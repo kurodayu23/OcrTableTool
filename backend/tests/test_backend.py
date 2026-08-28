@@ -21607,16 +21607,18 @@ class TablePipelineTests(unittest.TestCase):
 
     def test_blank_form_keeps_physical_empty_rows_and_recovers_merged_spans(self):
         ocr_backend._load_runtime()
-        columns = [0, 100, 200, 300]
-        rows = [0, 36, 128] + [152 + index * 24 for index in range(14)]
-        height, width = rows[-1] + 1, columns[-1] + 1
+        margin_x = 12
+        margin_y = 12
+        columns = [margin_x + value for value in (0, 100, 200, 300)]
+        rows = [margin_y + value for value in ([0, 36, 128] + [152 + index * 24 for index in range(14)])]
+        height, width = rows[-1] + margin_y + 1, columns[-1] + margin_x + 1
         image = np.full((height, width, 3), 245, dtype=np.uint8)
         horizontal = np.zeros((height, width), dtype=np.uint8)
         vertical = np.zeros((height, width), dtype=np.uint8)
         for boundary in rows:
-            cv2.line(horizontal, (0, boundary), (width - 1, boundary), 255, 2)
-        cv2.line(vertical, (0, 0), (0, height - 1), 255, 2)
-        cv2.line(vertical, (width - 1, 0), (width - 1, height - 1), 255, 2)
+            cv2.line(horizontal, (columns[0], boundary), (columns[-1], boundary), 255, 2)
+        cv2.line(vertical, (columns[0], rows[0]), (columns[0], rows[-1]), 255, 2)
+        cv2.line(vertical, (columns[-1], rows[0]), (columns[-1], rows[-1]), 255, 2)
         for row in range(1, 10):
             for boundary in columns[1:-1]:
                 cv2.line(
@@ -21656,6 +21658,23 @@ class TablePipelineTests(unittest.TestCase):
                     photographic_background=False,
                 )
             )
+            trimmed = ocr_backend._trim_blank_form_outer_closure_rows(
+                rows,
+                grid,
+                confidence,
+            )
+            self.assertIsNotNone(trimmed)
+            rows, grid, confidence = trimmed
+            self.assertEqual(len(grid), 15)
+            self.assertTrue(
+                ocr_backend._blank_form_physical_grid_is_safe(
+                    image,
+                    columns,
+                    rows,
+                    grid,
+                    photographic_background=False,
+                )
+            )
             spans = ocr_backend._recover_blank_form_physical_spans(
                 image,
                 columns,
@@ -21663,18 +21682,42 @@ class TablePipelineTests(unittest.TestCase):
                 grid,
                 confidence,
             )
+            confidence = [
+                [-1.0 if not value else 0.77 for value in values]
+                for values in grid
+            ]
+            ink_row = 4
+            ink_column = 1
+            cv2.rectangle(
+                image,
+                (columns[ink_column] + 20, rows[ink_row] + 8),
+                (columns[ink_column] + 60, rows[ink_row] + 24),
+                (10, 10, 10),
+                -1,
+            )
+            released = ocr_backend._release_confirmed_blank_form_empty_reviews(
+                image,
+                columns,
+                rows,
+                grid,
+                confidence,
+            )
 
-        self.assertEqual((len(grid), len(grid[0])), (16, 3))
+        self.assertEqual((len(grid), len(grid[0])), (15, 3))
         self.assertEqual(grid[0], ["徒步定位记录表", "", ""])
         self.assertIn(
             {"row": 0, "column": 0, "row_span": 1, "column_span": 3, "role": "title"},
             spans,
         )
-        for row in range(10, 16):
+        for row in range(10, 15):
             self.assertIn(
                 {"row": row, "column": 1, "row_span": 1, "column_span": 2, "role": "merged"},
                 spans,
             )
+        self.assertNotIn((ink_row, ink_column), released)
+        self.assertLess(confidence[ink_row][ink_column], 0.0)
+        self.assertIn((3, 0), released)
+        self.assertEqual(confidence[3][0], 0.0)
 
         broken_horizontal = horizontal.copy()
         broken_horizontal[rows[6] - 2 : rows[6] + 3, :] = 0
@@ -21692,6 +21735,24 @@ class TablePipelineTests(unittest.TestCase):
                     photographic_background=False,
                 )
             )
+
+    def test_runtime_trace_converts_numpy_scalars_without_failing_recognition(self):
+        ocr_backend._load_runtime()
+        buffer = []
+        with patch.object(ocr_backend, "_runtime_trace_active", True), patch.object(
+            ocr_backend, "_runtime_trace_started", 0.0
+        ), patch.object(ocr_backend, "_runtime_trace_buffer", buffer), patch.object(
+            ocr_backend, "_runtime_trace_file", None
+        ):
+            ocr_backend._write_runtime_trace(
+                "numpy_scalar",
+                flag=np.bool_(True),
+                count=np.int64(3),
+            )
+
+        payload = json.loads(buffer[0])
+        self.assertIs(payload["flag"], True)
+        self.assertEqual(payload["count"], 3)
 
     def test_third_grid_row_distinguishes_simple_and_multilevel_headers(self):
         ocr_backend._load_runtime()

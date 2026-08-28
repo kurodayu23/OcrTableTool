@@ -140,10 +140,26 @@ def _write_runtime_trace(
         ),
     }
     payload.update(values)
-    _runtime_trace_buffer.append(
-        json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
-    )
+    try:
+        encoded = json.dumps(
+            payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=_runtime_trace_json_default,
+        )
+    except (TypeError, ValueError, OverflowError):
+        # 运行轨迹只用于诊断，任何异常值都不能中断正式识别结果。
+        return
+    _runtime_trace_buffer.append(encoded + "\n")
     _flush_runtime_trace(force_flush)
+
+
+def _runtime_trace_json_default(value: Any) -> Any:
+    if np is not None and isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    return str(value)
 
 
 def _begin_runtime_trace(image_path: Any) -> None:
@@ -2557,10 +2573,10 @@ def _blank_form_physical_grid_is_safe(
         return False
     height, width = image.shape[:2]
     if (
-        columns[0] > width * 0.02
-        or columns[-1] < width * 0.98
-        or rows[0] > height * 0.02
-        or rows[-1] < height * 0.98
+        columns[0] > width * 0.10
+        or columns[-1] < width * 0.90
+        or rows[0] > height * 0.10
+        or rows[-1] < height * 0.90
     ):
         return False
     evidence = _ruled_grid_edge_evidence(image, (columns, rows, np.empty((0, 0))))
@@ -2598,6 +2614,65 @@ def _blank_form_physical_grid_is_safe(
     blank_start, blank_end = qualifying[0]
     labelled_tail_rows = sum(populations[row] > 0 for row in range(blank_end, row_count))
     return bool(blank_start == header_row + 1 and labelled_tail_rows >= 2)
+
+
+def _trim_blank_form_outer_closure_rows(
+    rows: list[int],
+    grid: list[list[str]],
+    confidence_grid: list[list[float]] | None,
+) -> tuple[list[int], list[list[str]], list[list[float]] | None] | None:
+    """Remove only empty closure intervals outside a recognisable blank form."""
+    row_count = len(grid)
+    column_count = len(grid[0]) if grid else 0
+    if (
+        row_count < 8
+        or column_count < 2
+        or len(rows) != row_count + 1
+        or any(len(row) != column_count for row in grid)
+    ):
+        return None
+    populations = [sum(bool(str(value).strip()) for value in row) for row in grid]
+    start = 0
+    while start < min(3, row_count) and populations[start] == 0:
+        start += 1
+    end = row_count
+    while end > max(start, row_count - 3) and populations[end - 1] == 0:
+        end -= 1
+    if start == 0 and end == row_count:
+        return None
+    trimmed_populations = populations[start:end]
+    if len(trimmed_populations) < 8 or trimmed_populations[0] != 1:
+        return None
+    if len(trimmed_populations) < 2 or trimmed_populations[1] < column_count - 1:
+        return None
+    blank_runs: list[tuple[int, int]] = []
+    blank_start = None
+    for row, population in enumerate(trimmed_populations[2:], start=2):
+        if population == 0 and blank_start is None:
+            blank_start = row
+        elif population != 0 and blank_start is not None:
+            blank_runs.append((blank_start, row))
+            blank_start = None
+    if blank_start is not None:
+        blank_runs.append((blank_start, len(trimmed_populations)))
+    qualifying = [run for run in blank_runs if run[1] - run[0] >= 3]
+    if len(qualifying) != 1 or qualifying[0][0] != 2:
+        return None
+    labelled_tail_rows = sum(
+        population > 0 for population in trimmed_populations[qualifying[0][1] :]
+    )
+    if labelled_tail_rows < 2:
+        return None
+    trimmed_confidence = (
+        None
+        if confidence_grid is None
+        else [list(row) for row in confidence_grid[start:end]]
+    )
+    return (
+        list(rows[start : end + 1]),
+        [list(row) for row in grid[start:end]],
+        trimmed_confidence,
+    )
 
 
 def _recover_blank_form_physical_spans(
@@ -21823,7 +21898,9 @@ def _recognize_screen_grid_cells(
                 separator_support.append(
                     float(np.percentile(vertical_profile, 80) - np.min(vertical_profile)) >= 8.0
                 )
-        merged_title = bool(separator_support) and np.mean(separator_support) < 0.35
+        merged_title = bool(
+            separator_support and float(np.mean(separator_support)) < 0.35
+        )
         following_row_populated = (
             sum(
                 bool(str(value).strip())
@@ -23891,6 +23968,42 @@ def _physical_cell_has_visible_text_ink(crop: np.ndarray) -> bool:
     foreground = gray < max(0.0, background - 18.0)
     coverage = float(np.mean(foreground))
     return bool(0.0025 <= coverage <= 0.40)
+
+
+def _release_confirmed_blank_form_empty_reviews(
+    image: np.ndarray,
+    columns: list[int],
+    rows: list[int],
+    grid: list[list[str]],
+    confidence_grid: list[list[float]],
+) -> set[tuple[int, int]]:
+    """Keep ink-bearing blanks yellow; clear review only for visibly empty cells."""
+    if (
+        not grid
+        or len(rows) != len(grid) + 1
+        or len(columns) != len(grid[0]) + 1
+        or len(confidence_grid) != len(grid)
+        or any(len(values) != len(grid[0]) for values in confidence_grid)
+    ):
+        return set()
+    released: set[tuple[int, int]] = set()
+    for row, values in enumerate(grid):
+        for column, value in enumerate(values):
+            if str(value).strip():
+                continue
+            left, right = int(columns[column]), int(columns[column + 1])
+            top, bottom = int(rows[row]), int(rows[row + 1])
+            pad_x = max(3, min(12, (right - left) // 10))
+            pad_y = max(3, min(10, (bottom - top) // 8))
+            crop = image[
+                max(0, top + pad_y) : min(image.shape[0], bottom - pad_y),
+                max(0, left + pad_x) : min(image.shape[1], right - pad_x),
+            ]
+            if _physical_cell_has_visible_text_ink(crop):
+                continue
+            confidence_grid[row][column] = 0.0
+            released.add((row, column))
+    return released
 
 
 def _physical_cell_has_strong_text_ink(crop: np.ndarray) -> bool:
@@ -27771,6 +27884,33 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             ocr_output.scores,
             preserve_geometry=True,
         )
+        trimmed_blank_form = _trim_blank_form_outer_closure_rows(
+            rows,
+            physical_page_grid,
+            physical_page_confidence,
+        )
+        if trimmed_blank_form is not None:
+            candidate_rows, candidate_grid, candidate_confidence = trimmed_blank_form
+            if _blank_form_physical_grid_is_safe(
+                rectified,
+                columns,
+                candidate_rows,
+                candidate_grid,
+                photographic_background=photographic_background,
+            ):
+                rows = candidate_rows
+                physical_page_grid = candidate_grid
+                physical_page_confidence = candidate_confidence or []
+                ruled_grid = (columns, rows, ruled_grid[2])
+                ruled_cell_count = (len(columns) - 1) * (len(rows) - 1)
+                structure_certificate = None
+                _write_runtime_trace(
+                    "route",
+                    force_flush=True,
+                    name="blank_form_outer_closure_trimmed",
+                    rows=len(physical_page_grid),
+                    columns=len(physical_page_grid[0]),
+                )
         raw_page_grid = [list(row) for row in physical_page_grid]
         raw_page_confidence = [list(row) for row in physical_page_confidence]
         blank_form_physical_grid = _blank_form_physical_grid_is_safe(
@@ -32307,6 +32447,20 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
         structural_warnings=structural_warnings,
         review_rows=header_review_rows,
     )
+    if blank_form_physical_grid and confidence_grid is not None:
+        released_blank_cells = _release_confirmed_blank_form_empty_reviews(
+            rectified,
+            columns,
+            rows,
+            grid,
+            confidence_grid,
+        )
+        if released_blank_cells:
+            _write_runtime_trace(
+                "route",
+                name="blank_form_confirmed_empty_cells",
+                cells=len(released_blank_cells),
+            )
     # A review-only span may also fold empty subordinate risks when its physical
     # evidence is already accepted above. The anchor remains yellow, while any
     # subordinate cell containing actual text still prevents the merge.
