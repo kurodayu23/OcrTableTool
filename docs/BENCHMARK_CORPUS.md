@@ -1,9 +1,9 @@
 # OCR 回归基准集边界
 
-`scripts/prepare_benchmark_corpus.ps1` 从经过校验的官方归档中确定性抽取 120 张本地回归图。原始归档、抽取图片、真值、OCR 输出和性能日志全部位于：
+`scripts/prepare_benchmark_corpus.ps1` 从经过校验的官方归档中确定性抽取 120 张本地回归图。原始归档、抽取图片、真值、OCR 输出和性能日志默认位于项目根目录下已忽略的：
 
 ```text
-D:\AP\AP7000\ai-workspace\ocr-benchmark
+benchmark-data\
 ```
 
 它们不属于产品运行时，也不进入平板包。正式安装包不得包含 `benchmarks`、`ai-workspace`、下载归档、测试图片或运行报告。
