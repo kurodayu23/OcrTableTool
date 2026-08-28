@@ -1,0 +1,6 @@
+onnxruntime==1.28.0
+openvino==2026.2.1
+openpyxl==3.1.5
+opencv-python==5.0.0.93
+rapid-table==3.0.2
+rapidocr==3.9.2
