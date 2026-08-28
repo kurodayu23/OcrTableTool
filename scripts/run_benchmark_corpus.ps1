@@ -1,6 +1,6 @@
 param(
     [string]$Python = "",
-    [string]$Corpus = "D:\AP\AP7000\ai-workspace\ocr-benchmark\corpus",
+    [string]$Corpus = "",
     [Parameter(Mandatory = $true)]
     [string]$Output,
     [string]$Ids = "",
@@ -12,11 +12,15 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$projectRoot = Split-Path $PSScriptRoot -Parent
+if (-not $Corpus) {
+    $Corpus = Join-Path $projectRoot "benchmark-data\corpus"
+}
 if (-not $Python) {
     if ($env:OCR_TABLE_PYTHON) {
         $Python = $env:OCR_TABLE_PYTHON
     } else {
-        $Python = Join-Path (Split-Path $PSScriptRoot -Parent) ".venv\Scripts\python.exe"
+        $Python = Join-Path $projectRoot ".venv\Scripts\python.exe"
     }
 }
 if (-not (Test-Path -LiteralPath $Python)) {
@@ -27,7 +31,7 @@ $arguments = @(
     (Join-Path $PSScriptRoot "run_benchmark_corpus.py"),
     "--corpus", $Corpus,
     "--output", $Output,
-    "--model-dir", (Join-Path (Split-Path $PSScriptRoot -Parent) "runtime\models")
+    "--model-dir", (Join-Path $projectRoot "runtime\models")
 )
 if ($Ids) { $arguments += @("--ids", $Ids) }
 if ($Source) { $arguments += @("--source", $Source) }

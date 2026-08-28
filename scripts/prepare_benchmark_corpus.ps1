@@ -1,9 +1,16 @@
 param(
-    [string]$Downloads = "D:\AP\AP7000\ai-workspace\ocr-benchmark\downloads",
-    [string]$Output = "D:\AP\AP7000\ai-workspace\ocr-benchmark\corpus"
+    [string]$Downloads = "",
+    [string]$Output = ""
 )
 
 $ErrorActionPreference = "Stop"
+$projectRoot = Split-Path $PSScriptRoot -Parent
+if (-not $Downloads) {
+    $Downloads = Join-Path $projectRoot "benchmark-data\downloads"
+}
+if (-not $Output) {
+    $Output = Join-Path $projectRoot "benchmark-data\corpus"
+}
 $scriptPath = Join-Path $PSScriptRoot "prepare_benchmark_corpus.py"
 $uv = Get-Command uv.exe -ErrorAction Stop
 

@@ -12,6 +12,7 @@ runtime/models/
 package/
 *.spec
 benchmark-results/
+benchmark-data/
 *.pro.user*
 *.log
 *.tmp
