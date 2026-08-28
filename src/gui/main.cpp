@@ -11,6 +11,7 @@ int main(int argc, char *argv[])
 {
     QApplication::setAttribute(Qt::AA_EnableHighDpiScaling);
     QApplication::setAttribute(Qt::AA_UseHighDpiPixmaps);
+    QApplication::setAttribute(Qt::AA_SynthesizeMouseForUnhandledTouchEvents, true);
     QApplication application(argc, argv);
     application.setApplicationName(QStringLiteral("OcrTableTool"));
     application.setOrganizationName(QStringLiteral("AP"));

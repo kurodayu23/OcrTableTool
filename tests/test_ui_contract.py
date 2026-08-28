@@ -453,11 +453,14 @@ class UiContractTest(unittest.TestCase):
         self.assertIn("editTableCell", header)
 
     def test_all_primary_work_surfaces_have_tablet_touch_contracts(self):
+        main = (ROOT / "src/gui/main.cpp").read_text(encoding="utf-8")
         source = (ROOT / "src/gui/mainwindow.cpp").read_text(encoding="utf-8")
+        preview = (ROOT / "src/gui/imagepreview.cpp").read_text(encoding="utf-8")
         viewer = (ROOT / "src/gui/imageviewerdialog.cpp").read_text(encoding="utf-8")
         camera = (ROOT / "src/gui/cameracapturedialog.cpp").read_text(encoding="utf-8")
         qss = (ROOT / "assets/app.qss").read_text(encoding="utf-8")
 
+        self.assertIn("Qt::AA_SynthesizeMouseForUnhandledTouchEvents", main)
         self.assertIn("QScrollerProperties", source)
         self.assertIn("DragVelocitySmoothingFactor", source)
         self.assertIn("DecelerationFactor", source)
@@ -468,6 +471,12 @@ class UiContractTest(unittest.TestCase):
         self.assertIn("min-height: 48px;", qss)
         self.assertIn("min-height: 44px;", qss)
         self.assertIn("padding: 12px 30px 12px 14px;", qss)
+
+        self.assertIn("setAttribute(Qt::WA_AcceptTouchEvents, true)", preview)
+        self.assertIn("QEvent::TouchBegin", preview)
+        self.assertIn("QEvent::TouchUpdate", preview)
+        self.assertIn("QEvent::TouchEnd", preview)
+        self.assertIn("finishCropDrag", preview)
 
         self.assertIn("setAttribute(Qt::WA_AcceptTouchEvents, true)", viewer)
         self.assertIn("bool viewportEvent(QEvent *event) override", viewer)

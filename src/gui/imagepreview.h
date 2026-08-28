@@ -10,6 +10,7 @@
 class QResizeEvent;
 class QKeyEvent;
 class QMouseEvent;
+class QEvent;
 
 class ImagePreview : public QFrame
 {
@@ -32,6 +33,7 @@ signals:
     void cropSelectionActiveChanged(bool active);
 
 protected:
+    bool event(QEvent *event) override;
     void paintEvent(QPaintEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
@@ -42,12 +44,16 @@ protected:
 private:
     void rebuildScaledPreview();
     QRect displayedImageRect() const;
+    void startCropDrag(const QPoint &position);
+    void updateCropDrag(const QPoint &position);
+    bool finishCropDrag();
 
     QImage m_image;
     QPixmap m_scaledPreview;
     QString m_emptyText;
     bool m_cropSelectionActive;
     bool m_cropDragging;
+    int m_cropTouchId;
     QPoint m_cropStart;
     QRect m_cropSelection;
 };

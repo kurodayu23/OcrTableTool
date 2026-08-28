@@ -7,6 +7,7 @@
 #include <QKeyEvent>
 #include <QMouseEvent>
 #include <QResizeEvent>
+#include <QTouchEvent>
 #include <QtMath>
 
 namespace {
@@ -28,10 +29,12 @@ ImagePreview::ImagePreview(QWidget *parent)
     , m_emptyText(QStringLiteral("打开一张手机拍摄的表格照片"))
     , m_cropSelectionActive(false)
     , m_cropDragging(false)
+    , m_cropTouchId(-1)
 {
     setObjectName(QStringLiteral("ImageCanvas"));
     setMinimumSize(360, 320);
     setFocusPolicy(Qt::StrongFocus);
+    setAttribute(Qt::WA_AcceptTouchEvents, true);
     setToolTip(QStringLiteral("单击查看大图，滚轮缩放，拖拽移动"));
 }
 
@@ -68,7 +71,7 @@ void ImagePreview::beginCropSelection()
     m_cropDragging = false;
     m_cropSelection = QRect();
     setCursor(Qt::CrossCursor);
-    setToolTip(QStringLiteral("按住鼠标左键拖动，框选一个完整表格"));
+    setToolTip(QStringLiteral("单指或按住鼠标左键拖动，框选一个完整表格"));
     emit cropSelectionActiveChanged(true);
     QJsonObject trace;
     trace.insert(QStringLiteral("image_width"), m_image.width());
@@ -89,6 +92,7 @@ void ImagePreview::cancelCropSelection()
     const bool wasActive = m_cropSelectionActive;
     m_cropSelectionActive = false;
     m_cropDragging = false;
+    m_cropTouchId = -1;
     m_cropSelection = QRect();
     setCursor(m_image.isNull() ? Qt::ArrowCursor : Qt::PointingHandCursor);
     setToolTip(QStringLiteral("单击查看大图，滚轮缩放，拖拽移动"));
@@ -100,6 +104,45 @@ void ImagePreview::cancelCropSelection()
 bool ImagePreview::isCropSelectionActive() const
 {
     return m_cropSelectionActive;
+}
+
+bool ImagePreview::event(QEvent *event)
+{
+    if (!m_cropSelectionActive)
+        return QFrame::event(event);
+    if (event->type() != QEvent::TouchBegin
+        && event->type() != QEvent::TouchUpdate
+        && event->type() != QEvent::TouchEnd
+        && event->type() != QEvent::TouchCancel) {
+        return QFrame::event(event);
+    }
+
+    QTouchEvent *touchEvent = static_cast<QTouchEvent *>(event);
+    const QList<QTouchEvent::TouchPoint> points = touchEvent->touchPoints();
+    if (event->type() == QEvent::TouchCancel) {
+        m_cropDragging = false;
+        m_cropTouchId = -1;
+        m_cropSelection = QRect();
+        update();
+        event->accept();
+        return true;
+    }
+    if (points.size() != 1) {
+        event->accept();
+        return true;
+    }
+
+    const QTouchEvent::TouchPoint &point = points.first();
+    if (event->type() == QEvent::TouchBegin) {
+        m_cropTouchId = point.id();
+        startCropDrag(point.pos().toPoint());
+    } else if (point.id() == m_cropTouchId) {
+        updateCropDrag(point.pos().toPoint());
+        if (event->type() == QEvent::TouchEnd)
+            finishCropDrag();
+    }
+    event->accept();
+    return true;
 }
 
 void ImagePreview::setEmptyText(const QString &text)
@@ -140,13 +183,8 @@ void ImagePreview::resizeEvent(QResizeEvent *event)
 void ImagePreview::mousePressEvent(QMouseEvent *event)
 {
     if (m_cropSelectionActive) {
-        if (event->button() == Qt::LeftButton
-            && displayedImageRect().contains(event->pos())) {
-            m_cropDragging = true;
-            m_cropStart = event->pos();
-            m_cropSelection = QRect(m_cropStart, m_cropStart);
-            update();
-        }
+        if (event->button() == Qt::LeftButton)
+            startCropDrag(event->pos());
         event->accept();
         return;
     }
@@ -156,10 +194,7 @@ void ImagePreview::mousePressEvent(QMouseEvent *event)
 void ImagePreview::mouseMoveEvent(QMouseEvent *event)
 {
     if (m_cropSelectionActive && m_cropDragging) {
-        const QPoint bounded(
-            qBound(displayedImageRect().left(), event->pos().x(), displayedImageRect().right()),
-            qBound(displayedImageRect().top(), event->pos().y(), displayedImageRect().bottom()));
-        m_cropSelection = QRect(m_cropStart, bounded).normalized();
+        updateCropDrag(event->pos());
         event->accept();
         update();
         return;
@@ -171,32 +206,8 @@ void ImagePreview::mouseReleaseEvent(QMouseEvent *event)
 {
     if (m_cropSelectionActive) {
         if (m_cropDragging && event->button() == Qt::LeftButton) {
-            m_cropDragging = false;
-            const QRect display = displayedImageRect();
-            const QRect selected = m_cropSelection.normalized().intersected(display);
-            if (selected.width() >= 12 && selected.height() >= 12) {
-                const double scaleX = double(m_image.width()) / double(qMax(1, display.width()));
-                const double scaleY = double(m_image.height()) / double(qMax(1, display.height()));
-                const QRect imageRect(
-                    qBound(0, qFloor((selected.left() - display.left()) * scaleX), m_image.width() - 1),
-                    qBound(0, qFloor((selected.top() - display.top()) * scaleY), m_image.height() - 1),
-                    qMax(1, qCeil(selected.width() * scaleX)),
-                    qMax(1, qCeil(selected.height() * scaleY)));
-                const QRect mapped = imageRect.intersected(m_image.rect());
-                QJsonObject trace;
-                trace.insert(QStringLiteral("display"), rectTrace(display));
-                trace.insert(QStringLiteral("selection"), rectTrace(selected));
-                trace.insert(QStringLiteral("image_rect"), rectTrace(mapped));
-                trace.insert(QStringLiteral("scale_x"), scaleX);
-                trace.insert(QStringLiteral("scale_y"), scaleY);
-                GuiTrace::write(QStringLiteral("crop_selection_mapped"), trace);
-                cancelCropSelection();
-                emit cropSelected(mapped);
-                event->accept();
-                return;
-            }
-            m_cropSelection = QRect();
-            update();
+            updateCropDrag(event->pos());
+            finishCropDrag();
         }
         event->accept();
         return;
@@ -204,6 +215,61 @@ void ImagePreview::mouseReleaseEvent(QMouseEvent *event)
     QFrame::mouseReleaseEvent(event);
     if (event->button() == Qt::LeftButton && !m_image.isNull())
         emit activated();
+}
+
+void ImagePreview::startCropDrag(const QPoint &position)
+{
+    if (!displayedImageRect().contains(position))
+        return;
+    m_cropDragging = true;
+    m_cropStart = position;
+    m_cropSelection = QRect(m_cropStart, m_cropStart);
+    update();
+}
+
+void ImagePreview::updateCropDrag(const QPoint &position)
+{
+    if (!m_cropDragging)
+        return;
+    const QRect display = displayedImageRect();
+    const QPoint bounded(
+        qBound(display.left(), position.x(), display.right()),
+        qBound(display.top(), position.y(), display.bottom()));
+    m_cropSelection = QRect(m_cropStart, bounded).normalized();
+    update();
+}
+
+bool ImagePreview::finishCropDrag()
+{
+    if (!m_cropDragging)
+        return false;
+    m_cropDragging = false;
+    m_cropTouchId = -1;
+    const QRect display = displayedImageRect();
+    const QRect selected = m_cropSelection.normalized().intersected(display);
+    if (selected.width() < 12 || selected.height() < 12) {
+        m_cropSelection = QRect();
+        update();
+        return false;
+    }
+    const double scaleX = double(m_image.width()) / double(qMax(1, display.width()));
+    const double scaleY = double(m_image.height()) / double(qMax(1, display.height()));
+    const QRect imageRect(
+        qBound(0, qFloor((selected.left() - display.left()) * scaleX), m_image.width() - 1),
+        qBound(0, qFloor((selected.top() - display.top()) * scaleY), m_image.height() - 1),
+        qMax(1, qCeil(selected.width() * scaleX)),
+        qMax(1, qCeil(selected.height() * scaleY)));
+    const QRect mapped = imageRect.intersected(m_image.rect());
+    QJsonObject trace;
+    trace.insert(QStringLiteral("display"), rectTrace(display));
+    trace.insert(QStringLiteral("selection"), rectTrace(selected));
+    trace.insert(QStringLiteral("image_rect"), rectTrace(mapped));
+    trace.insert(QStringLiteral("scale_x"), scaleX);
+    trace.insert(QStringLiteral("scale_y"), scaleY);
+    GuiTrace::write(QStringLiteral("crop_selection_mapped"), trace);
+    cancelCropSelection();
+    emit cropSelected(mapped);
+    return true;
 }
 
 void ImagePreview::keyPressEvent(QKeyEvent *event)

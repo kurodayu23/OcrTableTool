@@ -9,6 +9,7 @@
 #include <QMouseEvent>
 #include <QSignalSpy>
 #include <QTemporaryDir>
+#include <QTouchDevice>
 
 #include "backendrunner.h"
 #include "backendlocator.h"
@@ -29,6 +30,7 @@ private slots:
     void loadsVersionedBackendCells();
     void findsProjectPythonBesideQtCreatorShadowBuild();
     void mapsHighDpiCropToOriginalPixels();
+    void mapsTouchCropToOriginalPixels();
     void cropModeConsumesPreviewClick();
     void publishesBackendResponseOnlyAfterNaturalExit();
 };
@@ -200,6 +202,52 @@ void CoreTests::cropModeConsumesPreviewClick()
     preview.cancelCropSelection();
     QTest::mouseClick(&preview, Qt::LeftButton, Qt::NoModifier, QPoint(160, 120));
     QCOMPARE(activatedSpy.count(), 1);
+}
+
+void CoreTests::mapsTouchCropToOriginalPixels()
+{
+    ImagePreview preview;
+    preview.setFixedSize(400, 320);
+    QImage image(800, 400, QImage::Format_RGB32);
+    image.fill(Qt::white);
+    preview.setImage(image);
+    preview.show();
+    QTest::qWait(20);
+
+    QTouchDevice device;
+    device.setType(QTouchDevice::TouchScreen);
+    device.setCapabilities(QTouchDevice::Position);
+    QSignalSpy cropSpy(&preview, SIGNAL(cropSelected(QRect)));
+    QSignalSpy activatedSpy(&preview, SIGNAL(activated()));
+    preview.beginCropSelection();
+    QTouchEvent::TouchPoint point(0);
+    point.setPos(QPointF(50, 100));
+    point.setState(Qt::TouchPointPressed);
+    QTouchEvent beginEvent(QEvent::TouchBegin,
+                           &device,
+                           Qt::NoModifier,
+                           Qt::TouchPointPressed,
+                           QList<QTouchEvent::TouchPoint>() << point);
+    QApplication::sendEvent(&preview, &beginEvent);
+    point.setPos(QPointF(350, 220));
+    point.setState(Qt::TouchPointMoved);
+    QTouchEvent updateEvent(QEvent::TouchUpdate,
+                            &device,
+                            Qt::NoModifier,
+                            Qt::TouchPointMoved,
+                            QList<QTouchEvent::TouchPoint>() << point);
+    QApplication::sendEvent(&preview, &updateEvent);
+    point.setState(Qt::TouchPointReleased);
+    QTouchEvent endEvent(QEvent::TouchEnd,
+                         &device,
+                         Qt::NoModifier,
+                         Qt::TouchPointReleased,
+                         QList<QTouchEvent::TouchPoint>() << point);
+    QApplication::sendEvent(&preview, &endEvent);
+
+    QCOMPARE(cropSpy.count(), 1);
+    QCOMPARE(activatedSpy.count(), 0);
+    QCOMPARE(cropSpy.takeFirst().at(0).toRect(), QRect(89, 77, 628, 253));
 }
 
 void CoreTests::publishesBackendResponseOnlyAfterNaturalExit()
