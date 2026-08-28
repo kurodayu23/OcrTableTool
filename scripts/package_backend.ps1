@@ -149,7 +149,11 @@ $unusedRuntimeDirectories = @(
     (Join-Path $backendDirectory "_internal\openvino\frontend\jax"),
     (Join-Path $backendDirectory "_internal\openvino\frontend\paddle"),
     (Join-Path $backendDirectory "_internal\openvino\frontend\pytorch"),
-    (Join-Path $backendDirectory "_internal\openvino\frontend\tensorflow")
+    (Join-Path $backendDirectory "_internal\openvino\frontend\tensorflow"),
+    (Join-Path $backendDirectory "_internal\openvino\torch"),
+    (Join-Path $backendDirectory "_internal\openvino\properties\intel_gpu"),
+    (Join-Path $backendDirectory "_internal\openvino\properties\intel_npu"),
+    (Join-Path $backendDirectory "_internal\rapidocr\inference_engine\pytorch")
 )
 foreach ($directory in $unusedRuntimeDirectories) {
     $resolvedDirectory = [System.IO.Path]::GetFullPath($directory)

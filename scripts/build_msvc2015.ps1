@@ -60,6 +60,20 @@ if ((Test-Path $deployTool) -and (Test-Path $executable)) {
     & $deployTool --no-translations --compiler-runtime $executable
 }
 
+# Python 后端不参与 C++ 链接；增量构建时 qmake 的 POST_LINK 可能不会再次执行。
+# 每次构建都显式同步，避免新界面误带旧识别逻辑。
+$backendSource = Join-Path $projectRoot "backend"
+$backendDestination = Join-Path (Split-Path -Parent $executable) "backend"
+New-Item -ItemType Directory -Path $backendDestination -Force | Out-Null
+Copy-Item -Path (Join-Path $backendSource "*") -Destination $backendDestination -Recurse -Force
+$sourceBackendHash = (Get-FileHash -Algorithm SHA256 `
+    -LiteralPath (Join-Path $backendSource "ocr_backend.py")).Hash
+$deployedBackendHash = (Get-FileHash -Algorithm SHA256 `
+    -LiteralPath (Join-Path $backendDestination "ocr_backend.py")).Hash
+if ($sourceBackendHash -ne $deployedBackendHash) {
+    throw "Deployed OCR backend does not match current source."
+}
+
 # 只部署简体中文 Qt 翻译，避免把整套多语言文件带入平板包。
 $qtPrefix = Split-Path -Parent (Split-Path -Parent $QMake)
 $translationSource = Join-Path $qtPrefix "translations\qt_zh_CN.qm"
