@@ -787,7 +787,7 @@ void MainWindow::recognizeImage()
     }
     if (m_backend->isRunning()) {
         if (m_recognitionActive) {
-            setBusy(true, QStringLiteral("正在精确识别，请稍等…正在核对表格结构、文字、数字和符号。"));
+            setBusy(true, QStringLiteral("正在精确识别，请稍等…"));
         }
         return;
     }
@@ -966,7 +966,7 @@ void MainWindow::backendStarted(const QString &action)
             updateActions();
             return;
         }
-        message = QStringLiteral("正在精确识别，请稍等…正在核对表格结构、文字、数字和符号。");
+        message = QStringLiteral("正在精确识别，请稍等…");
     }
     setBusy(true, message);
 }
