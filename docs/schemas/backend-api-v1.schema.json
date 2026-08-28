@@ -1,0 +1,141 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.invalid/ocr/backend-api-v1.schema.json",
+  "title": "OCR Backend API V1",
+  "$defs": {
+    "requestId": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+    "cell": {
+      "type": "object",
+      "required": ["text", "confidence", "needs_review"],
+      "properties": {
+        "text": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "needs_review": {"type": "boolean"}
+      },
+      "additionalProperties": true
+    },
+    "span": {
+      "type": "object",
+      "required": ["row", "column", "row_span", "column_span"],
+      "properties": {
+        "row": {"type": "integer", "minimum": 0},
+        "column": {"type": "integer", "minimum": 0},
+        "row_span": {"type": "integer", "minimum": 1},
+        "column_span": {"type": "integer", "minimum": 1},
+        "role": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "healthRequest": {
+      "type": "object",
+      "required": ["protocol", "action", "request_id"],
+      "properties": {
+        "protocol": {"const": 1},
+        "action": {"const": "health"},
+        "request_id": {"$ref": "#/$defs/requestId"}
+      },
+      "additionalProperties": false
+    },
+    "warmupRequest": {
+      "type": "object",
+      "required": ["protocol", "action", "request_id"],
+      "properties": {
+        "protocol": {"const": 1},
+        "action": {"const": "warmup"},
+        "request_id": {"$ref": "#/$defs/requestId"}
+      },
+      "additionalProperties": false
+    },
+    "recognizeRequest": {
+      "type": "object",
+      "required": ["protocol", "action", "request_id", "image_path", "output_directory"],
+      "properties": {
+        "protocol": {"const": 1},
+        "action": {"const": "recognize"},
+        "request_id": {"$ref": "#/$defs/requestId"},
+        "image_path": {"type": "string", "minLength": 1},
+        "output_directory": {"type": "string", "minLength": 1},
+        "options": {
+          "type": "object",
+          "properties": {
+            "crop_mode": {"enum": ["auto", "grid", "full"]},
+            "accuracy_mode": {"enum": ["adaptive", "adaptive_high", "maximum"]},
+            "deadline_seconds": {"type": "number", "minimum": 0}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "exportXlsxRequest": {
+      "type": "object",
+      "required": ["protocol", "action", "request_id", "output_path", "cells", "spans"],
+      "properties": {
+        "protocol": {"const": 1},
+        "action": {"const": "export_xlsx"},
+        "request_id": {"$ref": "#/$defs/requestId"},
+        "output_path": {"type": "string", "minLength": 1},
+        "cells": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/cell"}}},
+        "spans": {"type": "array", "items": {"$ref": "#/$defs/span"}}
+      },
+      "additionalProperties": false
+    },
+    "errorResponse": {
+      "type": "object",
+      "required": ["protocol", "status", "action", "error_code", "message", "retryable"],
+      "properties": {
+        "protocol": {"const": 1},
+        "status": {"const": "error"},
+        "action": {"type": "string"},
+        "request_id": {"$ref": "#/$defs/requestId"},
+        "error_code": {"type": "string", "minLength": 1},
+        "field": {"type": ["string", "null"]},
+        "message": {"type": "string"},
+        "retryable": {"type": "boolean"},
+        "error_type": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "recognizeResponse": {
+      "type": "object",
+      "required": ["protocol", "status", "action", "rows", "columns", "cells", "spans", "recognition_state", "publication_blocked", "publication_block_reasons", "structure_verified", "structure_certificate", "image_quality", "rectified_image"],
+      "properties": {
+        "protocol": {"const": 1},
+        "status": {"const": "ok"},
+        "action": {"const": "recognize"},
+        "request_id": {"$ref": "#/$defs/requestId"},
+        "rows": {"type": "integer", "minimum": 1, "maximum": 256},
+        "columns": {"type": "integer", "minimum": 1, "maximum": 128},
+        "cells": {"type": "array", "minItems": 1, "items": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/cell"}}},
+        "spans": {"type": "array", "items": {"$ref": "#/$defs/span"}},
+        "recognition_state": {"enum": ["verified", "needs_review", "blocked"]},
+        "publication_blocked": {"type": "boolean"},
+        "publication_block_reasons": {"type": "array", "items": {"type": "string"}},
+        "structure_verified": {"type": "boolean"},
+        "structure_certificate": {"type": ["object", "null"]},
+        "image_quality": {
+          "type": "object",
+          "required": ["issues", "issue_labels", "needs_recapture"],
+          "properties": {
+            "issues": {"type": "array", "items": {"type": "string"}},
+            "issue_labels": {"type": "array", "items": {"type": "string"}},
+            "needs_recapture": {"type": "boolean"}
+          },
+          "additionalProperties": true
+        },
+        "rectified_image": {"type": "string", "minLength": 1},
+        "elapsed_seconds": {"type": "number", "minimum": 0},
+        "review_cell_count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": true
+    }
+  },
+  "oneOf": [
+    {"$ref": "#/$defs/healthRequest"},
+    {"$ref": "#/$defs/warmupRequest"},
+    {"$ref": "#/$defs/recognizeRequest"},
+    {"$ref": "#/$defs/exportXlsxRequest"},
+    {"$ref": "#/$defs/errorResponse"},
+    {"$ref": "#/$defs/recognizeResponse"}
+  ]
+}
