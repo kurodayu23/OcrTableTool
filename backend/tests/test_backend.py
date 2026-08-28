@@ -32,6 +32,11 @@ extract_ruled_grid = getattr(table_pipeline, "extract_ruled_grid", lambda _: Non
 assign_ocr_to_grid = getattr(table_pipeline, "assign_ocr_to_grid", lambda *args: ([], []))
 
 
+def _real_fixture_path(relative: str) -> Path | None:
+    root = os.environ.get("OCR_TABLE_REAL_FIXTURES", "").strip()
+    return Path(root) / relative if root else None
+
+
 class TablePipelineTests(unittest.TestCase):
     def test_backend_runtime_blocks_socket_connections(self):
         import socket
@@ -9847,10 +9852,8 @@ class TablePipelineTests(unittest.TestCase):
         self.assertEqual(len(rows), len(expected_rows))
 
     def test_real_dense_low_resolution_spreadsheet_keeps_all_22_columns(self):
-        image_path = Path(
-            r"C:\Users\TestUser\Pictures\excel\base_03.png"
-        )
-        if not image_path.exists():
+        image_path = _real_fixture_path(r"excel\base_03.png")
+        if image_path is None or not image_path.exists():
             self.skipTest("base_03.png real regression fixture is unavailable")
 
         image = cv2.imdecode(np.fromfile(str(image_path), dtype=np.uint8), cv2.IMREAD_COLOR)
@@ -10495,10 +10498,10 @@ class TablePipelineTests(unittest.TestCase):
         )
 
     def test_real_strong_perspective_grid_keeps_the_last_data_row(self):
-        image_path = Path(
-            r"C:\Users\TestUser\Pictures\excel\生活场景表格测试\strong_perspective\L029_strong_perspective.jpg"
+        image_path = _real_fixture_path(
+            r"excel\生活场景表格测试-20260808\strong_perspective\L029_strong_perspective.jpg"
         )
-        if not image_path.exists():
+        if image_path is None or not image_path.exists():
             self.skipTest("L029 real regression fixture is unavailable")
 
         image = cv2.imdecode(
@@ -10572,10 +10575,10 @@ class TablePipelineTests(unittest.TestCase):
         self.assertIn(225, recovered)
 
     def test_real_strong_perspective_grid_keeps_all_seven_columns(self):
-        image_path = Path(
-            r"C:\Users\TestUser\Pictures\excel\生活场景表格测试\strong_perspective\L012_strong_perspective.jpg"
+        image_path = _real_fixture_path(
+            r"excel\生活场景表格测试-20260808\strong_perspective\L012_strong_perspective.jpg"
         )
-        if not image_path.exists():
+        if image_path is None or not image_path.exists():
             self.skipTest("L012 real regression fixture is unavailable")
 
         image = cv2.imdecode(
