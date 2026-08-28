@@ -1,0 +1,9 @@
+<RCC>
+    <qresource prefix="/styles">
+        <file alias="app.qss">../../assets/app.qss</file>
+    </qresource>
+    <qresource prefix="/icons">
+        <file alias="image-add.svg">../../assets/image-add.svg</file>
+        <file alias="table-empty.svg">../../assets/table-empty.svg</file>
+    </qresource>
+</RCC>
