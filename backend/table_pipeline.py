@@ -477,6 +477,54 @@ def _expand_one_proven_trailing_grid_row(
     return expanded
 
 
+def _quad_has_dense_ruled_extent(
+    image: np.ndarray,
+    corners: np.ndarray,
+) -> bool:
+    """Prove that a perspective candidate is the complete dense table frame."""
+    if image.size == 0:
+        return False
+    try:
+        ordered = _ordered_corners(np.asarray(corners, dtype=np.float32).reshape(4, 2))
+    except (TypeError, ValueError):
+        return False
+    top_left, top_right, bottom_right, bottom_left = ordered
+    target_width = int(
+        round(max(np.linalg.norm(top_right - top_left), np.linalg.norm(bottom_right - bottom_left)))
+    )
+    target_height = int(
+        round(max(np.linalg.norm(bottom_left - top_left), np.linalg.norm(bottom_right - top_right)))
+    )
+    if target_width < 160 or target_height < 120:
+        return False
+    destination = np.asarray(
+        [[0, 0], [target_width - 1, 0], [target_width - 1, target_height - 1], [0, target_height - 1]],
+        dtype=np.float32,
+    )
+    transform = cv2.getPerspectiveTransform(ordered, destination)
+    preview = cv2.warpPerspective(
+        image,
+        transform,
+        (target_width, target_height),
+        flags=cv2.INTER_CUBIC,
+        borderValue=(255, 255, 255),
+    )
+    ruled = extract_ruled_grid(preview, prefer_adaptive=True)
+    if ruled is None:
+        return False
+    columns, rows, _ = ruled
+    if len(columns) - 1 < 4 or len(rows) - 1 < 8:
+        return False
+    tolerance_x = max(5, int(round(target_width * 0.04)))
+    tolerance_y = max(5, int(round(target_height * 0.04)))
+    return bool(
+        columns[0] <= tolerance_x
+        and columns[-1] >= target_width - 1 - tolerance_x
+        and rows[0] <= tolerance_y
+        and rows[-1] >= target_height - 1 - tolerance_y
+    )
+
+
 def _warp_perspective_table(
     image: np.ndarray,
     *,
@@ -513,6 +561,26 @@ def _warp_perspective_table(
 
     document_corners = _detect_light_document_corners(image) if expand_to_document else None
     low_contrast_table = _detect_low_contrast_ruled_quad(image)
+    enclosing_grid_outline = False
+    if best_corners is not None and low_contrast_table is not None:
+        best_area = abs(float(cv2.contourArea(best_corners)))
+        low_area = abs(float(cv2.contourArea(low_contrast_table)))
+        best_x, best_y, best_w, best_h = cv2.boundingRect(
+            best_corners.astype(np.int32)
+        )
+        low_x, low_y, low_w, low_h = cv2.boundingRect(
+            low_contrast_table.astype(np.int32)
+        )
+        inset_tolerance = max(8, int(round(min(best_w, best_h) * 0.03)))
+        enclosing_grid_outline = bool(
+            best_area >= image_area * 0.70
+            and best_area >= low_area * 1.05
+            and best_x <= low_x + inset_tolerance
+            and best_y <= low_y + inset_tolerance
+            and best_x + best_w >= low_x + low_w - inset_tolerance
+            and best_y + best_h >= low_y + low_h - inset_tolerance
+            and _quad_has_dense_ruled_extent(image, low_contrast_table)
+        )
     document_confirms_grid_corners = False
     if best_corners is not None and document_corners is not None:
         ordered_grid = _ordered_corners(best_corners)
@@ -535,7 +603,8 @@ def _warp_perspective_table(
     if low_contrast_table is not None and (
         best_corners is None
         or (
-            not (
+            not enclosing_grid_outline
+            and not (
                 document_confirms_grid_corners
                 and abs(float(cv2.contourArea(low_contrast_table)))
                 >= abs(float(cv2.contourArea(best_corners))) * 0.97
@@ -579,9 +648,22 @@ def _warp_perspective_table(
             and table_x + table_w >= document_x + document_w - max(8, document_w * 0.03)
             and table_y + table_h >= document_y + document_h - max(8, document_h * 0.03)
         )
+        low_contrast_outer_grid = bool(
+            low_contrast_table is not None
+            and abs(float(cv2.contourArea(low_contrast_table)))
+            >= table_area * 0.75
+            and abs(float(cv2.contourArea(low_contrast_table)))
+            >= document_area * 1.50
+            and _quad_has_dense_ruled_extent(
+                image,
+                low_contrast_table,
+            )
+        )
         nested_complete_sheet = bool(
             contains_document
             and table_area >= document_area * 2.5
+            and not _quad_has_dense_ruled_extent(image, best_corners)
+            and not low_contrast_outer_grid
         )
         document_to_table_ratio = document_area / max(1.0, table_area)
         near_matching_complete_sheet = bool(
@@ -1800,6 +1882,88 @@ def _recover_regular_missing_boundaries(
     return _merge_nearby_centers(recovered + insertions, maximum_gap=5)
 
 
+def _recover_long_weak_horizontal_sequence(
+    image: np.ndarray,
+    columns: list[int],
+    rows: list[int],
+    horizontal: np.ndarray,
+) -> list[int]:
+    """Restore a long weak row sequence only under an already credible column grid."""
+    if (
+        image.size == 0
+        or horizontal.size == 0
+        or not 2 <= len(columns) - 1 <= 12
+        or len(rows) < 6
+        or min(np.diff(columns), default=0) < 12
+    ):
+        return rows
+    recovered = sorted(set(int(value) for value in rows))
+    gaps = np.diff(recovered).astype(float)
+    ordinary = gaps[gaps <= np.percentile(gaps, 70)] if gaps.size else gaps
+    typical = float(np.median(ordinary)) if ordinary.size else 0.0
+    if typical < 8.0:
+        return recovered
+
+    projection = np.count_nonzero(horizontal, axis=1)
+    global_peak = int(projection.max(initial=0))
+    if global_peak <= 0:
+        return recovered
+    minimum_support = max(
+        float(image.shape[1]) * 0.15,
+        float(global_peak) * 0.10,
+    )
+    supported = np.flatnonzero(projection >= minimum_support)
+    groups: list[list[int]] = []
+    for value in supported:
+        candidate = int(value)
+        if not groups or candidate > groups[-1][-1] + 1:
+            groups.append([candidate])
+        else:
+            groups[-1].append(candidate)
+    weak_centers = _merge_nearby_centers(
+        [
+            group[int(np.argmax(projection[group]))]
+            for group in groups
+        ],
+        maximum_gap=6,
+    )
+    if len(weak_centers) < len(recovered) + 2:
+        return recovered
+
+    tolerance = max(7.0, typical * 0.35)
+    existing_match_ratio = sum(
+        any(abs(float(candidate) - float(value)) <= tolerance for candidate in weak_centers)
+        for value in recovered
+    ) / float(len(recovered))
+    if existing_match_ratio < 0.90:
+        return recovered
+    unmatched = [
+        candidate
+        for candidate in weak_centers
+        if not any(
+            abs(float(candidate) - float(value)) <= tolerance
+            for value in recovered
+        )
+    ]
+    if len(unmatched) < 2:
+        return recovered
+
+    fills_large_gap = any(
+        right - left >= typical * 2.50
+        and sum(left + tolerance < candidate < right - tolerance for candidate in unmatched) >= 2
+        for left, right in zip(recovered, recovered[1:])
+    )
+    leading_prefix = bool(
+        recovered[0] >= typical * 2.0
+        and len(unmatched) >= 2
+        and all(candidate < recovered[0] - tolerance for candidate in unmatched)
+        and typical * 0.45 <= recovered[0] - unmatched[-1] <= typical * 1.80
+    )
+    if not (fills_large_gap or leading_prefix):
+        return recovered
+    return _merge_nearby_centers(recovered + unmatched, maximum_gap=6)
+
+
 def _recover_visible_double_row_boundary(
     image: np.ndarray,
     rows: list[int],
@@ -2778,7 +2942,7 @@ def _trim_disconnected_outer_frame_cells(
         left = output_columns[index]
         right = output_columns[index + 1]
         return bool(
-            right - left <= typical_column * 0.28
+            right - left <= typical_column * 0.38
             and _edge_rule_continuation(
                 horizontal,
                 body_rows,
@@ -3430,6 +3594,22 @@ def _trim_sparse_trailing_page_row(
     densities = [band_density(top, bottom) for top, bottom in zip(ordered[:-1], ordered[1:])]
     body_densities = densities[1:-1] if len(densities) > 3 else densities[:-1]
     typical_density = float(np.median(body_densities)) if body_densities else 0.0
+    gaps = np.diff(ordered)
+    ordinary_gaps = gaps[:-1] if gaps.size > 1 else gaps
+    typical_gap = float(np.median(ordinary_gaps)) if ordinary_gaps.size else 0.0
+    narrow_trailing_frame = bool(
+        ordered[-1] >= height * 0.96
+        and typical_gap >= 8.0
+        and gaps.size
+        and gaps[-1] <= max(7.0, typical_gap * 0.38)
+        and not _leading_interval_has_text_components(
+            image,
+            ordered[-2],
+            ordered[-1],
+            None,
+            vertical,
+        )
+    )
     grid_sparse = False
     if vertical is not None and vertical.shape[:2] == gray.shape[:2]:
         vertical_densities: list[float] = []
@@ -3447,9 +3627,6 @@ def _trim_sparse_trailing_page_row(
         typical_vertical_density = (
             float(np.median(vertical_body)) if vertical_body else 0.0
         )
-        gaps = np.diff(ordered)
-        ordinary_gaps = gaps[:-1] if gaps.size > 1 else gaps
-        typical_gap = float(np.median(ordinary_gaps)) if ordinary_gaps.size else 0.0
         grid_sparse = bool(
             typical_vertical_density > 0
             and vertical_densities[-1] < typical_vertical_density * 0.30
@@ -3466,6 +3643,7 @@ def _trim_sparse_trailing_page_row(
         line_proven_page_margin = False
     if (
         (near_image_edge and densities[-1] < min(0.035, typical_density * 0.30))
+        or narrow_trailing_frame
         or grid_sparse
         or line_proven_page_margin
     ):
@@ -4138,6 +4316,18 @@ def _extract_ruled_grid_uncached(
             and not adaptive_removes_false_screen_splits
         ):
             if not outer_page_frame_candidate:
+                recovered_screen_rows = _recover_long_weak_horizontal_sequence(
+                    image,
+                    list(screen_columns),
+                    list(screen_rows),
+                    horizontal,
+                )
+                if recovered_screen_rows != list(screen_rows):
+                    return (
+                        list(screen_columns),
+                        recovered_screen_rows,
+                        screen_grid[2],
+                    )
                 return screen_grid
             columns = list(screen_columns)
             rows = list(screen_rows)
@@ -4274,6 +4464,17 @@ def _extract_ruled_grid_uncached(
         columns,
         rows,
     )
+    columns = _recover_crop_edge_boundaries(columns, width)
+    columns = _trim_sparse_page_edge_columns(image, columns, horizontal)
+    rows = _recover_long_weak_horizontal_sequence(
+        image,
+        columns,
+        rows,
+        horizontal,
+    )
+    rows = _collapse_double_row_boundaries(rows, horizontal)
+    rows = _trim_sparse_leading_page_row(image, rows, horizontal, vertical)
+    rows = _trim_sparse_trailing_page_row(image, rows, vertical)
     spreadsheet_grid = _recover_spreadsheet_ruler_grid(
         gray,
         columns,
@@ -5009,6 +5210,11 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("deadline_seconds must be a non-negative number")
         if deadline_seconds < 0:
             raise ValueError("deadline_seconds must be a non-negative number")
+        for boolean_option in ("input_rectified", "selected_table_region"):
+            if boolean_option in options and not isinstance(
+                options[boolean_option], bool
+            ):
+                raise ValueError(f"{boolean_option} must be a boolean")
     elif action == "export_xlsx":
         output_path = request.get("output_path")
         if not isinstance(output_path, str) or not output_path.strip():

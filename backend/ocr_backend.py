@@ -582,7 +582,7 @@ _SERVER_RECOGNITION_BATCH_SIZE = 8
 # 这样可减少逐单元格调用开销，同时保持图片顺序、模型配置和识别证据不变。
 _RECOGNITION_CALL_GROUP_SIZE = 16
 _RECOGNITION_LOGICAL_PROCESSORS = max(1, os.cpu_count() or 1)
-_RECOGNITION_INFERENCE_THREADS = min(4, _RECOGNITION_LOGICAL_PROCESSORS)
+_RECOGNITION_INFERENCE_THREADS = min(3, _RECOGNITION_LOGICAL_PROCESSORS)
 
 
 def _adaptive_wide_detector_limit(image: Any, configured_limit: int) -> int:
@@ -2457,6 +2457,230 @@ def _top_document_rectification(
     return pipeline._enhance_for_ocr(warped), transform, expanded
 
 
+def _bottom_document_rectification(
+    source: np.ndarray,
+    corners: list[list[float]] | np.ndarray,
+    expansion_ratio: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Only expand the detected bottom edge while preserving top and side geometry."""
+    if source.size == 0 or not 0.0 <= float(expansion_ratio) <= 0.08:
+        return None
+    points = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+    if not np.isfinite(points).all() or not cv2.isContourConvex(points.astype(np.int32)):
+        return None
+    top_left, top_right, bottom_right, bottom_left = points
+    ratio = float(expansion_ratio)
+    expanded = np.asarray(
+        [
+            top_left,
+            top_right,
+            bottom_right + ratio * (bottom_right - top_right),
+            bottom_left + ratio * (bottom_left - top_left),
+        ],
+        dtype=np.float32,
+    )
+    height, width = source.shape[:2]
+    expanded[:, 0] = np.clip(expanded[:, 0], 0, width - 1)
+    expanded[:, 1] = np.clip(expanded[:, 1], 0, height - 1)
+    target_width = int(round(max(
+        np.linalg.norm(expanded[1] - expanded[0]),
+        np.linalg.norm(expanded[2] - expanded[3]),
+    )))
+    target_height = int(round(max(
+        np.linalg.norm(expanded[3] - expanded[0]),
+        np.linalg.norm(expanded[2] - expanded[1]),
+    )))
+    if target_width < 40 or target_height < 40:
+        return None
+    destination = np.asarray(
+        [[0, 0], [target_width - 1, 0], [target_width - 1, target_height - 1], [0, target_height - 1]],
+        dtype=np.float32,
+    )
+    transform = cv2.getPerspectiveTransform(expanded, destination)
+    warped = cv2.warpPerspective(
+        source,
+        transform,
+        (target_width, target_height),
+        flags=cv2.INTER_CUBIC,
+        borderValue=(255, 255, 255),
+    )
+    return pipeline._enhance_for_ocr(warped), transform, expanded
+
+
+def _grid_has_text_supported_trailing_rows(
+    image: np.ndarray,
+    grid: tuple[list[int], list[int], np.ndarray],
+    base_row_count: int,
+) -> bool:
+    """Accept added bottom rows only when each contains text and continuing rules."""
+    columns, rows, _ = grid
+    growth = len(rows) - 1 - int(base_row_count)
+    if not 1 <= growth <= 2 or len(columns) < 3:
+        return False
+    horizontal, vertical, _ = pipeline._grid_maps(image)
+    first_added = len(rows) - 1 - growth
+    for index in range(first_added, len(rows) - 1):
+        top, bottom = int(rows[index]), int(rows[index + 1])
+        if (
+            not pipeline._leading_interval_has_text_components(
+                image,
+                top,
+                bottom,
+                horizontal,
+                vertical,
+            )
+            or pipeline._edge_rule_continuation(
+                vertical,
+                [int(value) for value in columns[1:-1]],
+                top + 2,
+                bottom - 2,
+                horizontal=False,
+            )
+            < 0.70
+        ):
+            return False
+    return True
+
+
+def _recover_opposite_edge_after_top_only_expansion(
+    source: np.ndarray,
+    rectified: np.ndarray,
+    rectification: dict[str, Any],
+    ruled_grid: tuple[list[int], list[int], np.ndarray] | None,
+    *,
+    maximum_cells: int,
+) -> tuple[np.ndarray, tuple[list[int], list[int], np.ndarray], dict[str, Any]] | None:
+    """Finish one missed opposite edge only after a proven top-only expansion."""
+    corners = rectification.get("corners")
+    if (
+        source.size == 0
+        or ruled_grid is None
+        or rectification.get("top_only_expansion") is not True
+        or not isinstance(corners, list)
+        or len(corners) != 4
+    ):
+        return None
+    baseline = _ruled_grid_edge_evidence(rectified, ruled_grid)
+    if baseline is None:
+        return None
+    base_rows = len(ruled_grid[1]) - 1
+    base_columns = len(ruled_grid[0]) - 1
+    original_corners = np.asarray(corners, dtype=np.float32).reshape(4, 2)
+
+    def stable_candidate(
+        side: str,
+    ) -> tuple[float, np.ndarray, tuple[list[int], list[int], np.ndarray], np.ndarray] | None:
+        expander = (
+            _top_document_rectification
+            if side == "top"
+            else _bottom_document_rectification
+        )
+        ratio_pairs = (
+            (0.05, 0.06),
+            (0.04, 0.05),
+            (0.06, 0.07),
+            (0.03, 0.035),
+            (0.025, 0.03),
+            (0.02, 0.025),
+            (0.015, 0.02),
+        )
+        for ratio_pair in ratio_pairs:
+            candidates = []
+            for ratio in ratio_pair:
+                expanded = expander(source, original_corners, ratio)
+                if expanded is None:
+                    continue
+                candidate_image, transform, candidate_corners = expanded
+                candidate_grid = pipeline.extract_ruled_grid(
+                    candidate_image,
+                    prefer_adaptive=True,
+                )
+                evidence = _ruled_grid_edge_evidence(
+                    candidate_image,
+                    candidate_grid,
+                )
+                if candidate_grid is None or evidence is None:
+                    continue
+                preserves, _ = _expanded_grid_preserves_base_and_adds_strong_rows(
+                    baseline,
+                    evidence,
+                    original_corners,
+                    transform,
+                )
+                row_count = len(candidate_grid[1]) - 1
+                column_count = len(candidate_grid[0]) - 1
+                if not (
+                    preserves
+                    and column_count == base_columns
+                    and 1 <= row_count - base_rows <= 2
+                    and _grid_geometry_is_bounded(
+                        candidate_grid[0],
+                        candidate_grid[1],
+                        maximum_cells=maximum_cells,
+                    )
+                    and _photographic_ruled_grid_is_credible(
+                        candidate_image,
+                        candidate_grid[0],
+                        candidate_grid[1],
+                    )
+                ):
+                    continue
+                if side == "top":
+                    if (
+                        row_count != base_rows + 1
+                        or not pipeline._leading_interval_has_text_components(
+                            candidate_image,
+                            candidate_grid[1][0],
+                            candidate_grid[1][1],
+                            *pipeline._grid_maps(candidate_image)[:2],
+                        )
+                    ):
+                        continue
+                elif not _grid_has_text_supported_trailing_rows(
+                    candidate_image,
+                    candidate_grid,
+                    base_rows,
+                ):
+                    continue
+                candidates.append(
+                    (ratio, candidate_image, candidate_grid, candidate_corners)
+                )
+            if (
+                len(candidates) == 2
+                and (
+                    len(candidates[0][2][1]),
+                    len(candidates[0][2][0]),
+                )
+                == (
+                    len(candidates[1][2][1]),
+                    len(candidates[1][2][0]),
+                )
+            ):
+                return candidates[0]
+        return None
+
+    selected = stable_candidate("top") or stable_candidate("bottom")
+    if selected is None:
+        return None
+    ratio, candidate_image, candidate_grid, candidate_corners = selected
+    metadata = dict(rectification)
+    metadata.update(
+        {
+            "corners": [
+                [round(float(point[0]), 2), round(float(point[1]), 2)]
+                for point in candidate_corners
+            ],
+            "edge_completeness_checked": True,
+            "edge_rows_recovered": len(candidate_grid[1]) - 1
+            - (len(ruled_grid[1]) - 1)
+            + int(rectification.get("edge_rows_recovered", 0)),
+            "opposite_edge_expansion": True,
+            "opposite_edge_expansion_ratio": ratio,
+        }
+    )
+    return candidate_image, candidate_grid, metadata
+
+
 def _ruled_grid_edge_evidence(
     image: np.ndarray,
     grid: tuple[list[int], list[int], np.ndarray] | None,
@@ -2616,6 +2840,94 @@ def _blank_form_physical_grid_is_safe(
     return bool(blank_start == header_row + 1 and labelled_tail_rows >= 2)
 
 
+def _raw_blank_form_grid_candidate(
+    image: np.ndarray,
+    current_grid: tuple[list[int], list[int], np.ndarray] | None,
+    *,
+    maximum_cells: int,
+) -> tuple[list[int], list[int], np.ndarray] | None:
+    """Recover a clear blank form from raw full-length physical rules."""
+    if image.size == 0 or min(image.shape[:2]) < 160:
+        return None
+    horizontal, vertical, _ = pipeline._grid_maps(image)
+    columns = pipeline._line_centers(
+        np.count_nonzero(vertical, axis=0), image.shape[0]
+    )
+    rows = pipeline._line_centers(
+        np.count_nonzero(horizontal, axis=1), image.shape[1]
+    )
+    row_count = len(rows) - 1
+    column_count = len(columns) - 1
+    if (
+        not 8 <= row_count <= 80
+        or not 2 <= column_count <= 12
+        or row_count * column_count > maximum_cells
+        or columns[0] > image.shape[1] * 0.10
+        or columns[-1] < image.shape[1] * 0.90
+        or rows[0] > image.shape[0] * 0.10
+        or rows[-1] < image.shape[0] * 0.90
+    ):
+        return None
+    if current_grid is not None and (
+        len(current_grid[0]) == len(columns)
+        and len(current_grid[1]) == len(rows)
+    ):
+        return None
+    row_gaps = np.diff(rows).astype(float)
+    typical_gap = float(np.median(row_gaps[2:])) if row_gaps.size > 2 else 0.0
+    if (
+        typical_gap < 12.0
+        or row_gaps[0] < typical_gap * 1.25
+        or row_gaps[1] < typical_gap * 1.25
+    ):
+        return None
+
+    internal_count = max(0, column_count - 1)
+    if internal_count < 1:
+        return None
+
+    def interval_divider_count(row: int) -> int:
+        top, bottom = int(rows[row]), int(rows[row + 1])
+        inset = max(2, int(round((bottom - top) * 0.16)))
+        band_top = min(bottom, top + inset)
+        band_bottom = max(band_top + 1, bottom - inset)
+        count = 0
+        for boundary in columns[1:-1]:
+            band = vertical[
+                band_top:band_bottom,
+                max(0, int(boundary) - 3) : min(vertical.shape[1], int(boundary) + 4),
+            ]
+            support = float(np.mean(np.any(band > 0, axis=1))) if band.size else 0.0
+            count += support >= 0.80
+        return count
+
+    divider_counts = [interval_divider_count(row) for row in range(row_count)]
+    if (
+        divider_counts[0] > max(1, int(math.floor(internal_count * 0.34)))
+        or divider_counts[1] < max(1, int(math.ceil(internal_count * 0.80)))
+    ):
+        return None
+    full_body_floor = max(1, int(math.ceil(internal_count * 0.80)))
+    body_end = 2
+    while body_end < row_count and divider_counts[body_end] >= full_body_floor:
+        body_end += 1
+    if body_end - 2 < 3 or row_count - body_end < 2:
+        return None
+    tail_ceiling = max(1, int(math.floor(internal_count * 0.34)))
+    if any(count > tail_ceiling for count in divider_counts[body_end:]):
+        return None
+
+    mask = cv2.bitwise_or(horizontal, vertical)
+    mask = cv2.dilate(mask, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)))
+    cleaned = image.copy()
+    cleaned[mask > 0] = 255
+    return (
+        [int(value) for value in columns],
+        [int(value) for value in rows],
+        cleaned,
+    )
+
+
 def _trim_blank_form_outer_closure_rows(
     rows: list[int],
     grid: list[list[str]],
@@ -2675,12 +2987,98 @@ def _trim_blank_form_outer_closure_rows(
     )
 
 
+def _collapse_blank_form_split_header_row(
+    image: np.ndarray,
+    columns: list[int],
+    rows: list[int],
+    grid: list[list[str]],
+    confidence_grid: list[list[float]] | None,
+) -> tuple[list[int], list[list[str]], list[list[float]] | None] | None:
+    """Remove one weak false divider that splits a tall blank-form header."""
+    row_count = len(grid)
+    column_count = len(grid[0]) if grid else 0
+    if (
+        row_count < 9
+        or not 2 <= column_count <= 12
+        or len(columns) != column_count + 1
+        or len(rows) != row_count + 1
+        or any(len(row) != column_count for row in grid)
+    ):
+        return None
+    populations = [sum(bool(str(value).strip()) for value in row) for row in grid]
+    if populations[0] != 1 or min(populations[1], populations[2]) > 1:
+        return None
+    merged_header: list[str] = []
+    merged_scores: list[float] = []
+    for column in range(column_count):
+        upper = str(grid[1][column]).strip()
+        lower = str(grid[2][column]).strip()
+        if upper and lower:
+            upper_key = _comparable_text(upper)
+            lower_key = _comparable_text(lower)
+            if upper_key not in lower_key and lower_key not in upper_key:
+                return None
+            selected = upper if len(upper_key) >= len(lower_key) else lower
+        else:
+            selected = upper or lower
+        merged_header.append(selected)
+        if confidence_grid is not None:
+            scores = [
+                float(confidence_grid[row][column])
+                for row in (1, 2)
+                if str(grid[row][column]).strip()
+            ]
+            merged_scores.append(min(scores) if scores else 0.0)
+    if sum(bool(value) for value in merged_header) < column_count - 1:
+        return None
+    blank_end = 3
+    while blank_end < row_count and populations[blank_end] == 0:
+        blank_end += 1
+    if blank_end - 3 < 3:
+        return None
+    if sum(populations[row] > 0 for row in range(blank_end, row_count)) < 2:
+        return None
+
+    horizontal = pipeline._grid_maps(image)[0]
+    support_values = []
+    for boundary in (rows[1], rows[2], rows[3]):
+        band = horizontal[
+            max(0, int(boundary) - 2) : min(horizontal.shape[0], int(boundary) + 3),
+            max(0, int(columns[0])) : min(horizontal.shape[1], int(columns[-1]) + 1),
+        ]
+        support_values.append(
+            float(np.mean(np.any(band > 0, axis=0))) if band.size else 0.0
+        )
+    if not (
+        support_values[0] >= 0.80
+        and support_values[1] < 0.50
+        and support_values[2] >= 0.80
+    ):
+        return None
+
+    collapsed_grid = [list(grid[0]), merged_header, *[list(row) for row in grid[3:]]]
+    collapsed_confidence = None
+    if confidence_grid is not None:
+        collapsed_confidence = [
+            list(confidence_grid[0]),
+            merged_scores,
+            *[list(row) for row in confidence_grid[3:]],
+        ]
+    return (
+        [int(value) for value in [*rows[:2], *rows[3:]]],
+        collapsed_grid,
+        collapsed_confidence,
+    )
+
+
 def _recover_blank_form_physical_spans(
     image: np.ndarray,
     columns: list[int],
     rows: list[int],
     grid: list[list[str]],
     confidence_grid: list[list[float]] | None,
+    *,
+    force_title_span: bool = False,
 ) -> list[dict[str, Any]]:
     """Recover title and repeated blank-entry merges from physical dividers."""
     row_count = len(grid)
@@ -2706,22 +3104,39 @@ def _recover_blank_form_physical_spans(
                 max(0, int(boundary) - 3) : min(vertical.shape[1], int(boundary) + 4),
             ]
             support = float(np.mean(np.any(band > 0, axis=1))) if band.size else 0.0
-            if support >= 0.35:
+            if support >= 0.90:
                 supported.append(index)
         supported.append(column_count)
         return supported
 
     spans: list[dict[str, Any]] = []
     title_cells = [column for column, value in enumerate(grid[0]) if str(value).strip()]
-    title_boundaries = supported_boundaries(0)
-    if len(title_cells) == 1 and title_boundaries == [0, column_count]:
-        source = title_cells[0]
-        if source != 0:
-            grid[0][0] = grid[0][source]
-            grid[0][source] = ""
-            if confidence_grid is not None:
-                confidence_grid[0][0] = confidence_grid[0][source]
-                confidence_grid[0][source] = 0.0
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    title_top, title_bottom = int(rows[0]), int(rows[1])
+    title_inset = max(2, int(round((title_bottom - title_top) * 0.16)))
+    title_band_top = min(title_bottom, title_top + title_inset)
+    title_band_bottom = max(title_band_top + 1, title_bottom - title_inset)
+    title_has_internal_divider = False
+    for boundary in columns[1:-1]:
+        band = gray[
+            title_band_top:title_band_bottom,
+            max(0, int(boundary) - 2) : min(gray.shape[1], int(boundary) + 3),
+        ]
+        if band.size and float(np.max(np.mean(band < 180, axis=0))) >= 0.95:
+            title_has_internal_divider = True
+            break
+    if title_cells and (force_title_span or not title_has_internal_divider):
+        title_text = "".join(str(grid[0][column]).strip() for column in title_cells)
+        title_scores = (
+            [float(confidence_grid[0][column]) for column in title_cells]
+            if confidence_grid is not None
+            else []
+        )
+        grid[0] = [""] * column_count
+        grid[0][0] = title_text
+        if confidence_grid is not None:
+            confidence_grid[0] = [0.0] * column_count
+            confidence_grid[0][0] = min(title_scores) if title_scores else 0.77
         spans.append(
             {
                 "row": 0,
@@ -2762,6 +3177,110 @@ def _recover_blank_form_physical_spans(
                 }
             )
     return spans
+
+
+def _recover_blank_form_title_multiview(
+    image: np.ndarray,
+    columns: list[int],
+    rows: list[int],
+    grid: list[list[str]],
+    confidence_grid: list[list[float]] | None,
+    spans: list[dict[str, Any]],
+    ocr_engine: Any,
+) -> list[float]:
+    """Re-read a blank-form title only when three model families agree."""
+    if (
+        not grid
+        or confidence_grid is None
+        or len(columns) != len(grid[0]) + 1
+        or len(rows) != len(grid) + 1
+        or not any(
+            span.get("role") == "title"
+            and int(span.get("row", -1)) == 0
+            and int(span.get("column", -1)) == 0
+            and int(span.get("column_span", 1)) == len(grid[0])
+            for span in spans
+        )
+    ):
+        return []
+    recognizers = [
+        getattr(ocr_engine, "fast_text_rec", None),
+        getattr(ocr_engine, "text_rec", None),
+        getattr(ocr_engine, "server_text_rec", None),
+    ]
+    if not all(callable(recognizer) for recognizer in recognizers):
+        return []
+    crop = image[
+        max(0, int(rows[0]) + 2) : min(image.shape[0], int(rows[1]) - 2),
+        max(0, int(columns[0]) + 2) : min(image.shape[1], int(columns[-1]) - 2),
+    ]
+    tight = _tight_text_crop(crop) if crop.size else crop
+    if tight.size == 0:
+        return []
+    views = [
+        tight,
+        cv2.resize(tight, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LANCZOS4),
+        cv2.resize(tight, None, fx=3.2, fy=3.2, interpolation=cv2.INTER_LANCZOS4),
+    ]
+    from rapidocr.ch_ppocr_rec.typings import TextRecInput
+
+    family_results: list[tuple[str, float]] = []
+    all_scores: list[float] = []
+    for recognizer in recognizers:
+        output = recognizer(TextRecInput(img=views))
+        _release_recognition_images(output)
+        texts = [str(value).strip() for value in output.txts]
+        scores = [float(value) for value in output.scores]
+        all_scores.extend(scores)
+        if len(texts) != 3 or len(scores) != 3:
+            return all_scores
+        groups: dict[str, list[tuple[str, float]]] = {}
+        for text, score in zip(texts, scores):
+            key = _comparable_text(text)
+            if len(key) >= 3 and score >= 0.90:
+                groups.setdefault(key, []).append((text, score))
+        supported = [values for values in groups.values() if len(values) >= 2]
+        if len(supported) != 1:
+            return all_scores
+        values = supported[0]
+        family_results.append((values[0][0], min(score for _, score in values)))
+    keys = {_comparable_text(text) for text, _ in family_results}
+    if len(keys) != 1:
+        confidence_grid[0][0] = min(float(confidence_grid[0][0]), 0.77)
+        return all_scores
+    grid[0][0] = family_results[0][0]
+    confidence_grid[0][0] = min(score for _, score in family_results)
+    return all_scores
+
+
+def _clear_blank_form_span_subordinates(
+    grid: list[list[str]],
+    confidence_grid: list[list[float]],
+    spans: list[dict[str, Any]],
+) -> set[tuple[int, int]]:
+    """Clear model fills from physically merged subordinate cells."""
+    cleared: set[tuple[int, int]] = set()
+    for span in spans:
+        anchor_row = int(span.get("row", -1))
+        anchor_column = int(span.get("column", -1))
+        row_span = max(1, int(span.get("row_span", 1)))
+        column_span = max(1, int(span.get("column_span", 1)))
+        for row in range(anchor_row, anchor_row + row_span):
+            for column in range(anchor_column, anchor_column + column_span):
+                if (row, column) == (anchor_row, anchor_column):
+                    continue
+                if not (
+                    0 <= row < len(grid)
+                    and 0 <= row < len(confidence_grid)
+                    and 0 <= column < len(grid[row])
+                    and 0 <= column < len(confidence_grid[row])
+                ):
+                    continue
+                if str(grid[row][column]).strip() or float(confidence_grid[row][column]) != 0.0:
+                    cleared.add((row, column))
+                grid[row][column] = ""
+                confidence_grid[row][column] = 0.0
+    return cleared
 
 
 def _matched_boundary_ratio(
@@ -3733,6 +4252,97 @@ def _recover_vertically_truncated_photo_grid(
         )
     if selected_candidate is not None:
         ratio, candidate_image, candidate_grid, _, expanded_corners = selected_candidate
+        bottom_expansion_ratio: float | None = None
+        if bool(metadata.get("full_frame_perspective_grid", False)):
+            candidate_baseline = _ruled_grid_edge_evidence(
+                candidate_image,
+                candidate_grid,
+            )
+        else:
+            candidate_baseline = None
+        if candidate_baseline is not None:
+            candidate_rows = len(candidate_grid[1]) - 1
+            candidate_columns = len(candidate_grid[0]) - 1
+            for ratio_pair in ((0.02, 0.025), (0.025, 0.03), (0.03, 0.035)):
+                bottom_candidates = []
+                for bottom_ratio in ratio_pair:
+                    expanded_bottom = _bottom_document_rectification(
+                        source,
+                        expanded_corners,
+                        bottom_ratio,
+                    )
+                    if expanded_bottom is None:
+                        continue
+                    bottom_image, bottom_transform, bottom_corners = expanded_bottom
+                    bottom_grid = pipeline.extract_ruled_grid(
+                        bottom_image,
+                        prefer_adaptive=True,
+                    )
+                    bottom_evidence = _ruled_grid_edge_evidence(
+                        bottom_image,
+                        bottom_grid,
+                    )
+                    if bottom_grid is None or bottom_evidence is None:
+                        continue
+                    preserves, strong_additions = (
+                        _expanded_grid_preserves_base_and_adds_strong_rows(
+                            candidate_baseline,
+                            bottom_evidence,
+                            expanded_corners,
+                            bottom_transform,
+                        )
+                    )
+                    bottom_rows = len(bottom_grid[1]) - 1
+                    bottom_columns = len(bottom_grid[0]) - 1
+                    if (
+                        preserves
+                        and (
+                            strong_additions
+                            or _grid_has_text_supported_trailing_rows(
+                                bottom_image,
+                                bottom_grid,
+                                candidate_rows,
+                            )
+                        )
+                        and bottom_columns == candidate_columns
+                        and 1 <= bottom_rows - candidate_rows <= 2
+                        and _grid_geometry_is_bounded(
+                            bottom_grid[0],
+                            bottom_grid[1],
+                            maximum_cells=maximum_cells,
+                        )
+                        and _photographic_ruled_grid_is_credible(
+                            bottom_image,
+                            bottom_grid[0],
+                            bottom_grid[1],
+                        )
+                    ):
+                        bottom_candidates.append(
+                            (
+                                bottom_ratio,
+                                bottom_image,
+                                bottom_grid,
+                                bottom_corners,
+                            )
+                        )
+                if (
+                    len(bottom_candidates) == 2
+                    and (
+                        len(bottom_candidates[0][2][1]),
+                        len(bottom_candidates[0][2][0]),
+                    )
+                    == (
+                        len(bottom_candidates[1][2][1]),
+                        len(bottom_candidates[1][2][0]),
+                    )
+                ):
+                    (
+                        bottom_expansion_ratio,
+                        candidate_image,
+                        candidate_grid,
+                        expanded_corners,
+                    ) = bottom_candidates[0]
+                    break
         candidate_shape = (len(candidate_grid[1]) - 1, len(candidate_grid[0]) - 1)
         metadata.update(
             {
@@ -3750,6 +4360,9 @@ def _recover_vertically_truncated_photo_grid(
                 "stable_clipped_edge_pair": selected_from_stable_clipped_edge,
             }
         )
+        if bottom_expansion_ratio is not None:
+            metadata["bottom_only_expansion"] = True
+            metadata["bottom_expansion_ratio"] = bottom_expansion_ratio
         return candidate_image, candidate_grid, metadata, False
 
     metadata["edge_completeness_checked"] = not saw_supported_external_rows
@@ -3806,9 +4419,15 @@ def _small_clear_screen_grid_uses_page_primary(
     row_gaps = np.diff(rows).astype(float)
     column_gaps = np.diff(columns).astype(float)
     typical_row = float(np.median(row_gaps)) if row_gaps.size else 0.0
+    typical_column = float(np.median(column_gaps)) if column_gaps.size else 0.0
     if (
         typical_row < 24.0
         or min(column_gaps, default=0.0) < 60.0
+        or (
+            typical_column > 0.0
+            and column_gaps[0] < typical_column * 0.60
+            and column_gaps[-1] < typical_column * 0.60
+        )
         or float(np.mean(np.abs(row_gaps - typical_row) <= max(3.0, typical_row * 0.20))) < 0.85
     ):
         return False
@@ -4534,6 +5153,58 @@ def _title_spans_from_screen_grid(
     }]
 
 
+def _spatial_title_is_prominent(
+    grid: list[list[str]],
+    geometry: dict[str, Any],
+) -> bool:
+    """Require centred, visibly larger title text before restoring a lost span."""
+    if len(grid) < 6 or len(grid[0]) < 3:
+        return False
+    column_count = len(grid[0])
+    if (
+        any(len(row) != column_count for row in grid)
+        or sum(bool(str(value).strip()) for value in grid[0]) != 1
+        or sum(bool(str(value).strip()) for value in grid[1]) < column_count - 1
+        or sum(
+            sum(bool(str(value).strip()) for value in row) >= column_count - 1
+            for row in grid[2:]
+        )
+        < 4
+    ):
+        return False
+    groups = geometry.get("grouped_rows")
+    anchors = geometry.get("anchors")
+    if (
+        not isinstance(groups, list)
+        or len(groups) != len(grid)
+        or not isinstance(anchors, list)
+        or len(anchors) != column_count
+        or len(groups[0]) != 1
+    ):
+        return False
+    title = groups[0][0]
+    later_heights = [
+        float(entry.get("height", 0.0))
+        for row in groups[1 : min(len(groups), 8)]
+        for entry in row
+        if float(entry.get("height", 0.0)) > 0.0
+    ]
+    if not later_heights:
+        return False
+    title_height = float(title.get("height", 0.0))
+    ordinary_height = float(np.median(later_heights))
+    left_anchor = float(anchors[0])
+    right_anchor = float(anchors[-1])
+    table_width = max(1.0, right_anchor - left_anchor)
+    table_center = (left_anchor + right_anchor) * 0.5
+    return bool(
+        float(title.get("score", 0.0)) >= 0.78
+        and title_height >= ordinary_height * 1.18
+        and abs(float(title.get("center_x", table_center)) - table_center)
+        <= table_width * 0.10
+    )
+
+
 def _new_structure_certificate(
     image: np.ndarray,
     columns: list[int],
@@ -4998,6 +5669,13 @@ def _strict_simple_title_span(
         or value in _COMMON_HEADER_LABELS
         for value in header_values
     )
+    textual_headers = sum(
+        bool(value)
+        and len(value) <= 18
+        and not re.search(r"\d{2,}", value)
+        and re.fullmatch(r"[A-Za-z\u3400-\u9fff（）() _./-]+", value) is not None
+        for value in header_values
+    )
     dense_body_rows = sum(
         sum(bool(str(value).strip()) for value in row) >= column_count - 1
         for row in grid[2:]
@@ -5006,7 +5684,10 @@ def _strict_simple_title_span(
         len(title_values) == 1
         and len(title_values[0]) >= 3
         and len(header_values) >= column_count - 1
-        and semantic_headers >= max(3, int(math.ceil(column_count * 0.50)))
+        and (
+            semantic_headers >= max(3, int(math.ceil(column_count * 0.50)))
+            or textual_headers >= column_count - 1
+        )
         and dense_body_rows >= 4
     ):
         return []
@@ -6099,6 +6780,8 @@ def _recover_certified_physical_group_header_spans(
     confidence_grid: list[list[float]] | None,
     page_text_evidence: list[tuple[str, float, float, float]],
     spans: list[dict[str, Any]],
+    *,
+    ocr_engine: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Anchor short merged header rows only to continuous physical dividers."""
     row_count = len(grid)
@@ -6116,7 +6799,20 @@ def _recover_certified_physical_group_header_spans(
         for span in spans
         if span.get("role") == "title"
     }
-    first_group_row = max(title_rows) + 1 if title_rows else 0
+    repeated_title_before_dense_header = bool(
+        0 in title_rows
+        and 1 in title_rows
+        and len(grid) >= 3
+        and sum(bool(str(value).strip()) for value in grid[1]) == 1
+        and sum(bool(str(value).strip()) for value in grid[2]) >= column_count - 1
+    )
+    first_group_row = (
+        1
+        if repeated_title_before_dense_header
+        else max(title_rows) + 1
+        if title_rows
+        else 0
+    )
     detail_row = next(
         (
             row
@@ -6224,6 +6920,69 @@ def _recover_certified_physical_group_header_spans(
             if _text_edit_distance(combined_key, _comparable_text(label)) <= 1
         ]
         return matches[0] if len(matches) == 1 else combined
+
+    def reread_missing_interval(
+        row_index: int,
+        start: int,
+        end: int,
+    ) -> tuple[str, float] | None:
+        medium = getattr(ocr_engine, "text_rec", None)
+        alternate = getattr(ocr_engine, "server_text_rec", None)
+        if not callable(medium) or not callable(alternate):
+            return None
+        top = max(0, int(rows[row_index]) + 2)
+        bottom = min(image.shape[0], int(rows[row_index + 1]) - 2)
+        left = max(0, int(columns[start]) + 3)
+        right = min(image.shape[1], int(columns[end]) - 3)
+        crop = image[top:bottom, left:right]
+        tight = _tight_text_crop(crop) if crop.size else crop
+        if tight.size == 0:
+            return None
+        if tight.ndim == 2:
+            gray = tight
+            color = cv2.cvtColor(tight, cv2.COLOR_GRAY2BGR)
+        else:
+            color = tight
+            gray = cv2.cvtColor(tight, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 4)).apply(gray)
+        binary = cv2.threshold(
+            clahe, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )[1]
+        views = [
+            color,
+            cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR),
+            cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR),
+            cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR),
+        ]
+        from rapidocr.ch_ppocr_rec.typings import TextRecInput
+
+        model_votes: list[tuple[str, float]] = []
+        for recognizer in (medium, alternate):
+            output = recognizer(TextRecInput(img=views))
+            _release_recognition_images(output)
+            if len(output.txts) != 4 or len(output.scores) != 4:
+                return None
+            votes: dict[str, list[float]] = {}
+            for text, score in zip(output.txts, output.scores):
+                value = str(text).strip()
+                numeric_score = float(score)
+                if (
+                    numeric_score >= 0.88
+                    and re.fullmatch(r"[A-Za-z\u3400-\u9fff][A-Za-z\u3400-\u9fff _-]{1,15}", value)
+                    and not re.search(r"\d", value)
+                ):
+                    votes.setdefault(value, []).append(numeric_score)
+            proven = [
+                (text, min(scores))
+                for text, scores in votes.items()
+                if len(scores) >= 3
+            ]
+            if len(proven) != 1:
+                return None
+            model_votes.append(proven[0])
+        if len(model_votes) != 2 or model_votes[0][0] != model_votes[1][0]:
+            return None
+        return model_votes[0][0], min(model_votes[0][1], model_votes[1][1], 0.77)
 
     rebuilt_spans = list(spans)
     for row_index in range(first_group_row, detail_row):
@@ -6528,6 +7287,10 @@ def _recover_certified_physical_group_header_spans(
                 if float(columns[start]) <= entry[1] <= float(columns[end])
             ]
             if not fragments:
+                reread = reread_missing_interval(row_index, start, end)
+                if reread is not None:
+                    recovered.append(reread)
+                    continue
                 fragments = [
                     (
                         str(grid[row_index][column]).strip(),
@@ -6547,6 +7310,11 @@ def _recover_certified_physical_group_header_spans(
                 (text, min((score for _, _, score in fragments), default=0.77))
             )
 
+        rebuilt_spans = [
+            span
+            for span in rebuilt_spans
+            if int(span.get("row", -1)) != row_index
+        ]
         grid[row_index] = [""] * column_count
         if confidence_grid is not None:
             confidence_grid[row_index] = [0.0] * column_count
@@ -8902,6 +9670,9 @@ def _recover_missing_spatial_cells(
     row_boundaries = [
         float(value) for value in geometry.get("row_boundaries", [])
     ]
+    cell_bounds = geometry.get("cell_bounds", {})
+    if not isinstance(cell_bounds, dict):
+        cell_bounds = {}
     grouped_rows = list(geometry.get("grouped_rows", []))
     first_structured_row = int(geometry.get("first_structured_row", 0))
     row_count = len(grid)
@@ -9044,7 +9815,13 @@ def _recover_missing_spatial_cells(
         ]
     ] = []
     for score, row, column in candidates:
-        if has_exact_cell_bounds:
+        exact_cell_bounds = cell_bounds.get((row, column))
+        if exact_cell_bounds is not None and len(exact_cell_bounds) == 4:
+            left = max(0, int(round(exact_cell_bounds[0])))
+            right = min(width, int(round(exact_cell_bounds[1])))
+            top = max(0, int(round(exact_cell_bounds[2])))
+            bottom = min(height, int(round(exact_cell_bounds[3])))
+        elif has_exact_cell_bounds:
             left = max(0, int(round(column_boundaries[column])))
             right = min(width, int(round(column_boundaries[column + 1])))
             top = max(0, int(round(row_boundaries[row])))
@@ -9052,8 +9829,15 @@ def _recover_missing_spatial_cells(
         else:
             left, right = midpoint_bounds(anchors, column, width)
             top, bottom = midpoint_bounds(row_centers, row, height)
-        pad_x = max(1, min(4, (right - left) // 15))
-        pad_y = max(1, min(3, (bottom - top) // 12))
+        if exact_cell_bounds is not None:
+            # SLANet already returns the physical cell quadrilateral. Keep only
+            # a one-pixel line inset; the wider generic inset can clip the
+            # leading digit or CJK glyph in a tightly aligned camera frame.
+            pad_x = max(1, min(2, (right - left) // 30))
+            pad_y = 1
+        else:
+            pad_x = max(1, min(4, (right - left) // 15))
+            pad_y = max(1, min(3, (bottom - top) // 12))
         crop = image[top + pad_y : bottom - pad_y, left + pad_x : right - pad_x]
         if crop.size == 0:
             continue
@@ -9115,8 +9899,12 @@ def _recover_missing_spatial_cells(
         bottom,
         visible_mark,
     ) in prepared_candidates:
-        pad_x = max(1, min(4, (right - left) // 15))
-        pad_y = max(1, min(3, (bottom - top) // 12))
+        if (row, column) in cell_bounds:
+            pad_x = max(1, min(2, (right - left) // 30))
+            pad_y = 1
+        else:
+            pad_x = max(1, min(4, (right - left) // 15))
+            pad_y = max(1, min(3, (bottom - top) // 12))
         raw_cell_crop = image[
             top + pad_y : bottom - pad_y,
             left + pad_x : right - pad_x,
@@ -11623,7 +12411,7 @@ def _verify_motion_blurred_ruled_cells(
     if not callable(medium_recognizer):
         return []
 
-    if view_mode not in {"motion", "standard"}:
+    if view_mode not in {"motion", "motion_horizontal", "standard"}:
         raise ValueError(f"unsupported physical-cell view mode: {view_mode}")
 
     locations: list[tuple[int, int]] = []
@@ -11660,13 +12448,17 @@ def _verify_motion_blurred_ruled_cells(
             raw_view = tight
             if raw_view.ndim == 2:
                 raw_view = cv2.cvtColor(raw_view, cv2.COLOR_GRAY2BGR)
-            if view_mode == "motion":
+            if view_mode in {"motion", "motion_horizontal"}:
                 gray = (
                     cv2.cvtColor(tight, cv2.COLOR_BGR2GRAY)
                     if tight.ndim == 3
                     else tight
                 )
-                restored = _wiener_motion_deblur_view(gray, 7, 45.0)
+                restored = _wiener_motion_deblur_view(
+                    gray,
+                    7,
+                    0.0 if view_mode == "motion_horizontal" else 45.0,
+                )
             else:
                 restored = tight
             restored = cv2.resize(
@@ -11714,6 +12506,33 @@ def _verify_motion_blurred_ruled_cells(
     ) -> bool:
         if not indices:
             return True
+        extreme_aspect_indices = [
+            index
+            for index in indices
+            if views[index].shape[1]
+            / max(1.0, float(views[index].shape[0]))
+            >= 20.0
+        ]
+        extreme_aspect_locations = [
+            [
+                int(locations[index][0]),
+                int(locations[index][1]),
+                round(
+                    views[index].shape[1]
+                    / max(1.0, float(views[index].shape[0])),
+                    3,
+                ),
+                int((cell_span_widths or {}).get(locations[index], 1)),
+            ]
+            for index in extreme_aspect_indices
+        ]
+        if extreme_aspect_locations:
+            _write_runtime_trace(
+                "route",
+                name="extreme_aspect_cell_batch",
+                family=family,
+                locations=extreme_aspect_locations,
+            )
         if isolated_recognition:
             group_size = max(1, int(isolated_group_size))
             recognition_groups = [
@@ -11721,7 +12540,18 @@ def _verify_motion_blurred_ruled_cells(
                 for start in range(0, len(indices), group_size)
             ]
         else:
-            recognition_groups = [indices]
+            extreme_index_set = set(extreme_aspect_indices)
+            ordinary_indices = [
+                index for index in indices if index not in extreme_index_set
+            ]
+            recognition_groups = (
+                [ordinary_indices, extreme_aspect_indices]
+                if (
+                    0 < len(extreme_aspect_indices) <= 8
+                    and len(ordinary_indices) >= 8
+                )
+                else [indices]
+            )
         for group in recognition_groups:
             output = recognizer(TextRecInput(img=[views[index] for index in group]))
             _release_recognition_images(output)
@@ -12021,12 +12851,23 @@ def _verify_motion_blurred_ruled_cells(
     # category code rather than generic numeric text.
     semantic_headers_by_column = semantic_headers()
     if unresolved and callable(alternate_medium_recognizer):
+        deferred_leading_extreme = {
+            index
+            for index in unresolved
+            if locations[index][0] < min(2, row_count)
+            and views[index].shape[1]
+            / max(1.0, float(views[index].shape[0]))
+            >= 20.0
+        }
+        alternate_indices = [
+            index for index in unresolved if index not in deferred_leading_extreme
+        ]
         if not add_recognition_batch(
-            "medium-alternate", alternate_medium_recognizer, unresolved
+            "medium-alternate", alternate_medium_recognizer, alternate_indices
         ):
             return all_scores
-        still_unresolved = []
-        for index in unresolved:
+        still_unresolved = list(deferred_leading_extreme)
+        for index in alternate_indices:
             values = supported_group(index)
             if values is None:
                 still_unresolved.append(index)
@@ -12140,6 +12981,8 @@ def _verify_motion_blurred_ruled_cells(
         isolated_primary_indices = []
         for index in raw_retry_indices:
             raw_height, raw_width = raw_views[index].shape[:2]
+            if raw_height < 6 or raw_width < 6:
+                continue
             # 低于模型基础宽高比时，单图和同类批次都使用同一固定输入宽度；
             # 只合并这部分裁格，超宽裁格仍逐格识别，避免改变归一化证据。
             if (
@@ -12705,6 +13548,8 @@ def _ruled_semantic_header_kind(value: Any) -> str:
         return "frequency_header_unit" if header_has_frequency_unit else "frequency"
     if "数量" in header or "数目" in header or "个数" in header:
         return "quantity"
+    if "日期" in header:
+        return "date"
     return ""
 
 
@@ -12733,6 +13578,19 @@ def _ruled_semantic_value_is_valid(kind: str, value: Any) -> bool:
         return bool(re.fullmatch(number + r"(?:[kmgt]?hz)?", normalized))
     if kind == "quantity":
         return bool(re.fullmatch(number + r"(?:个|台|套|件)?", normalized))
+    if kind == "date":
+        match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", normalized)
+        if match is None:
+            return False
+        year, month, day = (int(part) for part in match.groups())
+        if not 1900 <= year <= 2199 or not 1 <= month <= 12:
+            return False
+        month_days = [
+            31,
+            29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28,
+            31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+        ]
+        return 1 <= day <= month_days[month - 1]
     return True
 
 
@@ -13296,6 +14154,11 @@ _COMMON_HEADER_LABELS = tuple(
             "测量与判定", "验收结果", "报名状态", "联系电话",
             "学号", "姓名", "语文", "数学", "英语", "总分", "等级",
             "物料编码", "品名", "规格", "单价",
+            "领料单号", "材料编码", "材料名称", "规格型号", "申请数量",
+            "实发数量", "领用人", "任务号", "车牌号", "司机", "出发地",
+            "目的地", "计划时间", "实际时间", "工单号", "检验项目",
+            "报修位置", "维修项目", "维修人",
+            "检查项目", "标准值", "标称值", "批次号", "地块", "入库位置",
             "上期读数", "本期读数", "用量", "金额", "抄表日期",
             "收入(元)", "支出(元)",
             "科室", "医生",
@@ -13750,6 +14613,56 @@ def _split_collapsed_header_data_row(
     if len(grid) < 2:
         return grid, confidence_grid, spans
 
+    def has_collapsed_header_data_evidence(row: list[str]) -> bool:
+        nonempty = sum(bool(str(value).strip()) for value in row)
+        if nonempty < 3:
+            return False
+        matched = 0
+        values_with_data = 0
+        labels = sorted(_COMMON_HEADER_LABELS, key=len, reverse=True)
+        for value in row:
+            text = str(value).strip()
+            if re.fullmatch(r"(?:备注|数值|参数|指标)\d+", text):
+                matched += 1
+                continue
+            for label in labels:
+                if not text.startswith(label):
+                    continue
+                remainder = text[len(label) :].lstrip(" :：")
+                matched += 1
+                values_with_data += bool(remainder)
+                break
+        required = max(3, (nonempty + 1) // 2)
+        return matched >= required and values_with_data >= required
+
+    # A motion-blurred page can emit the full-width title twice, then merge the
+    # real header with the first body row. Remove the repeated row only when the
+    # following row independently proves that exact collapse pattern. This
+    # preserves intentionally repeated titles and does not invent any text.
+    if len(grid) >= 4 and len(grid[0]) >= 3:
+        first_values = [str(value).strip() for value in grid[0] if str(value).strip()]
+        second_values = [str(value).strip() for value in grid[1] if str(value).strip()]
+        if (
+            len(first_values) == 1
+            and len(second_values) == 1
+            and _comparable_text(first_values[0]) == _comparable_text(second_values[0])
+            and len(_comparable_text(first_values[0])) >= 3
+            and has_collapsed_header_data_evidence(grid[2])
+        ):
+            grid.pop(1)
+            if confidence_grid is not None:
+                confidence_grid.pop(1)
+            adjusted_spans = []
+            for span in spans:
+                adjusted = dict(span)
+                span_row = int(adjusted.get("row", -1))
+                if span_row == 1:
+                    continue
+                if span_row > 1:
+                    adjusted["row"] = span_row - 1
+                adjusted_spans.append(adjusted)
+            spans = adjusted_spans
+
     title_rows = {
         int(span.get("row", -1))
         for span in spans
@@ -13897,6 +14810,25 @@ def _split_collapsed_header_data_row(
                         0.78,
                     )
                 continue
+            if (
+                len(labels) == 2
+                and source_column + 1 < len(row)
+                and not str(row[source_column + 1]).strip()
+                and row_index + 1 < len(grid)
+                and bool(str(grid[row_index + 1][source_column]).strip())
+                and bool(str(grid[row_index + 1][source_column + 1]).strip())
+            ):
+                row[source_column] = labels[0]
+                row[source_column + 1] = labels[1]
+                if confidence_grid is not None:
+                    split_score = (
+                        source_score
+                        if source_score >= 0.78
+                        else min(abs(source_score), 0.77)
+                    )
+                    confidence_grid[row_index][source_column] = split_score
+                    confidence_grid[row_index][source_column + 1] = split_score
+                continue
             if confidence_grid is not None and source_score < 0.78:
                 # A low-confidence detector may return recognizable labels in
                 # reading order rather than physical column order.  Keep the
@@ -13968,7 +14900,11 @@ def _split_collapsed_header_data_row(
         for value in row:
             text = str(value).strip()
             match = None
+            if re.fullmatch(r"(?:备注|数值|参数|指标)\d+", text):
+                match = (text, "")
             for label in _COMMON_HEADER_LABELS:
+                if match is not None:
+                    break
                 if text == label:
                     match = (label, "")
                     break
@@ -14068,7 +15004,25 @@ def _recover_leading_metadata_spans(
     occupied_rows = {int(span.get("row", -1)) for span in spans}
     recovered_spans = list(spans)
     for row in range(detail_row):
-        if row in occupied_rows:
+        existing_row_spans = [
+            span
+            for span in recovered_spans
+            if int(span.get("row", -1)) == row
+        ]
+        existing_metadata_span_candidate = bool(
+            row > 0
+            and existing_row_spans
+            and all(
+                span.get("role") in {"subtitle", "group_header"}
+                for span in existing_row_spans
+            )
+            and any(
+                re.search(r"[:：]", str(value).strip())
+                for value in grid[row]
+                if str(value).strip()
+            )
+        )
+        if row in occupied_rows and not existing_metadata_span_candidate:
             continue
         top, bottom = int(rows[row]), int(rows[row + 1])
         inset = max(2, int(round((bottom - top) * 0.16)))
@@ -14132,6 +15086,33 @@ def _recover_leading_metadata_spans(
         )
         if not metadata_row:
             continue
+        visible_row_values = [
+            str(value).strip()
+            for value in grid[row]
+            if str(value).strip()
+        ]
+        metadata_value_count = sum(
+            bool(re.search(r"[:：]", value))
+            for value in visible_row_values
+        )
+        if (
+            len(visible_row_values) >= 2
+            and metadata_value_count == 1
+            and any(
+                not re.search(r"[:：]", value)
+                for value in visible_row_values
+            )
+        ):
+            # A page number or approval mark beside one metadata field is an
+            # independent cell, not evidence that the metadata owns the blank
+            # columns between them.  Keep the physical positions unchanged.
+            continue
+        if existing_metadata_span_candidate:
+            recovered_spans = [
+                span
+                for span in recovered_spans
+                if int(span.get("row", -1)) != row
+            ]
         if (
             metadata_row
             and len(row_evidence) == 2
@@ -14364,7 +15345,9 @@ def _recover_stacked_subtitle_for_review(
             start=1,
         ):
             boundary = (
-                right_position
+                column_count // 2
+                if len(metadata_fields) == 2
+                else right_position
                 if right_position - left_position <= 2 and right_position >= 2
                 else int(math.floor(column_count * index / len(metadata_fields)))
                 if right_position - left_position <= 2
@@ -14708,8 +15691,13 @@ def _repair_spurious_leading_checkmarks(
                 global_unmarked_counts.get(suffix_key, 0) >= 3
                 and adjacent_duplicate
             )
+            globally_repeated_nonboolean = (
+                global_unmarked_counts.get(suffix_key, 0) >= 4
+            )
             if len(suffix_key) < 2 or not (
-                same_column_repeated or cross_table_repeated
+                same_column_repeated
+                or cross_table_repeated
+                or globally_repeated_nonboolean
             ):
                 continue
             grid[row][column] = suffix
@@ -17911,7 +18899,7 @@ def _repair_overlapping_decimal_fragments(
     if any(len(row) != column_count for row in grid + confidence_grid):
         return set()
     clean_pattern = re.compile(r"[+\-]?\d+\.(\d+)")
-    split_pattern = re.compile(r"([+\-]?\d+\.\d+)\s+(\d+)")
+    split_pattern = re.compile(r"([+\-]?\d+\.\d*)\s+(\d+(?:\.\d+)?)")
     repaired: set[tuple[int, int]] = set()
     for column in range(column_count):
         clean_values: list[tuple[int, float]] = []
@@ -18756,20 +19744,45 @@ def _repair_common_header_multiview(
         key=lambda index: sum(bool(str(value).strip()) for value in grid[index]),
         default=0,
     )
-    candidates: list[tuple[int, int, str]] = []
+    semantic_header_count = sum(
+        str(value).strip() in _COMMON_HEADER_LABELS
+        for value in grid[header_row]
+    )
+    candidates: list[tuple[int, int, str | None]] = []
     for column, value in enumerate(grid[header_row]):
         current = str(value).strip()
-        if current in _COMMON_HEADER_LABELS or not re.fullmatch(r"[\u3400-\u9fff]{2,10}", current):
+        if current in _COMMON_HEADER_LABELS:
             continue
-        targets = [
-            label
-            for label in _COMMON_HEADER_LABELS
-            if re.fullmatch(r"[\u3400-\u9fff]{2,10}", label)
-            and len(label) == len(current)
-            and _text_edit_distance(current, label) == 1
-        ]
+        mark_match = re.fullmatch(r"[☑✓√]\s*(.+)", current)
+        marked_target = (
+            mark_match.group(1).strip()
+            if mark_match is not None
+            and mark_match.group(1).strip() in _COMMON_HEADER_LABELS
+            and not any(
+                token in mark_match.group(1)
+                for token in ("确认", "勾选", "选择", "是否", "判定", "状态")
+            )
+            else ""
+        )
+        targets = [marked_target] if marked_target else (
+            [
+                label
+                for label in _COMMON_HEADER_LABELS
+                if re.fullmatch(r"[\u3400-\u9fff]{2,10}", label)
+                and len(label) == len(current)
+                and _text_edit_distance(current, label) == 1
+            ]
+            if re.fullmatch(r"[\u3400-\u9fff]{2,10}", current)
+            else []
+        )
         if len(targets) == 1:
             candidates.append((header_row, column, targets[0]))
+        elif (
+            semantic_header_count >= len(grid[header_row]) - 1
+            and header_row + 1 < len(grid)
+            and bool(str(grid[header_row + 1][column]).strip())
+        ):
+            candidates.append((header_row, column, None))
     if not candidates or len(candidates) > 4:
         return set(), []
     from rapidocr.ch_ppocr_rec.typings import TextRecInput
@@ -18799,25 +19812,39 @@ def _repair_common_header_multiview(
             cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR),
         ]
         supported = True
+        model_targets: list[str] = []
         for recognizer in (medium, alternate):
             output = recognizer(TextRecInput(img=views))
             _release_recognition_images(output)
             texts = [str(value).strip() for value in output.txts]
             scores = [float(value) for value in output.scores]
             all_scores.extend(scores)
-            if (
-                len(texts) != 4
-                or len(scores) != 4
-                or sum(
-                    text == target and score >= 0.88
-                    for text, score in zip(texts, scores)
-                )
-                < 3
-            ):
+            if len(texts) != 4 or len(scores) != 4:
                 supported = False
                 break
+            if target is not None:
+                model_target = target
+            else:
+                votes: dict[str, int] = {}
+                for text, score in zip(texts, scores):
+                    if text in _COMMON_HEADER_LABELS and score >= 0.88:
+                        votes[text] = votes.get(text, 0) + 1
+                proven = [text for text, count in votes.items() if count >= 3]
+                if len(proven) != 1:
+                    supported = False
+                    break
+                model_target = proven[0]
+            if sum(
+                text == model_target and score >= 0.88
+                for text, score in zip(texts, scores)
+            ) < 3:
+                supported = False
+                break
+            model_targets.append(model_target)
+        if len(set(model_targets)) != 1:
+            supported = False
         if supported:
-            grid[row][column] = target
+            grid[row][column] = model_targets[0]
             confidence_grid[row][column] = min(
                 float(confidence_grid[row][column]),
                 0.77,
@@ -19169,34 +20196,26 @@ def _repair_repeated_categorical_blank_multiview(
             cv2.cvtColor(clahe, cv2.COLOR_GRAY2BGR),
             cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR),
         ]
-        outputs = []
-        for recognizer in (medium, alternate):
-            output = recognizer(TextRecInput(img=views))
-            _release_recognition_images(output)
-            texts = [str(value).strip() for value in output.txts]
-            scores = [float(value) for value in output.scores]
-            all_scores.extend(scores)
-            if len(texts) != 4 or len(scores) != 4:
-                outputs = []
-                break
-            outputs.append((texts, scores))
-        if len(outputs) != 2:
+        primary_output = medium(TextRecInput(img=views))
+        _release_recognition_images(primary_output)
+        primary_texts = [str(value).strip() for value in primary_output.txts]
+        primary_scores = [float(value) for value in primary_output.scores]
+        all_scores.extend(primary_scores)
+        if len(primary_texts) != 4 or len(primary_scores) != 4:
             continue
-        supported_targets = []
+
+        primary_evidence: dict[
+            str,
+            tuple[list[float], bool, bool],
+        ] = {}
         for target, peer_count in repeated.items():
             medium_votes = [
                 score
-                for text, score in zip(outputs[0][0], outputs[0][1])
+                for text, score in zip(primary_texts, primary_scores)
                 if text == target and score >= 0.75
             ]
-            alternate_votes = [
-                score
-                for text, score in zip(outputs[1][0], outputs[1][1])
-                if text == target and score >= 0.75
-            ]
-            exact_support = len(medium_votes) >= 2 and (
-                len(alternate_votes) >= 2
-                or (peer_count >= 3 and max(medium_votes) >= 0.95)
+            exact_without_alternate = len(medium_votes) >= 2 and (
+                (peer_count >= 3 and max(medium_votes) >= 0.95)
                 or (
                     peer_count >= 1
                     and bool(current)
@@ -19212,7 +20231,7 @@ def _repair_repeated_categorical_blank_multiview(
             )
             medium_prefixes = [
                 (text, score)
-                for text, score in zip(outputs[0][0], outputs[0][1])
+                for text, score in zip(primary_texts, primary_scores)
                 if text
                 and target.startswith(text)
                 and text != target
@@ -19228,8 +20247,48 @@ def _repair_repeated_categorical_blank_multiview(
                 )
                 == 1
             )
-            if exact_support or prefix_support:
-                supported_targets.append(target)
+            primary_evidence[target] = (
+                medium_votes,
+                prefix_support,
+                exact_without_alternate or prefix_support,
+            )
+
+        possible_targets = [
+            target
+            for target, (votes, prefix_support, _) in primary_evidence.items()
+            if len(votes) >= 2 or prefix_support
+        ]
+        medium_only_targets = [
+            target
+            for target, (_, _, supported) in primary_evidence.items()
+            if supported
+        ]
+        if len(medium_only_targets) >= 2 or not possible_targets:
+            continue
+        if len(medium_only_targets) == 1 and len(possible_targets) == 1:
+            supported_targets = medium_only_targets
+        else:
+            alternate_output = alternate(TextRecInput(img=views))
+            _release_recognition_images(alternate_output)
+            alternate_texts = [
+                str(value).strip() for value in alternate_output.txts
+            ]
+            alternate_scores = [float(value) for value in alternate_output.scores]
+            all_scores.extend(alternate_scores)
+            if len(alternate_texts) != 4 or len(alternate_scores) != 4:
+                continue
+            supported_targets = list(medium_only_targets)
+            for target in possible_targets:
+                if target in medium_only_targets:
+                    continue
+                medium_votes = primary_evidence[target][0]
+                alternate_votes = [
+                    score
+                    for text, score in zip(alternate_texts, alternate_scores)
+                    if text == target and score >= 0.75
+                ]
+                if len(medium_votes) >= 2 and len(alternate_votes) >= 2:
+                    supported_targets.append(target)
         if len(supported_targets) != 1:
             continue
         grid[row][column] = supported_targets[0]
@@ -19237,6 +20296,231 @@ def _repair_repeated_categorical_blank_multiview(
             float(confidence_grid[row][column]),
             0.77,
         )
+        repaired.add((row, column))
+    return repaired, all_scores
+
+
+def _recover_repeated_visible_blank_physical_multiview(
+    image: np.ndarray,
+    grid: list[list[str]],
+    confidence_grid: list[list[float]],
+    columns: list[int],
+    rows: list[int],
+    ocr_engine: Any,
+    *,
+    maximum_cells: int = 8,
+    first_body_row: int | None = None,
+) -> tuple[set[tuple[int, int]], list[float]]:
+    """Recover an ink-bearing blank only as a repeated peer with two-model proof."""
+    if (
+        not grid
+        or not grid[0]
+        or len(columns) != len(grid[0]) + 1
+        or len(rows) != len(grid) + 1
+        or len(confidence_grid) != len(grid)
+        or any(len(row) != len(grid[0]) for row in grid + confidence_grid)
+    ):
+        return set(), []
+    recognizers = (
+        ("small", getattr(ocr_engine, "fast_text_rec", None), 0.55),
+        ("medium", getattr(ocr_engine, "text_rec", None), 0.55),
+        ("server", getattr(ocr_engine, "server_text_rec", None), 0.50),
+    )
+    if not all(callable(recognizer) for _, recognizer, _ in recognizers):
+        return set(), []
+    header_rows = _multilevel_header_rows_for_review(grid)
+    body_start = max(header_rows) + 1 if header_rows else 1
+    semantic_header_rows = [
+        row
+        for row in range(min(4, len(grid)))
+        if sum(
+            bool(_header_semantic_labels(value))
+            for value in grid[row]
+            if str(value).strip()
+        )
+        >= 2
+    ]
+    if semantic_header_rows:
+        body_start = max(body_start, max(semantic_header_rows) + 1)
+    if first_body_row is not None:
+        body_start = max(body_start, int(first_body_row))
+    if body_start >= len(grid):
+        return set(), []
+
+    candidates: list[dict[str, Any]] = []
+    for row in range(body_start, len(grid)):
+        for column in range(len(grid[0])):
+            if (
+                str(grid[row][column]).strip()
+                or float(confidence_grid[row][column]) > 0.0
+            ):
+                continue
+            peer_counts: dict[str, int] = {}
+            for peer_row in range(body_start, len(grid)):
+                if peer_row == row:
+                    continue
+                key = _comparable_text(grid[peer_row][column])
+                if key:
+                    peer_counts[key] = peer_counts.get(key, 0) + 1
+            repeated_keys = {
+                key for key, count in peer_counts.items() if count >= 2
+            }
+            if not repeated_keys:
+                continue
+            left, right = int(columns[column]), int(columns[column + 1])
+            top, bottom = int(rows[row]), int(rows[row + 1])
+            raw = image[
+                max(0, top) : min(image.shape[0], bottom),
+                max(0, left) : min(image.shape[1], right),
+            ]
+            inner = (
+                raw[3:-3, 4:-4]
+                if raw.shape[0] > 8 and raw.shape[1] > 10
+                else raw
+            )
+            if inner.size == 0 or not _physical_cell_has_visible_text_ink(inner):
+                continue
+            gray = (
+                cv2.cvtColor(inner, cv2.COLOR_BGR2GRAY)
+                if inner.ndim == 3
+                else inner
+            )
+            background = float(np.percentile(gray, 85))
+            ink_ratio = float(np.mean(gray < max(0.0, background - 18.0)))
+            if ink_ratio < 0.03:
+                continue
+            views = [
+                raw[pad_y : raw.shape[0] - pad_y, pad_x : raw.shape[1] - pad_x]
+                for pad_x, pad_y in ((0, 0), (1, 1), (2, 1), (3, 2), (4, 3))
+            ]
+            tight = _tight_text_crop(raw)
+            if tight.size == 0 or any(view.size == 0 for view in views):
+                continue
+            tight_gray = (
+                cv2.cvtColor(tight, cv2.COLOR_BGR2GRAY)
+                if tight.ndim == 3
+                else tight
+            )
+            clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 4)).apply(
+                tight_gray
+            )
+            binary = cv2.threshold(
+                clahe,
+                0,
+                255,
+                cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+            )[1]
+            views.append(cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR))
+            candidates.append(
+                {
+                    "row": row,
+                    "column": column,
+                    "repeated_keys": repeated_keys,
+                    "views": views,
+                    "ink_ratio": ink_ratio,
+                    "evidence": [],
+                }
+            )
+    candidates.sort(
+        key=lambda item: (-item["ink_ratio"], item["row"], item["column"])
+    )
+    candidates = candidates[: max(1, int(maximum_cells))]
+    if not candidates:
+        return set(), []
+    _write_runtime_trace(
+        "route",
+        name="repeated_visible_blank_candidates",
+        cells=len(candidates),
+        locations=[
+            [int(candidate["row"]), int(candidate["column"])]
+            for candidate in candidates
+        ],
+    )
+
+    from rapidocr.ch_ppocr_rec.typings import TextRecInput
+
+    all_scores: list[float] = []
+
+    def run_family(
+        family: str,
+        recognizer: Any,
+        score_floor: float,
+        selected: list[dict[str, Any]],
+    ) -> None:
+        for candidate in selected:
+            output = recognizer(TextRecInput(img=candidate["views"]))
+            _release_recognition_images(output)
+            texts = [str(value).strip() for value in output.txts]
+            model_scores = [float(value) for value in output.scores]
+            all_scores.extend(model_scores)
+            if len(texts) != len(candidate["views"]):
+                continue
+            for text, score in zip(texts, model_scores):
+                key = _comparable_text(text)
+                if key in candidate["repeated_keys"] and score >= score_floor:
+                    candidate["evidence"].append((key, family, text, score))
+
+    run_family(*recognizers[0], candidates)
+    medium_candidates = []
+    for candidate in candidates:
+        small_votes: dict[str, int] = {}
+        for key, family, _, _ in candidate["evidence"]:
+            if family == "small":
+                small_votes[key] = small_votes.get(key, 0) + 1
+        if any(votes >= 2 for votes in small_votes.values()):
+            medium_candidates.append(candidate)
+    run_family(*recognizers[1], medium_candidates)
+    server_candidates = []
+    for candidate in candidates:
+        family_votes: dict[tuple[str, str], int] = {}
+        for key, family, _, _ in candidate["evidence"]:
+            family_votes[(key, family)] = family_votes.get((key, family), 0) + 1
+        supported_without_server = [
+            key
+            for key in candidate["repeated_keys"]
+            if family_votes.get((key, "small"), 0) >= 2
+            and family_votes.get((key, "medium"), 0) >= 2
+        ]
+        if (
+            len(supported_without_server) != 1
+            and any(votes >= 2 for votes in family_votes.values())
+        ):
+            server_candidates.append(candidate)
+    run_family(*recognizers[2], server_candidates)
+
+    repaired: set[tuple[int, int]] = set()
+    for candidate in candidates:
+        supported = []
+        for key in candidate["repeated_keys"]:
+            values = [
+                value for value in candidate["evidence"] if value[0] == key
+            ]
+            per_family = {
+                family: [score for _, source, _, score in values if source == family]
+                for family, _, _ in recognizers
+            }
+            repeated_families = sum(
+                len(scores) >= 2 for scores in per_family.values()
+            )
+            strong_families = sum(
+                bool(scores) and max(scores) >= 0.75
+                for scores in per_family.values()
+            )
+            if repeated_families >= 2 or (
+                len(key) == 1
+                and repeated_families >= 1
+                and strong_families >= 2
+                and len(values) >= 4
+            ):
+                supported.append((key, values))
+        if len(supported) != 1:
+            continue
+        _, values = supported[0]
+        selected_text = max(values, key=lambda value: value[3])[2]
+        row = int(candidate["row"])
+        column = int(candidate["column"])
+        grid[row][column] = selected_text
+        confidence_grid[row][column] = 0.77
         repaired.add((row, column))
     return repaired, all_scores
 
@@ -21107,6 +22391,191 @@ def _normalize_unique_leading_line_labels(
     return changed
 
 
+def _normalize_overlapping_identifier_tail_segments(
+    grid: list[list[str]],
+    confidence: list[list[float]],
+) -> set[tuple[int, int]]:
+    """Remove one duplicated tail prefix only from a proven code column."""
+    if not grid or not grid[0] or len(confidence) != len(grid):
+        return set()
+    changed: set[tuple[int, int]] = set()
+    for column in range(len(grid[0])):
+        values = [
+            (row, re.sub(r"\s+", "", str(grid[row][column]).strip()))
+            for row in range(1, len(grid))
+            if str(grid[row][column]).strip()
+        ]
+        clean_matches = [
+            re.fullmatch(r"[A-Z]{2,4}-[A-Z0-9]{2,8}-(\d{2,4})", value)
+            for _, value in values
+        ]
+        clean_matches = [match for match in clean_matches if match is not None]
+        if len(clean_matches) < 6:
+            continue
+        tail_lengths: dict[int, int] = {}
+        for match in clean_matches:
+            length = len(match.group(1))
+            tail_lengths[length] = tail_lengths.get(length, 0) + 1
+        dominant_length, support = max(tail_lengths.items(), key=lambda item: item[1])
+        if support < max(5, int(math.ceil(len(clean_matches) * 0.75))):
+            continue
+        for row, value in values:
+            match = re.fullmatch(
+                r"([A-Z]{2,4}-[A-Z0-9]{2,8}-)(\d{1,2})-(\d{2,4})",
+                value,
+            )
+            if match is None:
+                continue
+            duplicate, tail = match.group(2), match.group(3)
+            if len(tail) != dominant_length or not tail.startswith(duplicate):
+                continue
+            grid[row][column] = match.group(1) + tail
+            confidence[row][column] = min(float(confidence[row][column]), 0.77)
+            changed.add((row, column))
+    return changed
+
+
+def _normalize_proven_numeric_glyph_confusions(
+    grid: list[list[str]],
+    confidence: list[list[float]],
+) -> set[tuple[int, int]]:
+    """Normalize OCR letter-shaped digits only when a column proves the format."""
+    if not grid or not grid[0] or len(confidence) != len(grid):
+        return set()
+    column_count = len(grid[0])
+    if any(len(row) != column_count for row in grid + confidence):
+        return set()
+    digit_map = str.maketrans(
+        {
+            "O": "0", "o": "0", "D": "0", "Q": "0",
+            "I": "1", "i": "1", "l": "1", "Z": "2", "z": "2",
+            "S": "5", "s": "5", "G": "6", "B": "8",
+        }
+    )
+    changed: set[tuple[int, int]] = set()
+
+    def valid_iso_date(value: str) -> bool:
+        match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", value)
+        if match is None:
+            return False
+        year, month, day = (int(part) for part in match.groups())
+        if not 1900 <= year <= 2199 or not 1 <= month <= 12:
+            return False
+        month_days = [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28,
+                      31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+        return 1 <= day <= month_days[month - 1]
+
+    for column in range(column_count):
+        values = [
+            (row, re.sub(r"\s+", "", str(grid[row][column]).strip()))
+            for row in range(1, len(grid))
+            if str(grid[row][column]).strip()
+        ]
+        clean_dates = sum(valid_iso_date(value) for _, value in values)
+        header_proves_date = any(
+            token in re.sub(r"\s+", "", str(grid[row][column]))
+            for row in range(min(4, len(grid)))
+            for token in ("日期", "时间")
+        )
+        if clean_dates >= 3 or header_proves_date:
+            for row, value in values:
+                if not re.fullmatch(r"[0-9A-Za-z]{4}-[0-9A-Za-z]{2}-[0-9A-Za-z]{2}", value):
+                    continue
+                normalized = value.translate(digit_map)
+                if normalized != value and valid_iso_date(normalized):
+                    grid[row][column] = normalized
+                    confidence[row][column] = min(float(confidence[row][column]), 0.77)
+                    changed.add((row, column))
+
+        code_values = [
+            (row, value, re.fullmatch(r"([A-Za-z]{2,4})-([A-Za-z0-9]{5,10})", value))
+            for row, value in values
+        ]
+        code_values = [(row, value, match) for row, value, match in code_values if match]
+        clean_codes = sum(bool(match.group(2).isdigit()) for _, _, match in code_values)
+        if (
+            len(code_values) >= 5
+            and clean_codes >= 4
+            and clean_codes / float(len(code_values)) >= 0.65
+        ):
+            for row, value, match in code_values:
+                suffix = match.group(2)
+                normalized_suffix = suffix.translate(digit_map)
+                if suffix == normalized_suffix or not normalized_suffix.isdigit():
+                    continue
+                grid[row][column] = f"{match.group(1)}-{normalized_suffix}"
+                confidence[row][column] = min(float(confidence[row][column]), 0.77)
+                changed.add((row, column))
+    return changed
+
+
+def _normalize_spaced_iso_date_tokens(
+    grid: list[list[str]],
+    confidence: list[list[float]],
+) -> set[tuple[int, int]]:
+    """Remove OCR spaces only when the compact text is a valid ISO date."""
+    changed: set[tuple[int, int]] = set()
+    for row, values in enumerate(grid):
+        for column, value in enumerate(values):
+            original = str(value).strip()
+            compact = re.sub(r"\s+", "", original)
+            match = re.fullmatch(r"(\d{4})-(\d{2})-(\d{2})", compact)
+            if compact == original or match is None:
+                continue
+            year, month, day = (int(part) for part in match.groups())
+            if not 1900 <= year <= 2199 or not 1 <= month <= 12:
+                continue
+            month_days = [
+                31,
+                29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28,
+                31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
+            ]
+            if not 1 <= day <= month_days[month - 1]:
+                continue
+            grid[row][column] = compact
+            confidence[row][column] = min(float(confidence[row][column]), 0.77)
+            changed.add((row, column))
+    return changed
+
+
+def _normalize_proven_reversed_percentages(
+    grid: list[list[str]],
+    confidence: list[list[float]],
+) -> set[tuple[int, int]]:
+    """Restore a reversed percent glyph sequence only from repeated clean peers."""
+    valid_counts: dict[str, int] = {}
+    for row in grid:
+        for value in row:
+            token = re.sub(r"\s+", "", str(value).strip())
+            if re.fullmatch(r"[+\-]?\d+(?:\.\d+)?%", token):
+                valid_counts[token] = valid_counts.get(token, 0) + 1
+    repeated = {token for token, count in valid_counts.items() if count >= 3}
+    reversed_counts: dict[str, int] = {}
+    for row in grid:
+        for value in row:
+            token = re.sub(r"\s+", "", str(value).strip())
+            if re.fullmatch(r"%[0-9A-Za-z]{1,5}", token):
+                reversed_counts[token] = reversed_counts.get(token, 0) + 1
+    rotation_map = str.maketrans(
+        {"6": "9", "9": "6", "S": "5", "s": "5", "Z": "2", "z": "2",
+         "O": "0", "o": "0", "D": "0", "Q": "0", "B": "8"}
+    )
+    changed: set[tuple[int, int]] = set()
+    for row, values in enumerate(grid):
+        for column, value in enumerate(values):
+            token = re.sub(r"\s+", "", str(value).strip())
+            match = re.fullmatch(r"%([0-9A-Za-z]{1,5})", token)
+            if match is None:
+                continue
+            normalized = match.group(1)[::-1].translate(rotation_map) + "%"
+            if normalized not in repeated and reversed_counts.get(token, 0) < 3:
+                continue
+            grid[row][column] = normalized
+            confidence[row][column] = min(float(confidence[row][column]), 0.77)
+            changed.add((row, column))
+    return changed
+
+
 def _apply_consistency_checks(
     grid: list[list[str]],
     confidence: list[list[float]],
@@ -21117,6 +22586,10 @@ def _apply_consistency_checks(
     _strip_absolute_spreadsheet_row_prefixes(grid, confidence)
     _remove_proven_spreadsheet_row_ruler_cells(grid, confidence)
     _normalize_proven_structured_insertions(grid, confidence)
+    _normalize_overlapping_identifier_tail_segments(grid, confidence)
+    _normalize_proven_numeric_glyph_confusions(grid, confidence)
+    _normalize_spaced_iso_date_tokens(grid, confidence)
+    _normalize_proven_reversed_percentages(grid, confidence)
     _normalize_unique_leading_line_labels(grid, confidence)
     first_populated = [
         column for column, value in enumerate(grid[0]) if str(value).strip()
@@ -22986,8 +24459,37 @@ def _recover_spatial_headers_with_aligned_page_body(
     _, _, overlap_rows, _, _, page_start, spatial_start = max(candidates)
     recovered_grid = [list(row) for row in spatial_grid]
     recovered_confidence = [list(row) for row in spatial_confidence]
+    recovered_spans = copy.deepcopy(spatial_spans)
+    inserted_metadata_rows = 0
+    if page_start > spatial_start:
+        metadata_rows = [
+            list(row)
+            for row in page_grid[spatial_start:page_start]
+        ]
+        metadata_confidence = [
+            list(row)
+            for row in page_confidence[spatial_start:page_start]
+        ]
+        metadata_supported = bool(
+            1 <= len(metadata_rows) <= 2
+            and all(
+                1
+                <= sum(bool(str(value).strip()) for value in row)
+                <= max(3, page_columns // 2 + 1)
+                and any(re.search(r"[:：]", str(value)) for value in row)
+                for row in metadata_rows
+            )
+        )
+        if metadata_supported:
+            inserted_metadata_rows = len(metadata_rows)
+            recovered_grid[spatial_start:spatial_start] = metadata_rows
+            recovered_confidence[spatial_start:spatial_start] = metadata_confidence
+            for span in recovered_spans:
+                if int(span.get("row", -1)) >= spatial_start:
+                    span["row"] = int(span["row"]) + inserted_metadata_rows
+    adjusted_spatial_start = spatial_start + inserted_metadata_rows
     for offset in range(overlap_rows):
-        target_row = spatial_start + offset
+        target_row = adjusted_spatial_start + offset
         source_row = page_start + offset
         for column in range(spatial_columns):
             page_text = str(page_grid[source_row][column]).strip()
@@ -22997,12 +24499,57 @@ def _recover_spatial_headers_with_aligned_page_body(
     return (
         recovered_grid,
         recovered_confidence,
-        copy.deepcopy(spatial_spans),
+        recovered_spans,
         {
             "page_start": page_start,
             "spatial_start": spatial_start,
             "overlap_rows": overlap_rows,
+            "inserted_metadata_rows": inserted_metadata_rows,
         },
+    )
+
+
+def _aligned_header_can_keep_physical_certificate(
+    page_grid: list[list[str]],
+    recovered_grid: list[list[str]],
+    recovered_spans: list[dict[str, Any]],
+    alignment_metrics: dict[str, int | float],
+    certificate: dict[str, Any] | None,
+) -> bool:
+    """Allow the existing grid certificate to re-check a title-only repair."""
+    page_rows, page_columns, _ = _grid_shape_and_content(page_grid)
+    recovered_rows, recovered_columns, _ = _grid_shape_and_content(
+        recovered_grid
+    )
+    title_spans = [
+        span
+        for span in recovered_spans
+        if int(span.get("row", -1)) == 0
+        and int(span.get("column", -1)) == 0
+        and int(span.get("row_span", 1)) == 1
+        and int(span.get("column_span", 1)) == recovered_columns
+        and span.get("role") == "title"
+    ]
+    return bool(
+        certificate is not None
+        and bool(certificate.get("verified", False))
+        and (page_rows, page_columns) == (recovered_rows, recovered_columns)
+        and int(certificate.get("rows", -1)) == recovered_rows
+        and int(certificate.get("columns", -1)) == recovered_columns
+        and int(alignment_metrics.get("page_start", -1)) == 1
+        and int(alignment_metrics.get("spatial_start", -1)) == 1
+        and int(alignment_metrics.get("inserted_metadata_rows", -1)) == 0
+        and int(alignment_metrics.get("overlap_rows", -1))
+        == recovered_rows - 1
+        and len(title_spans) == 1
+        and recovered_rows >= 2
+        and sum(bool(str(value).strip()) for value in recovered_grid[1])
+        >= recovered_columns - 1
+        and not _spans_hide_non_anchor_text(recovered_grid, recovered_spans)
+        and _grids_have_matching_cell_ownership(
+            page_grid[1:],
+            recovered_grid[1:],
+        )
     )
 
 
@@ -24055,6 +25602,11 @@ def _remove_weak_adjacent_duplicate_fills(
     )
     if header_row < 0:
         return set()
+    ordinal_columns = {
+        column
+        for column, value in enumerate(grid[header_row])
+        if any(label in str(value) for label in ("序号", "编号"))
+    }
 
     def foreground_coverage(row: int, column: int) -> float:
         left, right = columns[column], columns[column + 1]
@@ -24082,10 +25634,22 @@ def _remove_weak_adjacent_duplicate_fills(
                 continue
             left_text = str(grid[row][left_column]).strip()
             right_text = str(grid[row][right_column]).strip()
+            single_ordinal_duplicate = bool(
+                left_column in ordinal_columns
+                and re.fullmatch(r"\d{1,3}", left_text)
+                and left_text == right_text
+            )
+            single_cjk_duplicate = bool(
+                re.fullmatch(r"[\u3400-\u9fff]", _comparable_text(left_text))
+                and _comparable_text(left_text) == _comparable_text(right_text)
+            )
             if (
-                len(_comparable_text(left_text)) < 2
+                (
+                    len(_comparable_text(left_text)) < 2
+                    and not single_ordinal_duplicate
+                    and not single_cjk_duplicate
+                )
                 or _comparable_text(left_text) != _comparable_text(right_text)
-                or not re.search(r"\d", left_text)
             ):
                 continue
             left_coverage = foreground_coverage(row, left_column)
@@ -24095,10 +25659,24 @@ def _remove_weak_adjacent_duplicate_fills(
                 if left_coverage <= right_coverage
                 else (right_column, right_coverage, left_coverage)
             )
+            if single_ordinal_duplicate and weak_column != right_column:
+                continue
+            categorical_duplicate = not bool(re.search(r"\d", left_text))
+            maximum_weak_coverage = 0.01 if categorical_duplicate else 0.05
+            minimum_strong_coverage = (
+                0.03
+                if single_ordinal_duplicate
+                else 0.075
+            )
+            if single_cjk_duplicate:
+                minimum_strong_coverage = 0.02
+            elif categorical_duplicate:
+                minimum_strong_coverage = 0.03
+            maximum_weak_ratio = 0.20 if categorical_duplicate else 0.45
             if (
-                weak_coverage > 0.05
-                or strong_coverage < 0.075
-                or weak_coverage > strong_coverage * 0.45
+                weak_coverage > maximum_weak_coverage
+                or strong_coverage < minimum_strong_coverage
+                or weak_coverage > strong_coverage * maximum_weak_ratio
                 or float(confidence_grid[row][weak_column]) > 0.77
             ):
                 continue
@@ -24125,6 +25703,18 @@ def _split_patterned_adjacent_spills(
         for column in range(len(values) - 1):
             left = str(values[column]).strip()
             right = str(values[column + 1]).strip()
+            repeated_header_labels = (
+                _segment_concatenated_header_labels(left)
+                if left
+                and _comparable_text(left) == _comparable_text(right)
+                else []
+            )
+            if len(repeated_header_labels) == 2:
+                values[column], values[column + 1] = repeated_header_labels
+                confidence_grid[row][column] = 0.77
+                confidence_grid[row][column + 1] = 0.77
+                repaired.update({(row, column), (row, column + 1)})
+                continue
             left_header_labels = _segment_concatenated_header_labels(left)
             if len(left_header_labels) == 2 and not right:
                 values[column], values[column + 1] = left_header_labels
@@ -24188,6 +25778,83 @@ def _split_patterned_adjacent_spills(
                     confidence_grid[row][column] = 0.77
                     confidence_grid[row][column + 1] = 0.77
                     repaired.update({(row, column), (row, column + 1)})
+    return repaired
+
+
+def _split_physically_separated_adjacent_tokens(
+    image: np.ndarray,
+    grid: list[list[str]],
+    confidence_grid: list[list[float]],
+    columns: list[int],
+    rows: list[int],
+) -> set[tuple[int, int]]:
+    """Split two tokens only when ink and repeated column ownership both agree."""
+    if (
+        image.size == 0
+        or not grid
+        or not grid[0]
+        or len(columns) != len(grid[0]) + 1
+        or len(rows) != len(grid) + 1
+        or any(len(row) != len(grid[0]) for row in grid + confidence_grid)
+    ):
+        return set()
+    column_count = len(grid[0])
+    header_row = max(
+        range(min(4, len(grid))),
+        key=lambda row: sum(bool(str(value).strip()) for value in grid[row]),
+        default=0,
+    )
+
+    def key(value: Any) -> str:
+        return _comparable_text(value)
+
+    column_counts: list[dict[str, int]] = [dict() for _ in range(column_count)]
+    for row in range(header_row + 1, len(grid)):
+        for column, value in enumerate(grid[row]):
+            text_key = key(value)
+            if text_key and not re.search(r"\s", str(value).strip()):
+                column_counts[column][text_key] = (
+                    column_counts[column].get(text_key, 0) + 1
+                )
+
+    def has_ink(row: int, column: int) -> bool:
+        left, right = int(columns[column]), int(columns[column + 1])
+        top, bottom = int(rows[row]), int(rows[row + 1])
+        pad_x = max(2, min(5, (right - left) // 16))
+        pad_y = max(2, min(4, (bottom - top) // 12))
+        crop = image[
+            max(0, top + pad_y) : min(image.shape[0], bottom - pad_y),
+            max(0, left + pad_x) : min(image.shape[1], right - pad_x),
+        ]
+        return _physical_cell_has_visible_text_ink(crop)
+
+    repaired: set[tuple[int, int]] = set()
+    for row in range(header_row + 1, len(grid)):
+        for left_column in range(column_count - 1):
+            right_column = left_column + 1
+            left = str(grid[row][left_column]).strip()
+            right = str(grid[row][right_column]).strip()
+            combined = left if left and not right else right if right and not left else ""
+            tokens = combined.split()
+            if (
+                len(tokens) != 2
+                or not all(1 <= len(key(token)) <= 24 for token in tokens)
+                or column_counts[left_column].get(key(tokens[0]), 0) < 1
+                or column_counts[right_column].get(key(tokens[1]), 0) < 1
+                or not has_ink(row, left_column)
+                or not has_ink(row, right_column)
+            ):
+                continue
+            grid[row][left_column], grid[row][right_column] = tokens
+            confidence_grid[row][left_column] = min(
+                abs(float(confidence_grid[row][left_column])) or 0.77,
+                0.77,
+            )
+            confidence_grid[row][right_column] = min(
+                abs(float(confidence_grid[row][right_column])) or 0.77,
+                0.77,
+            )
+            repaired.update({(row, left_column), (row, right_column)})
     return repaired
 
 
@@ -25392,7 +27059,7 @@ def _dense_percentage_format_risks(
             bool(re.fullmatch(r"[+\-]?\d+(?:\.\d+)?%", value))
             for _, value in values
         )
-        if valid_count < 6:
+        if valid_count < 3:
             continue
         selected.update(
             (row, column)
@@ -25401,6 +27068,89 @@ def _dense_percentage_format_risks(
             and not re.fullmatch(r"[+\-]?\d+(?:\.\d+)?%", value)
         )
     return selected
+
+
+def _repair_invalid_percentage_tight_consensus(
+    image: np.ndarray,
+    grid: list[list[str]],
+    confidence_grid: list[list[float]],
+    columns: list[int],
+    rows: list[int],
+    ocr_engine: Any,
+) -> tuple[set[tuple[int, int]], list[float]]:
+    """Repair a reversed percent only when two tight Medium views agree."""
+    selected = sorted(_dense_percentage_format_risks(grid))
+    medium = getattr(ocr_engine, "text_rec", None)
+    alternate = getattr(ocr_engine, "server_text_rec", None)
+    if (
+        not selected
+        or len(selected) > 12
+        or not callable(medium)
+        or not callable(alternate)
+        or len(columns) != len(grid[0]) + 1
+        or len(rows) != len(grid) + 1
+    ):
+        return set(), []
+    views = []
+    locations = []
+    for row, column in selected:
+        crop = image[
+            max(0, int(rows[row]) + 2) : min(
+                image.shape[0], int(rows[row + 1]) - 2
+            ),
+            max(0, int(columns[column]) + 2) : min(
+                image.shape[1], int(columns[column + 1]) - 2
+            ),
+        ]
+        tight = _tight_text_crop(crop) if crop.size else crop
+        if tight.size == 0:
+            continue
+        if tight.ndim == 2:
+            tight = cv2.cvtColor(tight, cv2.COLOR_GRAY2BGR)
+        views.append(tight)
+        locations.append((row, column))
+    if not views:
+        return set(), []
+
+    from rapidocr.ch_ppocr_rec.typings import TextRecInput
+
+    primary = medium(TextRecInput(img=views))
+    secondary = alternate(TextRecInput(img=views))
+    _release_recognition_images(primary)
+    _release_recognition_images(secondary)
+    if any(
+        len(values) != len(views)
+        for values in (
+            primary.txts,
+            primary.scores,
+            secondary.txts,
+            secondary.scores,
+        )
+    ):
+        return set(), []
+    scores = [float(value) for value in primary.scores] + [
+        float(value) for value in secondary.scores
+    ]
+    repaired: set[tuple[int, int]] = set()
+    for index, (row, column) in enumerate(locations):
+        primary_text = str(primary.txts[index]).strip()
+        secondary_text = str(secondary.txts[index]).strip()
+        if (
+            primary_text != secondary_text
+            or min(
+                float(primary.scores[index]),
+                float(secondary.scores[index]),
+            )
+            < 0.95
+            or re.fullmatch(r"[+\-]?\d+(?:\.\d+)?%", primary_text)
+            is None
+        ):
+            continue
+        grid[row][column] = primary_text
+        current = abs(float(confidence_grid[row][column]))
+        confidence_grid[row][column] = min(current, 0.77) if current else 0.77
+        repaired.add((row, column))
+    return repaired, scores
 
 
 def _dense_b_eight_confusion_risks(
@@ -25695,6 +27445,222 @@ def _grid_geometry_is_bounded(
     )
 
 
+def _full_frame_ruled_grid_can_bypass_photo_rectification(
+    image: np.ndarray,
+    ruled_grid: tuple[list[int], list[int], np.ndarray] | None,
+    *,
+    maximum_cells: int,
+) -> bool:
+    """Retain a dark full-frame grid when its physical rules already own the frame."""
+    if ruled_grid is None or image.size == 0:
+        return False
+    columns, rows, _ = ruled_grid
+    return bool(
+        2 <= len(columns) - 1 <= 32
+        and 4 <= len(rows) - 1 <= 120
+        and _grid_geometry_is_bounded(
+            columns,
+            rows,
+            maximum_cells=maximum_cells,
+        )
+        and _screen_grid_is_credible(image, columns, rows)
+        and _ruled_grid_spans_source_frame(image, columns, rows)
+        and _small_clear_screen_grid_uses_page_primary(image, columns, rows)
+        and _full_frame_grid_is_nearly_axis_aligned(image)
+    )
+
+
+def _full_frame_grid_is_nearly_axis_aligned(image: np.ndarray) -> bool:
+    """Reject a camera-perspective grid from the direct screen shortcut."""
+    if image.size == 0:
+        return False
+    _, _, corners, _ = pipeline._warp_perspective_table(
+        image,
+        expand_to_document=True,
+    )
+    if corners is None:
+        return True
+    top_left, top_right, bottom_right, bottom_left = np.asarray(
+        corners,
+        dtype=float,
+    ).reshape(4, 2)
+    top_slope = abs(float(top_right[1] - top_left[1])) / max(
+        1.0,
+        abs(float(top_right[0] - top_left[0])),
+    )
+    bottom_slope = abs(float(bottom_right[1] - bottom_left[1])) / max(
+        1.0,
+        abs(float(bottom_right[0] - bottom_left[0])),
+    )
+    left_slope = abs(float(bottom_left[0] - top_left[0])) / max(
+        1.0,
+        abs(float(bottom_left[1] - top_left[1])),
+    )
+    right_slope = abs(float(bottom_right[0] - top_right[0])) / max(
+        1.0,
+        abs(float(bottom_right[1] - top_right[1])),
+    )
+    return bool(
+        max(top_slope, bottom_slope) <= 0.012
+        and max(left_slope, right_slope) <= 0.018
+    )
+
+
+def _recover_motion_blurred_photo_grid(
+    image: np.ndarray,
+    current_grid: tuple[list[int], list[int], np.ndarray] | None,
+    *,
+    maximum_cells: int,
+    selected_region: bool = False,
+) -> tuple[list[int], list[int], np.ndarray] | None:
+    """Recover a bounded grid from proven horizontal motion."""
+    if image.size == 0 or min(image.shape[:2]) < 180:
+        return None
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    gradient_x = float(
+        np.mean(np.abs(cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)))
+    )
+    gradient_y = float(
+        np.mean(np.abs(cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)))
+    )
+    horizontal_motion_signature = bool(
+        gradient_y >= 20.0
+        and gradient_x / max(0.001, gradient_y) <= 0.26
+    )
+    if selected_region and not horizontal_motion_signature:
+        return None
+    current_columns = len(current_grid[0]) - 1 if current_grid else 0
+    current_rows = len(current_grid[1]) - 1 if current_grid else 0
+    ocr_image = cv2.cvtColor(
+        _wiener_motion_deblur_view(gray, 7, 0.0),
+        cv2.COLOR_GRAY2BGR,
+    )
+    for kernel_length in ((7, 3) if selected_region else (7,)):
+        geometry_image = cv2.cvtColor(
+            _wiener_motion_deblur_view(gray, kernel_length, 0.0),
+            cv2.COLOR_GRAY2BGR,
+        )
+        candidate = pipeline.extract_ruled_grid(
+            geometry_image,
+            prefer_adaptive=True,
+        )
+        if candidate is None:
+            candidate = pipeline.extract_ruled_grid(
+                geometry_image,
+                prefer_adaptive=False,
+            )
+        if candidate is None:
+            continue
+        columns, rows, cleaned = candidate
+        if selected_region and len(rows) >= 4:
+            horizontal = pipeline._grid_maps(geometry_image)[0]
+            supports = []
+            for boundary in rows[:3]:
+                band = horizontal[
+                    max(0, int(boundary) - 2) : min(
+                        horizontal.shape[0], int(boundary) + 3
+                    ),
+                    int(columns[0]) : int(columns[-1]) + 1,
+                ]
+                supports.append(
+                    float(np.mean(np.any(band > 0, axis=0)))
+                    if band.size
+                    else 0.0
+                )
+            gaps = np.diff(rows).astype(float)
+            typical_gap = float(np.median(gaps[2:])) if gaps.size > 2 else 0.0
+            combined_gap = float(rows[2] - rows[0])
+            if (
+                supports[0] >= 0.70
+                and supports[1] < 0.15
+                and supports[2] >= 0.70
+                and typical_gap > 0.0
+                and 1.30 <= combined_gap / typical_gap <= 2.50
+            ):
+                rows = [rows[0], *rows[2:]]
+            mask = np.zeros(ocr_image.shape[:2], dtype=np.uint8)
+            for boundary in rows:
+                cv2.line(
+                    mask,
+                    (int(columns[0]), int(boundary)),
+                    (int(columns[-1]), int(boundary)),
+                    255,
+                    3,
+                )
+            for index, boundary in enumerate(columns):
+                cv2.line(
+                    mask,
+                    (int(boundary), int(rows[0])),
+                    (int(boundary), int(rows[-1])),
+                    255,
+                    3 if index in {0, len(columns) - 1} else 7,
+                )
+            cleaned = pipeline._enhance_for_ocr(ocr_image)
+            cleaned[mask > 0] = 255
+        candidate = (
+            [int(value) for value in columns],
+            [int(value) for value in rows],
+            cleaned,
+        )
+        column_count = len(columns) - 1
+        row_count = len(rows) - 1
+        if not (
+            4 <= column_count <= (12 if selected_region else 32)
+            and 7 <= row_count <= 120
+            and _grid_geometry_is_bounded(
+                columns,
+                rows,
+                maximum_cells=maximum_cells,
+            )
+            and _photographic_ruled_grid_is_credible(
+                geometry_image,
+                columns,
+                rows,
+            )
+            and _ruled_grid_spans_source_frame(
+                geometry_image,
+                columns,
+                rows,
+            )
+        ):
+            continue
+        if current_grid is None:
+            return candidate if column_count <= 12 else None
+        maximum_columns = max(
+            current_columns + 4,
+            int(math.ceil(current_columns * 1.75)),
+        )
+        if selected_region:
+            if (
+                column_count < current_columns
+                or column_count > maximum_columns
+                or row_count < max(7, current_rows - 2)
+                or row_count > min(120, current_rows * 2)
+            ):
+                continue
+            if (
+                column_count == current_columns
+                and abs(row_count - current_rows) <= 2
+            ) or column_count >= current_columns + 2:
+                return candidate
+            continue
+        if (
+            (
+                column_count < current_columns + 2
+                and not (
+                    horizontal_motion_signature
+                    and column_count == current_columns
+                )
+            )
+            or column_count > maximum_columns
+            or row_count < current_rows - 2
+            or row_count > current_rows + 2
+        ):
+            continue
+        return candidate
+    return None
+
+
 def _mark_unverified_structure_for_review(
     confidence_grid: list[list[float]],
 ) -> None:
@@ -25763,6 +27729,55 @@ def _apply_structure_review_policy(
                         min(float(value), 0.77) if float(value) != 0.0 else 0.77
                     )
     return confidence_grid
+
+
+def _spatial_review_can_be_limited(
+    grid: list[list[str]],
+    spans: list[dict[str, Any]],
+    structural_warnings: list[str],
+    *,
+    document_mode: str,
+    engine_name: str,
+    rectification_mode: str = "",
+    photographic_background: bool = False,
+) -> bool:
+    """Keep a structure banner while limiting yellow cells on a strong spatial table."""
+    if (
+        document_mode != "borderless_columns"
+        or engine_name not in {
+            "Hybrid OCR + borderless spatial layout",
+            "Hybrid OCR + review-only page spatial recovery",
+        }
+        or (
+            engine_name == "Hybrid OCR + review-only page spatial recovery"
+            and (photographic_background or rectification_mode != "screen")
+        )
+        or len(grid) < 6
+        or len(grid[0]) < 3
+        or _structure_requires_whole_table_review(structural_warnings)
+        or _spans_hide_non_anchor_text(grid, spans)
+    ):
+        return False
+    column_count = len(grid[0])
+    title_spans = [
+        span
+        for span in spans
+        if int(span.get("row", -1)) == 0
+        and int(span.get("column", -1)) == 0
+        and int(span.get("row_span", 1)) == 1
+        and int(span.get("column_span", 1)) == column_count
+        and span.get("role") == "title"
+    ]
+    return bool(
+        len(title_spans) == 1
+        and sum(bool(str(value).strip()) for value in grid[0]) == 1
+        and sum(bool(str(value).strip()) for value in grid[1]) >= column_count - 1
+        and sum(
+            sum(bool(str(value).strip()) for value in row) >= column_count - 1
+            for row in grid[2:]
+        )
+        >= 4
+    )
 
 
 def _fold_merged_subordinate_reviews_into_anchors(
@@ -26436,6 +28451,187 @@ def _spatial_geometry_cell_boundaries(
     return columns, rows
 
 
+def _table_structure_cell_recovery_geometry(
+    cell_bboxes: Any,
+    logic_points: Any,
+    row_count: int,
+    column_count: int,
+) -> dict[str, Any] | None:
+    """Build exact per-cell OCR crops from a structure model's geometry."""
+    if row_count < 3 or column_count < 2:
+        return None
+    try:
+        boxes = np.asarray(cell_bboxes, dtype=float)
+        logic = np.asarray(logic_points, dtype=int)
+    except (TypeError, ValueError):
+        return None
+    if (
+        boxes.ndim != 2
+        or boxes.shape[1] < 8
+        or logic.ndim != 2
+        or logic.shape[1] < 4
+        or len(boxes) != len(logic)
+    ):
+        return None
+
+    cell_bounds: dict[tuple[int, int], tuple[int, int, int, int]] = {}
+    row_centers_by_index: list[list[float]] = [[] for _ in range(row_count)]
+    column_centers_by_index: list[list[float]] = [
+        [] for _ in range(column_count)
+    ]
+    for raw_box, raw_logic in zip(boxes, logic):
+        row_start, row_end, column_start, column_end = map(int, raw_logic[:4])
+        if (
+            row_start < 0
+            or row_end < row_start
+            or row_end >= row_count
+            or column_start < 0
+            or column_end < column_start
+            or column_end >= column_count
+        ):
+            return None
+        points = np.asarray(raw_box[:8], dtype=float).reshape(-1, 2)
+        if not np.isfinite(points).all():
+            return None
+        left = int(math.floor(float(points[:, 0].min())))
+        right = int(math.ceil(float(points[:, 0].max())))
+        top = int(math.floor(float(points[:, 1].min())))
+        bottom = int(math.ceil(float(points[:, 1].max())))
+        if right - left < 8 or bottom - top < 8:
+            continue
+        center_x = (left + right) * 0.5
+        center_y = (top + bottom) * 0.5
+        if row_start == row_end:
+            row_centers_by_index[row_start].append(center_y)
+        if column_start == column_end:
+            column_centers_by_index[column_start].append(center_x)
+            cell_bounds[(row_start, column_start)] = (
+                left,
+                right,
+                top,
+                bottom,
+            )
+
+    minimum_coverage = max(4, int(math.ceil(row_count * column_count * 0.65)))
+    if (
+        len(cell_bounds) < minimum_coverage
+        or any(not values for values in row_centers_by_index)
+        or any(not values for values in column_centers_by_index)
+    ):
+        return None
+    anchors = [float(np.median(values)) for values in column_centers_by_index]
+    row_centers = [float(np.median(values)) for values in row_centers_by_index]
+    if (
+        any(right <= left for left, right in zip(anchors, anchors[1:]))
+        or any(right <= left for left, right in zip(row_centers, row_centers[1:]))
+    ):
+        return None
+    dense_row_floor = max(2, int(math.ceil(column_count * 0.60)))
+    per_row_cells = [0] * row_count
+    for row, _ in cell_bounds:
+        per_row_cells[row] += 1
+    first_structured_row = next(
+        (row for row, count in enumerate(per_row_cells) if count >= dense_row_floor),
+        0,
+    )
+    return {
+        "anchors": anchors,
+        "row_centers": row_centers,
+        "grouped_rows": [[] for _ in range(row_count)],
+        "first_structured_row": first_structured_row,
+        "cell_bounds": cell_bounds,
+    }
+
+
+def _aligned_table_structure_cell_recovery_geometry(
+    table_grid: list[list[str]],
+    cell_bboxes: Any,
+    logic_points: Any,
+    final_grid: list[list[str]],
+) -> dict[str, Any] | None:
+    """Accept exact geometry or a uniquely aligned prefix before one split tail row."""
+    if not table_grid or not final_grid or not final_grid[0]:
+        return None
+    final_rows = len(final_grid)
+    final_columns = len(final_grid[0])
+    if any(len(row) != final_columns for row in final_grid):
+        return None
+    table_columns = max((len(row) for row in table_grid), default=0)
+    if table_columns != final_columns:
+        return None
+    if len(table_grid) == final_rows:
+        return _table_structure_cell_recovery_geometry(
+            cell_bboxes,
+            logic_points,
+            final_rows,
+            final_columns,
+        )
+    if len(table_grid) != final_rows + 1 or final_rows < 8:
+        return None
+
+    normalized_table = [
+        list(row) + [""] * (final_columns - len(row))
+        for row in table_grid
+    ]
+    aligned_prefix_rows = final_rows - 1
+    body_rows = list(range(2, aligned_prefix_rows))
+    direct_matches = 0
+    shifted_matches = 0
+    aligned_rows = 0
+    for row in body_rows:
+        final_keys = [_comparable_text(value) for value in final_grid[row]]
+        direct_keys = [_comparable_text(value) for value in normalized_table[row]]
+        shifted_keys = [
+            _comparable_text(value) for value in normalized_table[row + 1]
+        ]
+        row_matches = sum(
+            bool(final_key) and final_key == table_key
+            for final_key, table_key in zip(final_keys, direct_keys)
+        )
+        direct_matches += row_matches
+        shifted_matches += sum(
+            bool(final_key) and final_key == table_key
+            for final_key, table_key in zip(final_keys, shifted_keys)
+        )
+        populated = sum(bool(value) for value in final_keys)
+        if row_matches >= max(2, int(math.ceil(populated * 0.50))):
+            aligned_rows += 1
+    if (
+        aligned_rows < max(4, int(math.ceil(len(body_rows) * 0.75)))
+        or direct_matches < max(12, shifted_matches * 2)
+    ):
+        return None
+
+    try:
+        boxes = np.asarray(cell_bboxes, dtype=float)
+        logic = np.asarray(logic_points, dtype=int)
+    except (TypeError, ValueError):
+        return None
+    if len(boxes) != len(logic) or logic.ndim != 2 or logic.shape[1] < 4:
+        return None
+    retained = [
+        index
+        for index, point in enumerate(logic)
+        if int(point[1]) < final_rows
+    ]
+    geometry = _table_structure_cell_recovery_geometry(
+        boxes[retained],
+        logic[retained],
+        final_rows,
+        final_columns,
+    )
+    if geometry is None:
+        return None
+    geometry["cell_bounds"] = {
+        location: bounds
+        for location, bounds in geometry["cell_bounds"].items()
+        if location[0] < aligned_prefix_rows
+    }
+    geometry["restrict_to_cell_bounds"] = True
+    geometry["aligned_prefix_rows"] = aligned_prefix_rows
+    return geometry
+
+
 def _spatial_geometry_row_column_boundaries(
     geometry: dict[str, Any],
     columns: list[int],
@@ -27007,6 +29203,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
     maximum_accuracy = accuracy_mode == "maximum"
     high_accuracy = accuracy_mode in {"adaptive_high", "maximum"}
     already_rectified_input = bool(options.get("input_rectified"))
+    selected_table_region = bool(options.get("selected_table_region"))
     maximum_grid_cells = 1280 if maximum_accuracy else 720
     structural_warnings: list[str] = []
     processing_notices: list[str] = []
@@ -27032,6 +29229,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
     large_page_spatial_body_recovered = False
     perspective_ruler_grid_recovered = False
     redundantly_split_title_recovered = False
+    prominent_spatial_title_recovered = False
     review_only_spatial_header_spans: list[dict[str, Any]] = []
     review_only_physical_spans = False
     collapsed_page_recovery_metrics: dict[str, Any] = {}
@@ -27040,9 +29238,13 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
     adaptive_screen_grid_selected = False
     page_spatial_layout_agrees = False
     blank_form_physical_grid = False
+    raw_blank_form_grid_recovered = False
     raw_spatial_grid: list[list[str]] = []
     raw_spatial_spans: list[dict[str, Any]] = []
     raw_spatial_strong = False
+    table_structure_cell_bboxes = None
+    table_structure_logic_points = None
+    table_structure_grid: list[list[str]] = []
     image_path = Path(str(request.get("image_path", "")))
     if not image_path.is_file():
         raise ValueError(f"image does not exist: {image_path}")
@@ -27066,6 +29268,24 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             screen_grid[0], screen_grid[1], maximum_cells=maximum_grid_cells
         )
     )
+    if photographic_background:
+        full_frame_ruled_grid = pipeline.extract_ruled_grid(
+            image,
+            prefer_adaptive=True,
+        )
+        if _full_frame_ruled_grid_can_bypass_photo_rectification(
+            image,
+            full_frame_ruled_grid,
+            maximum_cells=maximum_grid_cells,
+        ):
+            screen_grid = full_frame_ruled_grid
+            screen_grid_is_credible = True
+            screen_grid_is_bounded = True
+            photographic_background = False
+            adaptive_screen_grid_selected = True
+            processing_notices.append(
+                "暗光画面中的完整规则网格已按原始边界保留。"
+            )
     if not photographic_background and not screen_grid_is_bounded:
         embedded_grid = pipeline.extract_embedded_spreadsheet_grid(image)
         if (
@@ -27231,7 +29451,61 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 )
                 primary_report = None
     ruled_grid = screen_grid if screen_grid_is_credible and not photographic_background else None
-    if primary_report is not None:
+    selected_motion_recovery = None
+    if selected_table_region:
+        source_motion_grid = pipeline.extract_ruled_grid(
+            image,
+            prefer_adaptive=False,
+        )
+        if source_motion_grid is not None and (
+            len(source_motion_grid[0]) - 1 > 12
+            or not _grid_geometry_is_bounded(
+                source_motion_grid[0],
+                source_motion_grid[1],
+                maximum_cells=maximum_grid_cells,
+            )
+            or not _photographic_ruled_grid_is_credible(
+                image,
+                source_motion_grid[0],
+                source_motion_grid[1],
+            )
+        ):
+            source_motion_grid = None
+        selected_motion_recovery = _recover_motion_blurred_photo_grid(
+            image,
+            source_motion_grid,
+            maximum_cells=maximum_grid_cells,
+            selected_region=True,
+        )
+    if selected_motion_recovery is not None:
+        ruled_grid = selected_motion_recovery
+        source_gray = (
+            cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            if image.ndim == 3
+            else image
+        )
+        rectified = cv2.cvtColor(
+            _wiener_motion_deblur_view(source_gray, 7, 0.0),
+            cv2.COLOR_GRAY2BGR,
+        )
+        rectification = {
+            "detected": False,
+            "corners": [],
+            "mode": "full_fallback",
+            "motion_deblurred_grid_recovered": True,
+            "selected_table_region": True,
+        }
+        processing_notices.append(
+            "已按框选表格的水平运动模糊证据恢复物理网格和清晰文字视图。"
+        )
+        _write_runtime_trace(
+            "route",
+            force_flush=True,
+            name="selected_region_motion_grid_recovered",
+            rows=len(ruled_grid[1]) - 1,
+            columns=len(ruled_grid[0]) - 1,
+        )
+    elif primary_report is not None:
         rectified, ruled_grid, rectification = primary_report
         processing_notices.append("已自动定位并仅识别画面中的主报表区域。")
     elif ruled_grid is not None:
@@ -27456,6 +29730,15 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                     maximum_cells=maximum_grid_cells,
                 )
             )
+            opposite_edge_recovery = _recover_opposite_edge_after_top_only_expansion(
+                image,
+                rectified,
+                rectification,
+                ruled_grid,
+                maximum_cells=maximum_grid_cells,
+            )
+            if opposite_edge_recovery is not None:
+                rectified, ruled_grid, rectification = opposite_edge_recovery
             if _crop_cuts_through_source_content(image, rectification):
                 rectification["edge_completeness_checked"] = False
                 edge_recovery_inconclusive = True
@@ -27492,6 +29775,36 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 rectified,
                 prefer_adaptive=photographic_background,
             )
+        if photographic_background:
+            motion_grid = _recover_motion_blurred_photo_grid(
+                rectified,
+                ruled_grid,
+                maximum_cells=maximum_grid_cells,
+            )
+            if motion_grid is not None:
+                previous_rows = len(ruled_grid[1]) - 1 if ruled_grid else 0
+                previous_columns = len(ruled_grid[0]) - 1 if ruled_grid else 0
+                motion_gray = (
+                    cv2.cvtColor(rectified, cv2.COLOR_BGR2GRAY)
+                    if rectified.ndim == 3
+                    else rectified
+                )
+                rectified = cv2.cvtColor(
+                    _wiener_motion_deblur_view(motion_gray, 7, 0.0),
+                    cv2.COLOR_GRAY2BGR,
+                )
+                ruled_grid = motion_grid
+                cropped_grid_is_credible = True
+                rectification["motion_deblurred_grid_recovered"] = True
+                _write_runtime_trace(
+                    "route",
+                    force_flush=True,
+                    name="motion_deblurred_photo_grid_recovered",
+                    previous_rows=previous_rows,
+                    previous_columns=previous_columns,
+                    rows=len(ruled_grid[1]) - 1,
+                    columns=len(ruled_grid[0]) - 1,
+                )
         if (
             paper_touches_image_edge
             and not rectification.get("refined_from_paper")
@@ -27526,6 +29839,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
         if (
             photographic_background
             and ruled_grid is not None
+            and not rectification.get("motion_deblurred_grid_recovered")
             and not _photographic_ruled_grid_is_credible(
                 rectified,
                 ruled_grid[0],
@@ -27715,6 +30029,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
     verified_outputs: dict[Any, tuple[Any, list[str], list[float], int]] = {}
     force_bounded_page_verification = False
     main_consensus_verified_cells: set[tuple[int, int]] = set()
+    aligned_header_certificate_candidate = False
 
     def strip_verified_spreadsheet_headers(
         values: list[list[str]],
@@ -27804,6 +30119,32 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
         return verified_outputs[key][:3]
     engine_name = "PP-OCRv5 Mobile + PP-OCRv6 Medium + selective PP-OCRv5 Server verification"
     document_mode = "grid_table"
+    if (
+        ruled_grid is not None
+        and not photographic_background
+        and str(rectification.get("mode", "")) == "screen"
+    ):
+        raw_blank_form_grid = _raw_blank_form_grid_candidate(
+            rectified,
+            ruled_grid,
+            maximum_cells=maximum_grid_cells,
+        )
+        if raw_blank_form_grid is not None:
+            ruled_grid = raw_blank_form_grid
+            raw_blank_form_grid_recovered = True
+            structure_certificate = _new_structure_certificate(
+                rectified,
+                ruled_grid[0],
+                ruled_grid[1],
+                "screen_raw_blank_form_grid",
+            )
+            _write_runtime_trace(
+                "route",
+                force_flush=True,
+                name="raw_blank_form_grid_recovered",
+                rows=len(ruled_grid[1]) - 1,
+                columns=len(ruled_grid[0]) - 1,
+            )
     ruled_cell_count = (
         (len(ruled_grid[0]) - 1) * (len(ruled_grid[1]) - 1)
         if ruled_grid is not None
@@ -27828,6 +30169,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             rectification.get("mode") != "screen"
             or adaptive_screen_grid_selected
             or small_screen_page_primary
+            or raw_blank_form_grid_recovered
         )
     )
     if use_verified_page_grid:
@@ -27884,6 +30226,34 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             ocr_output.scores,
             preserve_geometry=True,
         )
+        collapsed_blank_header = _collapse_blank_form_split_header_row(
+            rectified,
+            columns,
+            rows,
+            physical_page_grid,
+            physical_page_confidence,
+        )
+        if collapsed_blank_header is not None:
+            rows, physical_page_grid, collapsed_confidence = collapsed_blank_header
+            physical_page_confidence = collapsed_confidence or []
+            ruled_grid = (columns, rows, ruled_grid[2])
+            ruled_cell_count = (len(columns) - 1) * (len(rows) - 1)
+            certificate_source = str(
+                (structure_certificate or {}).get("source", "screen_ruled_grid")
+            )
+            structure_certificate = _new_structure_certificate(
+                rectified,
+                columns,
+                rows,
+                certificate_source,
+            )
+            _write_runtime_trace(
+                "route",
+                force_flush=True,
+                name="blank_form_split_header_collapsed",
+                rows=len(physical_page_grid),
+                columns=len(physical_page_grid[0]),
+            )
         trimmed_blank_form = _trim_blank_form_outer_closure_rows(
             rows,
             physical_page_grid,
@@ -27911,14 +30281,93 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                     rows=len(physical_page_grid),
                     columns=len(physical_page_grid[0]),
                 )
+        early_blank_form_grid = bool(
+            raw_blank_form_grid_recovered
+            or _blank_form_physical_grid_is_safe(
+                rectified,
+                columns,
+                rows,
+                physical_page_grid,
+                photographic_background=photographic_background,
+            )
+        )
+        if (
+            structure_certificate is not None
+            and bool(structure_certificate.get("verified", False))
+            and not early_blank_form_grid
+        ):
+            early_page_text_evidence = [
+                (
+                    str(text),
+                    float(np.mean(np.asarray(box, dtype=float)[:, 0])),
+                    float(np.mean(np.asarray(box, dtype=float)[:, 1])),
+                    float(score),
+                )
+                for box, text, score in zip(
+                    ocr_output.boxes,
+                    ocr_output.txts,
+                    ocr_output.scores,
+                )
+            ]
+            before_outer_shape = _grid_shape_and_content(
+                physical_page_grid
+            )[:2]
+            (
+                early_trimmed_grid,
+                early_trimmed_confidence,
+                early_trim_aligned,
+            ) = _trim_certified_empty_outer_grid(
+                physical_page_grid,
+                physical_page_confidence,
+                structure_certificate,
+                early_page_text_evidence,
+            )
+            after_outer_shape = _grid_shape_and_content(
+                early_trimmed_grid
+            )[:2]
+            if early_trim_aligned and after_outer_shape != before_outer_shape:
+                active_columns = [
+                    int(value)
+                    for value in structure_certificate.get(
+                        "column_boundaries", []
+                    )
+                ]
+                active_rows = [
+                    int(value)
+                    for value in structure_certificate.get(
+                        "row_boundaries", []
+                    )
+                ]
+                if (
+                    len(active_columns) == after_outer_shape[1] + 1
+                    and len(active_rows) == after_outer_shape[0] + 1
+                ):
+                    physical_page_grid = early_trimmed_grid
+                    physical_page_confidence = early_trimmed_confidence or []
+                    columns = active_columns
+                    rows = active_rows
+                    ruled_grid = (columns, rows, ruled_grid[2])
+                    ruled_cell_count = after_outer_shape[0] * after_outer_shape[1]
+                    _write_runtime_trace(
+                        "route",
+                        force_flush=True,
+                        name="certified_empty_outer_grid_trimmed_before_cell_review",
+                        before_rows=before_outer_shape[0],
+                        before_columns=before_outer_shape[1],
+                        rows=after_outer_shape[0],
+                        columns=after_outer_shape[1],
+                    )
         raw_page_grid = [list(row) for row in physical_page_grid]
         raw_page_confidence = [list(row) for row in physical_page_confidence]
-        blank_form_physical_grid = _blank_form_physical_grid_is_safe(
-            rectified,
-            columns,
-            rows,
-            physical_page_grid,
-            photographic_background=photographic_background,
+        blank_form_physical_grid = bool(
+            raw_blank_form_grid_recovered
+            or _blank_form_physical_grid_is_safe(
+                rectified,
+                columns,
+                rows,
+                physical_page_grid,
+                photographic_background=photographic_background,
+            )
         )
         if blank_form_physical_grid:
             review_only_spatial_header_spans = _recover_blank_form_physical_spans(
@@ -27927,6 +30376,16 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 rows,
                 physical_page_grid,
                 physical_page_confidence,
+                force_title_span=raw_blank_form_grid_recovered,
+            )
+            _recover_blank_form_title_multiview(
+                rectified,
+                columns,
+                rows,
+                physical_page_grid,
+                physical_page_confidence,
+                review_only_spatial_header_spans,
+                ocr_engine,
             )
             structural_warnings.append(
                 "已按完整物理线框保留空白表单的全部行列与合并单元格；文字单元格仍需核对。"
@@ -28587,10 +31046,14 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             structural_warnings.append("首行或左侧字段不够稳定，结果已按当前检测内容生成。")
         motion_cell_consensus = bool(
             photographic_background
+            and not rectification.get("motion_deblurred_grid_recovered")
             and _page_grid_needs_motion_cell_consensus(
                 physical_page_grid,
                 physical_page_confidence,
             )
+        )
+        physical_cell_view_mode = (
+            "motion" if motion_cell_consensus else "standard"
         )
         standard_cell_consensus = bool(
             not motion_cell_consensus
@@ -28611,10 +31074,28 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
         )
         selective_standard_consensus = bool(
             standard_cell_consensus
-            and ruled_cell_count >= 180
+            and (
+                ruled_cell_count >= 180
+                or (
+                    ruled_cell_count >= 80
+                    and not photographic_background
+                    and str(rectification.get("mode", "")) == "screen"
+                )
+            )
             and structure_certificate is not None
             and bool(structure_certificate.get("verified", False))
-            and bool(rectification.get("edge_completeness_checked", False))
+            and bool(
+                rectification.get("edge_completeness_checked", False)
+                or (
+                    not photographic_background
+                    and str(rectification.get("mode", "")) == "screen"
+                    and _ruled_grid_spans_source_frame(
+                        rectified,
+                        columns,
+                        rows,
+                    )
+                )
+            )
             and observed_evidence_scores
             and low_confidence_evidence / float(len(observed_evidence_scores)) <= 0.02
         )
@@ -28888,7 +31369,10 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                     rows,
                     locked_physical_cells,
                     preserve_recognition_batches=(
-                        not review_only_selective_standard_consensus
+                        not (
+                            selective_standard_consensus
+                            or review_only_selective_standard_consensus
+                        )
                     ),
                     certified_selective_review=(
                         selective_standard_consensus
@@ -29092,9 +31576,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                             columns,
                             rows,
                             ocr_engine,
-                            view_mode=(
-                                "motion" if motion_cell_consensus else "standard"
-                            ),
+                            view_mode=physical_cell_view_mode,
                             first_row=0,
                             selected_cells=non_unit_visible_blank_cells,
                             isolated_recognition=False,
@@ -29113,7 +31595,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                         columns,
                         rows,
                         ocr_engine,
-                        view_mode="motion" if motion_cell_consensus else "standard",
+                        view_mode=physical_cell_view_mode,
                         first_row=0,
                         selected_cells=physical_consensus_cells,
                         cell_span_widths=title_span_widths,
@@ -29155,9 +31637,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                             columns,
                             rows,
                             ocr_engine,
-                            view_mode=(
-                                "motion" if motion_cell_consensus else "standard"
-                            ),
+                            view_mode=physical_cell_view_mode,
                             first_row=0,
                             selected_cells=unresolved_unit_confusion_cells,
                             isolated_recognition=True,
@@ -29667,6 +32147,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             page_grid,
             spatial_grid,
         )
+        page_grid_before_aligned_header = [list(row) for row in page_grid]
         aligned_header_recovery = _recover_spatial_headers_with_aligned_page_body(
             page_grid,
             page_confidence,
@@ -29682,24 +32163,106 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 review_only_spatial_header_spans,
                 alignment_metrics,
             ) = aligned_header_recovery
-            multilevel_header_spatial_recovered = True
-            structure_certificate = None
-            active_certificate_boundaries = None
+            aligned_page_text_evidence = [
+                (
+                    str(text),
+                    float(np.mean(np.asarray(box, dtype=float)[:, 0])),
+                    float(np.mean(np.asarray(box, dtype=float)[:, 1])),
+                    float(score),
+                )
+                for box, text, score in zip(
+                    ocr_output.boxes,
+                    ocr_output.txts,
+                    ocr_output.scores,
+                )
+            ]
+            (
+                page_grid,
+                page_confidence,
+                review_only_spatial_header_spans,
+            ) = _recover_leading_metadata_spans(
+                page_grid,
+                page_confidence,
+                review_only_spatial_header_spans,
+                image=rectified,
+                columns=columns,
+                rows=rows,
+                page_text_evidence=aligned_page_text_evidence,
+            )
+            if (
+                len(columns) == len(page_grid[0]) + 1
+                and len(rows) == len(page_grid) + 1
+            ):
+                review_only_spatial_header_spans = (
+                    _recover_certified_physical_group_header_spans(
+                        rectified,
+                        columns,
+                        rows,
+                        page_grid,
+                        page_confidence,
+                        aligned_page_text_evidence,
+                        review_only_spatial_header_spans,
+                        ocr_engine=ocr_engine,
+                    )
+                )
             spatial_recovery_boundaries = _spatial_geometry_cell_boundaries(
                 spatial_geometry,
                 rectified.shape[:2],
                 len(page_grid),
                 len(page_grid[0]),
             )
-            structural_warnings.append(
-                "物理网格遗漏标题层并包含外侧空行，已按逐格一致的空间标题和物理表体恢复；整表标黄并禁止直接发布。"
+            if spatial_recovery_boundaries is not None:
+                recovery_columns, recovery_rows = spatial_recovery_boundaries
+                (
+                    page_grid,
+                    page_confidence,
+                    review_only_spatial_header_spans,
+                ) = _recover_leading_metadata_spans(
+                    page_grid,
+                    page_confidence,
+                    review_only_spatial_header_spans,
+                    image=rectified,
+                    columns=recovery_columns,
+                    rows=recovery_rows,
+                    page_text_evidence=aligned_page_text_evidence,
+                )
+                review_only_spatial_header_spans = (
+                    _recover_certified_physical_group_header_spans(
+                        rectified,
+                        recovery_columns,
+                        recovery_rows,
+                        page_grid,
+                        page_confidence,
+                        aligned_page_text_evidence,
+                        review_only_spatial_header_spans,
+                        ocr_engine=ocr_engine,
+                    )
+                )
+            aligned_header_certificate_candidate = (
+                _aligned_header_can_keep_physical_certificate(
+                    page_grid_before_aligned_header,
+                    page_grid,
+                    review_only_spatial_header_spans,
+                    alignment_metrics,
+                    structure_certificate,
+                )
             )
+            multilevel_header_spatial_recovered = bool(
+                not aligned_header_certificate_candidate
+            )
+            if not aligned_header_certificate_candidate:
+                structure_certificate = None
+                active_certificate_boundaries = None
+                structural_warnings.append(
+                    "物理网格遗漏标题层并包含外侧空行，已按逐格一致的空间标题和物理表体恢复；整表标黄并禁止直接发布。"
+                )
             _write_runtime_trace(
                 "route",
                 force_flush=True,
                 name="aligned_spatial_header_body_recovered",
                 rows=len(page_grid),
                 columns=len(page_grid[0]),
+                certificate_candidate=aligned_header_certificate_candidate,
                 **alignment_metrics,
             )
         title_recovery = (
@@ -29731,6 +32294,12 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 name="full_width_title_spatial_recovered",
                 rows=len(page_grid),
                 columns=len(page_grid[0]) if page_grid else 0,
+            )
+        if blank_form_physical_grid:
+            _clear_blank_form_span_subordinates(
+                page_grid,
+                page_confidence,
+                review_only_spatial_header_spans,
             )
         page_rows, page_columns, page_nonempty = _grid_shape_and_content(page_grid)
         page_cells = max(1, page_rows * page_columns)
@@ -29804,11 +32373,31 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 or blank_form_physical_grid
             )
             physical_grid_selected = not review_only_spatial_recovery
+            if aligned_header_certificate_candidate and physical_grid_selected:
+                for row_index, confidence_row in enumerate(confidence_grid):
+                    for column_index, score in enumerate(confidence_row):
+                        if (
+                            row_index,
+                            column_index,
+                        ) in main_consensus_verified_cells:
+                            continue
+                        confidence_row[column_index] = (
+                            min(float(score), 0.77)
+                            if str(grid[row_index][column_index]).strip()
+                            else -1.0
+                        )
             if review_only_spatial_recovery:
                 structure_certificate = None
                 document_mode = "borderless_columns"
                 for row_index, confidence_row in enumerate(confidence_grid):
                     for column_index, score in enumerate(confidence_row):
+                        if (
+                            full_width_title_spatial_recovered
+                            and not photographic_background
+                            and str(rectification.get("mode", "")) == "screen"
+                            and row_index > 0
+                        ):
+                            continue
                         confidence_row[column_index] = (
                             min(float(score), 0.77)
                             if str(grid[row_index][column_index]).strip()
@@ -30472,6 +33061,15 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             spatial_confidence,
             spatial_geometry,
         )
+        prominent_spatial_title = bool(
+            any(
+                span.get("role") == "title" and int(span.get("row", -1)) == 0
+                for span in spatial_spans
+            )
+            and _spatial_title_is_prominent(spatial_grid, spatial_geometry)
+        )
+        if prominent_spatial_title:
+            prominent_spatial_title_recovered = True
         bounded_raw_spatial_verified = False
         if (
             use_raw_spatial
@@ -30597,6 +33195,12 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 spatial_spans,
                 spatial_geometry,
             )
+            if prominent_spatial_title:
+                spatial_spans = _title_spans_from_screen_grid(
+                    spatial_grid,
+                    spatial_confidence,
+                )
+                prominent_spatial_title_recovered = bool(spatial_spans)
         spatial_header_credible = bool(
             _spatial_has_credible_header(spatial_grid, spatial_spans)
             or (
@@ -30654,6 +33258,17 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                     grid = []
                     spans = []
                 if grid:
+                    if (
+                        getattr(table_output, "cell_bboxes", None)
+                        and getattr(table_output, "logic_points", None)
+                    ):
+                        table_structure_cell_bboxes = np.asarray(
+                            table_output.cell_bboxes[0], dtype=float
+                        ).copy()
+                        table_structure_logic_points = np.asarray(
+                            table_output.logic_points[0], dtype=int
+                        ).copy()
+                        table_structure_grid = copy.deepcopy(grid)
                     document_mode = "grid_table"
             except MemoryError:
                 raise
@@ -30685,6 +33300,15 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             spatial_confidence,
             spatial_geometry,
         )
+        prominent_spatial_title = bool(
+            any(
+                span.get("role") == "title" and int(span.get("row", -1)) == 0
+                for span in spatial_spans
+            )
+            and _spatial_title_is_prominent(spatial_grid, spatial_geometry)
+        )
+        if prominent_spatial_title:
+            prominent_spatial_title_recovered = True
         rebuilt_spreadsheet = _rebuild_spreadsheet_grid_from_ruler(
             rectified,
             spatial_grid,
@@ -30710,6 +33334,12 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 spatial_spans,
                 spatial_geometry,
             )
+            if prominent_spatial_title:
+                spatial_spans = _title_spans_from_screen_grid(
+                    spatial_grid,
+                    spatial_confidence,
+                )
+                prominent_spatial_title_recovered = bool(spatial_spans)
         if spatial_grid:
             strong_layout = bool(
                 strong_layout
@@ -30944,6 +33574,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 confidence_grid,
                 page_text_evidence,
                 spans,
+                ocr_engine=ocr_engine,
             )
         if active_certificate_boundaries is not None:
             scores.extend(
@@ -31005,6 +33636,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                     confidence_grid,
                     page_text_evidence,
                     spans,
+                    ocr_engine=ocr_engine,
                 )
             _write_runtime_trace(
                 "route",
@@ -31197,6 +33829,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 confidence_grid,
                 review_page_text_evidence,
                 spans,
+                ocr_engine=ocr_engine,
             )
             _extend_leading_nested_group_header(
                 grid,
@@ -31226,6 +33859,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             # 静默融合两列，或在 GUI/CSV/XLSX 中隐藏真实存在的空白格。
             if (
                 not redundantly_split_title_recovered
+                and not prominent_spatial_title_recovered
                 and not review_only_physical_spans
             ):
                 spans = []
@@ -31267,6 +33901,14 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             grid,
             confidence_grid,
         )
+        physical_token_spills = _split_physically_separated_adjacent_tokens(
+            rectified,
+            grid,
+            confidence_grid,
+            recovery_columns,
+            recovery_rows,
+        )
+        patterned_spills.update(physical_token_spills)
         if patterned_spills:
             locations = "、".join(
                 f"R{row + 1}C{column + 1}"
@@ -31527,6 +34169,34 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 structural_warnings.append(
                     "标题层之外的副标题或分组表头已按最终物理竖线恢复，整表仍需人工核对。"
                 )
+    before_collapsed_header_repair = [list(row) for row in grid]
+    grid, confidence_grid, spans = _split_collapsed_header_data_row(
+        grid,
+        confidence_grid,
+        spans,
+    )
+    if grid != before_collapsed_header_repair:
+        structure_verified = False
+        structure_certificate = None
+        review_only_physical_spans = True
+        processing_notices.append(
+            "已按可见表头标签拆分粘连的表头与首行数据，相关单元格仍标黄。"
+        )
+    if not any(span.get("role") == "title" for span in spans):
+        final_title_spans = _strict_simple_title_span(grid, confidence_grid)
+        if final_title_spans:
+            spans = final_title_spans + [
+                span
+                for span in spans
+                if int(span.get("row", -1)) != 0
+            ]
+            spans.sort(
+                key=lambda span: (
+                    int(span.get("row", -1)),
+                    int(span.get("column", -1)),
+                )
+            )
+            review_only_physical_spans = True
     if _repair_shifted_paired_nested_header(grid, confidence_grid, spans):
         review_only_physical_spans = True
     split_metadata_fields = _split_combined_metadata_across_physical_spans(
@@ -32211,6 +34881,46 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 processing_notices.append(
                     f"已按重复类别和Medium多视图恢复空白或横线格（{locations}），相关单元格仍标黄。"
                 )
+            repeated_blank_recoveries, repeated_blank_scores = (
+                _recover_repeated_visible_blank_physical_multiview(
+                    rectified,
+                    duplicate_grid,
+                    duplicate_confidence,
+                    duplicate_columns,
+                    duplicate_rows,
+                    ocr_engine,
+                )
+                if budget.elapsed() <= 19.0
+                else (set(), [])
+            )
+            scores.extend(repeated_blank_scores)
+            if repeated_blank_recoveries:
+                locations = "、".join(
+                    f"R{row + duplicate_row_offset + 1}C{column + 1}"
+                    for row, column in sorted(repeated_blank_recoveries)
+                )
+                processing_notices.append(
+                    f"已按重复列值和多模型物理格证据补读可见漏格（{locations}），相关单元格仍标黄。"
+                )
+            repaired_percentages, percentage_scores = (
+                _repair_invalid_percentage_tight_consensus(
+                    rectified,
+                    duplicate_grid,
+                    duplicate_confidence,
+                    duplicate_columns,
+                    duplicate_rows,
+                    ocr_engine,
+                )
+            )
+            scores.extend(percentage_scores)
+            if repaired_percentages:
+                locations = "、".join(
+                    f"R{row + duplicate_row_offset + 1}C{column + 1}"
+                    for row, column in sorted(repaired_percentages)
+                )
+                processing_notices.append(
+                    f"已按物理紧裁双视图共识修复百分号顺序（{locations}），相关单元格仍标黄。"
+                )
             late_removed = _remove_weak_adjacent_duplicate_fills(
                 rectified,
                 duplicate_grid,
@@ -32221,6 +34931,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                     repaired_categories
                     | repaired_leading_glyphs
                     | repaired_status_marks
+                    | repaired_percentages
                 ),
             )
             removed_duplicate_fills.update(
@@ -32379,6 +35090,140 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             [0.77 if str(value).strip() else 0.0 for value in row]
             for row in grid
         ]
+    structure_cell_probe_route = bool(
+        (
+            selected_table_region
+            and full_width_title_spatial_recovered
+        )
+        or (
+            not selected_table_region
+            and ruled_grid is None
+            and document_mode == "borderless_columns"
+            and engine_name == "Hybrid OCR + borderless spatial layout"
+        )
+    )
+    aligned_structure_probe_needed = bool(
+        maximum_accuracy
+        and structure_cell_probe_route
+        and table_structure_cell_bboxes is None
+        and confidence_grid is not None
+        and grid
+        and grid[0]
+        and 20 <= len(grid) * len(grid[0]) <= 320
+        and any(
+            not str(grid[row][column]).strip()
+            and float(confidence_grid[row][column]) <= 0.0
+            for row in range(len(grid))
+            for column in range(len(grid[row]))
+        )
+        and ocr_output is not None
+        and ocr_output.boxes is not None
+        and ocr_output.txts is not None
+        and ocr_output.scores is not None
+        and budget.allow(2.0)
+    )
+    if aligned_structure_probe_needed:
+        try:
+            if table_engine is None:
+                _, table_engine = _engines(load_table=True)
+            with contextlib.redirect_stdout(sys.stderr):
+                table_probe = table_engine(
+                    rectified,
+                    ocr_results=[
+                        (ocr_output.boxes, ocr_output.txts, ocr_output.scores)
+                    ],
+                )
+            table_structure_grid, _ = pipeline.parse_html_table(
+                table_probe.pred_htmls[0] if table_probe.pred_htmls else ""
+            )
+            if (
+                table_structure_grid
+                and getattr(table_probe, "cell_bboxes", None)
+                and getattr(table_probe, "logic_points", None)
+            ):
+                table_structure_cell_bboxes = np.asarray(
+                    table_probe.cell_bboxes[0], dtype=float
+                ).copy()
+                table_structure_logic_points = np.asarray(
+                    table_probe.logic_points[0], dtype=int
+                ).copy()
+        except MemoryError:
+            raise
+        except Exception:
+            table_structure_grid = []
+            table_structure_cell_bboxes = None
+            table_structure_logic_points = None
+    table_cell_geometry = (
+        _table_structure_cell_recovery_geometry(
+            table_structure_cell_bboxes,
+            table_structure_logic_points,
+            len(grid),
+            len(grid[0]),
+        )
+        if confidence_grid is not None and grid and grid[0]
+        else None
+    )
+    if (
+        table_cell_geometry is None
+        and confidence_grid is not None
+        and grid
+        and grid[0]
+        and table_structure_grid
+    ):
+        table_cell_geometry = _aligned_table_structure_cell_recovery_geometry(
+            table_structure_grid,
+            table_structure_cell_bboxes,
+            table_structure_logic_points,
+            grid,
+        )
+    if maximum_accuracy and photographic_background and table_cell_geometry:
+        subordinate_cells: set[tuple[int, int]] = set()
+        for span in spans:
+            span_row = int(span.get("row", -1))
+            span_column = int(span.get("column", -1))
+            row_span = max(1, int(span.get("row_span", 1)))
+            column_span = max(1, int(span.get("column_span", 1)))
+            if span_row < 0 or span_column < 0:
+                continue
+            for row in range(span_row, span_row + row_span):
+                for column in range(span_column, span_column + column_span):
+                    if (row, column) != (span_row, span_column):
+                        subordinate_cells.add((row, column))
+        if table_cell_geometry.get("restrict_to_cell_bounds"):
+            bounded_cells = set(table_cell_geometry.get("cell_bounds", {}))
+            subordinate_cells.update(
+                (row, column)
+                for row in range(len(grid))
+                for column in range(len(grid[row]))
+                if (row, column) not in bounded_cells
+                or str(grid[row][column]).strip()
+                or float(confidence_grid[row][column]) > 0.0
+            )
+        blanks_before = sum(
+            not str(value).strip() for row in grid for value in row
+        )
+        grid, confidence_grid, late_structure_scores = (
+            _recover_missing_spatial_cells(
+                rectified,
+                grid,
+                confidence_grid,
+                table_cell_geometry,
+                ocr_engine,
+                max_candidates=None,
+                require_cross_model=True,
+                excluded_cells=subordinate_cells,
+                skip_unsharp_suggestions=True,
+                reuse_combined_blank_evidence=True,
+            )
+        )
+        scores.extend(late_structure_scores)
+        recovered_blanks = blanks_before - sum(
+            not str(value).strip() for row in grid for value in row
+        )
+        if recovered_blanks > 0:
+            processing_notices.append(
+                f"已按结构模型单元格边界补读 {recovered_blanks} 个漏检格，相关单元格仍标黄。"
+            )
     if confidence_grid is not None:
         if _recover_stacked_subtitle_for_review(grid, confidence_grid, spans):
             structure_verified = False
@@ -32404,6 +35249,12 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             processing_notices.append(
                 f"已在发布门前按唯一格式和连续序号修复粘连（{locations}），相关单元格仍标黄。"
             )
+    if blank_form_physical_grid and confidence_grid is not None:
+        _clear_blank_form_span_subordinates(
+            grid,
+            confidence_grid,
+            spans,
+        )
     if confidence_grid is not None:
         _mark_dense_residual_reviews(grid, confidence_grid)
     header_only_warning_fragments = (
@@ -32435,9 +35286,19 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             and _spans_hide_non_anchor_text(grid, spans)
         ):
             spans = []
+    limited_spatial_review = _spatial_review_can_be_limited(
+        grid,
+        spans,
+        structural_warnings,
+        document_mode=document_mode,
+        engine_name=engine_name,
+        rectification_mode=str(rectification.get("mode", "")),
+        photographic_background=photographic_background,
+    )
     header_review_rows = (
         {int(span.get("row", -1)) for span in spans}
-        if review_only_spans_are_safe and structure_verified
+        if (review_only_spans_are_safe and structure_verified)
+        or limited_spatial_review
         else None
     )
     confidence_grid = _apply_structure_review_policy(
@@ -32467,7 +35328,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
     if (
         confidence_grid is not None
         and spans
-        and structure_verified
+        and (structure_verified or limited_spatial_review)
     ):
         _fold_merged_subordinate_reviews_into_anchors(
             grid,
