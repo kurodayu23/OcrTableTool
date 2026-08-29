@@ -41,47 +41,55 @@ if (-not (Test-Path $VcVarsAll)) {
 }
 
 New-Item -ItemType Directory -Path $BuildDirectory -Force | Out-Null
-$projectFile = Join-Path $projectRoot "ocr-table-tool.pro"
-$commandLine = 'call "{0}" amd64 {1} && "{2}" "{3}" -spec win32-msvc && nmake /NOLOGO' -f `
-    $VcVarsAll, $WindowsSdkVersion, $QMake, $projectFile
-Push-Location $BuildDirectory
-try {
-    & cmd.exe /d /c $commandLine
-    if ($LASTEXITCODE -ne 0) {
-        throw "qmake/nmake failed with exit code $LASTEXITCODE"
-    }
-} finally {
-    Pop-Location
-}
-
-$deployTool = Join-Path (Split-Path -Parent $QMake) "windeployqt.exe"
-$executable = Join-Path $BuildDirectory "src\gui\bin\OcrTableTool.exe"
-if ((Test-Path $deployTool) -and (Test-Path $executable)) {
-    & $deployTool --no-translations --compiler-runtime $executable
-}
-
 # Python 后端不参与 C++ 链接；增量构建时 qmake 的 POST_LINK 可能不会再次执行。
-# 每次构建都显式同步，避免新界面误带旧识别逻辑。
-$backendSource = Join-Path $projectRoot "backend"
-$backendDestination = Join-Path (Split-Path -Parent $executable) "backend"
-New-Item -ItemType Directory -Path $backendDestination -Force | Out-Null
-Copy-Item -Path (Join-Path $backendSource "*") -Destination $backendDestination -Recurse -Force
+# 只同步正式运行文件，避免把缓存或构建目录递归复制到后端目录。
+$backendDirectory = Join-Path $BuildDirectory "src\gui\bin\backend"
+New-Item -ItemType Directory -Path $backendDirectory -Force | Out-Null
+$backendFiles = @(
+    "ocr_backend.py",
+    "table_pipeline.py",
+    "recognition_scheduler.py",
+    "requirements.txt",
+    "warmup.py"
+)
+foreach ($backendFile in $backendFiles) {
+    Copy-Item -LiteralPath (Join-Path $projectRoot "backend\$backendFile") `
+        -Destination (Join-Path $backendDirectory $backendFile) -Force
+}
 $sourceBackendHash = (Get-FileHash -Algorithm SHA256 `
-    -LiteralPath (Join-Path $backendSource "ocr_backend.py")).Hash
+    -LiteralPath (Join-Path $projectRoot "backend\ocr_backend.py")).Hash
 $deployedBackendHash = (Get-FileHash -Algorithm SHA256 `
-    -LiteralPath (Join-Path $backendDestination "ocr_backend.py")).Hash
+    -LiteralPath (Join-Path $backendDirectory "ocr_backend.py")).Hash
 if ($sourceBackendHash -ne $deployedBackendHash) {
     throw "Deployed OCR backend does not match current source."
 }
 
-# 只部署简体中文 Qt 翻译，避免把整套多语言文件带入平板包。
 $qtPrefix = Split-Path -Parent (Split-Path -Parent $QMake)
 $translationSource = Join-Path $qtPrefix "translations\qt_zh_CN.qm"
 if (-not (Test-Path $translationSource)) {
     throw "Qt Simplified Chinese translation was not found: $translationSource"
 }
-$translationDirectory = Join-Path (Split-Path -Parent $executable) "translations"
+$translationDirectory = Join-Path $BuildDirectory "src\gui\bin\translations"
 New-Item -ItemType Directory -Path $translationDirectory -Force | Out-Null
-Copy-Item -LiteralPath $translationSource -Destination (Join-Path $translationDirectory "qt_zh_CN.qm") -Force
+Copy-Item -LiteralPath $translationSource `
+    -Destination (Join-Path $translationDirectory "qt_zh_CN.qm") -Force
+
+$deployTool = Join-Path (Split-Path -Parent $QMake) "windeployqt.exe"
+if (-not (Test-Path $deployTool)) {
+    throw "windeployqt was not found."
+}
+$projectFile = Join-Path $projectRoot "ocr-table-tool.pro"
+$executable = Join-Path $BuildDirectory "src\gui\bin\OcrTableTool.exe"
+$commandLine = 'call "{0}" amd64 {1} && "{2}" "{3}" -spec win32-msvc && nmake /NOLOGO && "{4}" --no-translations --compiler-runtime "{5}"' -f `
+    $VcVarsAll, $WindowsSdkVersion, $QMake, $projectFile, $deployTool, $executable
+Push-Location $BuildDirectory
+try {
+    & cmd.exe /d /c $commandLine
+    if ($LASTEXITCODE -ne 0) {
+        throw "qmake/nmake/windeployqt failed with exit code $LASTEXITCODE"
+    }
+} finally {
+    Pop-Location
+}
 
 Write-Host "Build ready: $executable"
