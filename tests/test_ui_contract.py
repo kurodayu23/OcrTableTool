@@ -68,7 +68,7 @@ class UiContractTest(unittest.TestCase):
         self.assertIn("m_backend->recognize(m_sourceImagePath,", source)
         self.assertIn('QStringLiteral("auto"),', source)
         self.assertIn("m_recognitionSourceIsRectified);", source)
-        self.assertIn("QTimer::singleShot(0, this, [this]() { startBackgroundRecognition(); });", source)
+        self.assertIn("startBackgroundRecognition();", source)
         self.assertNotIn("current-input.png", source)
 
     def test_user_can_crop_one_target_table_without_overwriting_the_original(self):
@@ -124,6 +124,8 @@ class UiContractTest(unittest.TestCase):
         self.assertIn("beginStopping(action, QStringLiteral(\"操作已取消\"));", runner)
         self.assertNotIn("waitForFinished(3000)", runner)
         self.assertIn("m_restartRecognitionAfterCancel", source + header)
+        self.assertIn("if (m_backend->isRunning() && m_recognitionActive)", source)
+        self.assertIn('QStringLiteral("stale_recognition_discarded")', source)
         self.assertIn("responseRequestId != m_activeRequestId", runner)
         self.assertNotIn("识别已达到30秒上限", runner)
         self.assertIn("m_pendingRecognitionResponse", source + header)
@@ -142,7 +144,13 @@ class UiContractTest(unittest.TestCase):
         self.assertIn('QStringLiteral("拍照")', source)
         self.assertIn("void MainWindow::takePhoto()", source)
         self.assertIn("CameraCaptureDialog dialog(this);", source)
-        self.assertIn("m_backend->cancel();", source[source.index("void MainWindow::takePhoto()") : source.index("bool MainWindow::loadImage")])
+        self.assertIn(
+            "m_backend->cancel();",
+            source[
+                source.index("void MainWindow::takePhoto()") :
+                source.index("bool MainWindow::loadImage(const QString &path)")
+            ],
+        )
         self.assertIn("正在释放识别资源并打开摄像头", source)
         self.assertIn("m_cameraButton", source + header)
         self.assertIn("QCameraInfo::availableCameras()", dialog)
@@ -216,6 +224,9 @@ class UiContractTest(unittest.TestCase):
 
         self.assertIn("bool inputRectified = false", header)
         self.assertIn('options.insert(QStringLiteral("input_rectified"), true);', runner)
+        self.assertIn("bool selectedTableRegion = false", header)
+        self.assertIn('options.insert(QStringLiteral("selected_table_region"), true);', runner)
+        self.assertIn('QStringLiteral("selected_table_region")', window)
         self.assertIn('QStringLiteral("rectified-")', window)
         self.assertIn("m_recognitionSourceIsRectified", window)
 
@@ -367,6 +378,15 @@ class UiContractTest(unittest.TestCase):
         self.assertIn("m_statusLabel->setToolTip(detailText.isEmpty() ? statusText : detailText);", source)
         self.assertIn("#ReviewNotice", qss)
 
+    def test_review_cells_use_compact_marker_without_full_yellow_fill(self):
+        source = (ROOT / "src/gui/mainwindow.cpp").read_text(encoding="utf-8")
+
+        self.assertIn("const QIcon &reviewMarkerIcon()", source)
+        self.assertIn("m_table->setIconSize(QSize(12, 12));", source)
+        self.assertIn("item->setIcon(reviewMarkerIcon());", source)
+        self.assertIn("待确认：请对照原图核对文字、数字、符号和位置", source)
+        self.assertNotIn('item->setBackground(QColor(QStringLiteral("#FFF4D6")))', source)
+
     def test_table_headers_do_not_clip_at_high_dpi(self):
         source = (ROOT / "src/gui/mainwindow.cpp").read_text(encoding="utf-8")
         qss = (ROOT / "assets/app.qss").read_text(encoding="utf-8")
@@ -419,7 +439,7 @@ class UiContractTest(unittest.TestCase):
         self.assertIn("可导出当前结果", source)
         self.assertNotIn("仍要继续导出吗", source)
         self.assertNotIn("confirmPendingReviewExport", source)
-        self.assertIn("黄色单元格仍需核对", source)
+        self.assertIn("黄色标记项仍需核对", source)
         self.assertIn('cell.insert(QStringLiteral("needs_review"), table.needsReview(row, column));',
                       (ROOT / "src/gui/backendrunner.cpp").read_text(encoding="utf-8"))
         self.assertIn("QScrollBar:vertical", qss)
@@ -489,6 +509,22 @@ class UiContractTest(unittest.TestCase):
         self.assertIn("verticalScrollBar()->setValue", viewer)
         self.assertNotIn("双指缩放", viewer)
         self.assertNotIn("单指移动", viewer)
+
+    def test_gui_command_line_e2e_uses_the_real_window_pipeline(self):
+        main = (ROOT / "src/gui/main.cpp").read_text(encoding="utf-8")
+        window = (ROOT / "src/gui/mainwindow.cpp").read_text(encoding="utf-8")
+        header = (ROOT / "src/gui/mainwindow.h").read_text(encoding="utf-8")
+
+        self.assertIn("application.arguments()", main)
+        self.assertIn("window.loadImageFile(imagePath);", main)
+        self.assertIn("bool loadImageFile(const QString &path);", header)
+        self.assertIn("return loadImage(path);", window)
+        self.assertIn("OCR_TABLE_GUI_TEST_AUTO_DISPLAY", window)
+        self.assertIn("recognizeImage();", window)
+        self.assertIn("canonicalDisplayedResultHash", window)
+        self.assertIn("QCryptographicHash::Sha256", window)
+        self.assertIn('QStringLiteral("canonical_result_hash")', window)
+        self.assertIn('QStringLiteral("review_cell_count")', window)
 
     def test_camera_and_preview_prefer_quality_without_repeated_scaling(self):
         camera = (ROOT / "src/gui/cameracapturedialog.cpp").read_text(encoding="utf-8")

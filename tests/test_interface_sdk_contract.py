@@ -21,6 +21,9 @@ class InterfaceSdkContractTests(unittest.TestCase):
         serialized = json.dumps(schema, ensure_ascii=False)
         for action in ("health", "warmup", "recognize", "export_xlsx"):
             self.assertIn(f'"{action}"', serialized)
+        recognize_options = schema["$defs"]["recognizeRequest"]["properties"]["options"]["properties"]
+        self.assertEqual(recognize_options["input_rectified"], {"type": "boolean"})
+        self.assertEqual(recognize_options["selected_table_region"], {"type": "boolean"})
 
     def test_client_uses_one_process_per_request(self):
         source = CLIENT_CPP.read_text(encoding="utf-8")
@@ -121,6 +124,8 @@ class InterfaceSdkContractTests(unittest.TestCase):
         self.assertIn('QStringLiteral("INSUFFICIENT_MEMORY")', source)
         self.assertIn('QStringLiteral("table_region_fallback")', source)
         self.assertIn("m_regionFallbackAttempted", source + header)
+        self.assertIn('QStringLiteral("camera-table-retry.png")', source)
+        self.assertNotIn("m_capturePath = m_originalCapturePath;", source)
 
     def test_camera_sdk_crops_one_selected_table_on_the_full_resolution_photo(self):
         source = CAMERA_CPP.read_text(encoding="utf-8")
@@ -134,7 +139,9 @@ class InterfaceSdkContractTests(unittest.TestCase):
         self.assertIn("bounded.height() * 0.025", source)
         self.assertIn('QStringLiteral("table_region_cropped")', source)
         self.assertIn("m_capturePath = recognitionPath;", source)
-        self.assertIn("m_ocr->recognize(recognitionPath, m_requestDirectory);", source)
+        self.assertIn("m_tableRegion.isValid());", source)
+        client = CLIENT_CPP.read_text(encoding="utf-8")
+        self.assertIn('QStringLiteral("selected_table_region")', client)
 
 
 if __name__ == "__main__":

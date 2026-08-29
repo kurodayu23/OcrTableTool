@@ -1,3 +1,4 @@
+import copy
 import json
 import inspect
 import os
@@ -892,6 +893,49 @@ class TablePipelineTests(unittest.TestCase):
             )
         )
 
+    def test_long_weak_horizontal_sequence_requires_credible_columns(self):
+        image = np.full((600, 800, 3), 245, dtype=np.uint8)
+        horizontal = np.zeros((600, 800), dtype=np.uint8)
+        columns = [0, 100, 200, 300, 400, 500, 600, 700, 799]
+        complete_rows = [20, 80, 140, 200, 260, 320, 380, 440, 500, 560]
+        for row in complete_rows[:4]:
+            cv2.line(horizontal, (0, row), (159, row), 255, 2)
+        for row in complete_rows[4:]:
+            cv2.line(horizontal, (0, row), (799, row), 255, 2)
+        observed = complete_rows[4:]
+
+        self.assertEqual(
+            table_pipeline._recover_long_weak_horizontal_sequence(
+                image,
+                columns,
+                observed,
+                horizontal,
+            ),
+            complete_rows,
+        )
+
+        two_header_rows = complete_rows[2:]
+        self.assertEqual(
+            table_pipeline._recover_long_weak_horizontal_sequence(
+                image,
+                columns,
+                two_header_rows,
+                horizontal,
+            ),
+            complete_rows,
+        )
+
+        false_columns = list(range(0, 210, 10))
+        self.assertEqual(
+            table_pipeline._recover_long_weak_horizontal_sequence(
+                image,
+                false_columns,
+                observed,
+                horizontal,
+            ),
+            observed,
+        )
+
     def test_maximum_screen_mode_can_keep_one_thousand_verified_cells(self):
         columns = list(range(24))
         rows = list(range(45))
@@ -902,6 +946,119 @@ class TablePipelineTests(unittest.TestCase):
                 columns,
                 rows,
                 maximum_cells=1280,
+            )
+        )
+
+    def test_dark_full_frame_grid_can_skip_photo_rectification(self):
+        ocr_backend._load_runtime()
+        image = np.full((500, 700, 3), 92, dtype=np.uint8)
+        columns = [0, 100, 200, 300, 400, 500, 600, 699]
+        rows = [0] + [40 * index for index in range(1, 12)] + [499]
+        for column in columns:
+            cv2.line(image, (column, 0), (column, 499), (230, 230, 230), 2)
+        for row in rows:
+            cv2.line(image, (0, row), (699, row), (230, 230, 230), 2)
+        candidate = (columns, rows, np.zeros(image.shape[:2], dtype=np.uint8))
+
+        self.assertTrue(
+            ocr_backend._full_frame_ruled_grid_can_bypass_photo_rectification(
+                image,
+                candidate,
+                maximum_cells=1280,
+            )
+        )
+        inset = ([80] + columns[2:-1] + [620], rows, candidate[2])
+        self.assertFalse(
+            ocr_backend._full_frame_ruled_grid_can_bypass_photo_rectification(
+                image,
+                inset,
+                maximum_cells=1280,
+            )
+        )
+        irregular_rows = [0, 22, 67, 95, 142, 178, 229, 263, 310, 352, 401, 438, 499]
+        irregular = (columns, irregular_rows, candidate[2])
+        self.assertFalse(
+            ocr_backend._full_frame_ruled_grid_can_bypass_photo_rectification(
+                image,
+                irregular,
+                maximum_cells=1280,
+            )
+        )
+        edge_slivers = (
+            [0, 45, 145, 245, 345, 445, 545, 645, 690],
+            rows,
+            candidate[2],
+        )
+        self.assertFalse(
+            ocr_backend._full_frame_ruled_grid_can_bypass_photo_rectification(
+                image,
+                edge_slivers,
+                maximum_cells=1280,
+            )
+        )
+
+    def test_bottom_document_rectification_preserves_top_edge(self):
+        ocr_backend._load_runtime()
+        image = np.full((160, 220, 3), 245, dtype=np.uint8)
+        corners = np.asarray(
+            [[20, 20], [200, 20], [200, 130], [20, 130]],
+            dtype=np.float32,
+        )
+
+        result = ocr_backend._bottom_document_rectification(
+            image,
+            corners,
+            0.05,
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        _, _, expanded = result
+        np.testing.assert_allclose(expanded[:2], corners[:2])
+        self.assertGreater(float(expanded[2][1]), float(corners[2][1]))
+        self.assertGreater(float(expanded[3][1]), float(corners[3][1]))
+        self.assertIsNone(
+            ocr_backend._bottom_document_rectification(
+                image,
+                corners,
+                0.09,
+            )
+        )
+
+    def test_trailing_grid_rows_require_text_and_continuing_rules(self):
+        ocr_backend._load_runtime()
+        image = np.full((260, 420, 3), 245, dtype=np.uint8)
+        columns = [10, 110, 210, 310, 410]
+        rows = [10, 60, 110, 160, 210, 250]
+        for column in columns:
+            cv2.line(image, (column, rows[0]), (column, rows[-1]), (35, 35, 35), 2)
+        for row in rows:
+            cv2.line(image, (columns[0], row), (columns[-1], row), (35, 35, 35), 2)
+        cv2.putText(
+            image,
+            "DATA",
+            (125, 242),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (20, 20, 20),
+            2,
+        )
+        grid = (columns, rows, np.zeros(image.shape[:2], dtype=np.uint8))
+
+        self.assertTrue(
+            ocr_backend._grid_has_text_supported_trailing_rows(
+                image,
+                grid,
+                4,
+            )
+        )
+        blank = image.copy()
+        blank[212:248, 12:408] = 245
+        self.assertFalse(
+            ocr_backend._grid_has_text_supported_trailing_rows(
+                blank,
+                grid,
+                4,
             )
         )
 
@@ -984,6 +1141,52 @@ class TablePipelineTests(unittest.TestCase):
         self.assertTrue(metadata.get("paper_expanded"))
         self.assertLess(rectified.shape[1], 650)
         self.assertGreater(rectified.shape[0], 500)
+
+    def test_dense_outer_grid_is_not_replaced_by_small_inner_document(self):
+        image = np.full((900, 1200, 3), (72, 78, 84), dtype=np.uint8)
+        outer = np.asarray(
+            [[70, 65], [1130, 65], [1130, 835], [70, 835]],
+            dtype=np.float32,
+        )
+        inner = np.asarray(
+            [[420, 250], [780, 250], [780, 650], [420, 650]],
+            dtype=np.float32,
+        )
+        cv2.fillConvexPoly(image, outer.astype(np.int32), (228, 230, 232))
+        for x in np.linspace(70, 1130, 9).astype(int):
+            cv2.line(image, (x, 65), (x, 835), (30, 30, 30), 3)
+        for y in np.linspace(65, 835, 15).astype(int):
+            cv2.line(image, (70, y), (1130, y), (30, 30, 30), 3)
+
+        self.assertTrue(table_pipeline._quad_has_dense_ruled_extent(image, outer))
+        with (
+            patch.object(
+                table_pipeline,
+                "_detect_light_document_corners",
+                return_value=inner,
+            ),
+            patch.object(
+                table_pipeline,
+                "_detect_low_contrast_ruled_quad",
+                return_value=outer,
+            ),
+            patch.object(
+                table_pipeline,
+                "_refine_vertical_table_sides",
+                side_effect=lambda _image, corners: corners,
+            ),
+            patch.object(
+                table_pipeline,
+                "_expand_one_proven_trailing_grid_row",
+                return_value=None,
+            ),
+        ):
+            _, _, selected, used_document = table_pipeline._warp_perspective_table(
+                image
+            )
+
+        self.assertFalse(used_document)
+        np.testing.assert_allclose(selected, outer)
 
     def test_perspective_warp_keeps_near_matching_complete_sheet_extent(self):
         image = np.full((600, 800, 3), (55, 65, 75), dtype=np.uint8)
@@ -1694,6 +1897,23 @@ class TablePipelineTests(unittest.TestCase):
         self.assertEqual(repaired, {(4, 2)})
         self.assertEqual(grid[4][2], "常规项目")
 
+    def test_spurious_checkmark_uses_strong_global_repetition_in_nonboolean_column(self):
+        grid = [
+            ["编号", "区域", "批次", "数量"],
+            ["1", "综合部", "A区", "10"],
+            ["2", "一车间", "综合部", "11"],
+            ["3", "综合部", "批次-L08", "12"],
+            ["4", "A区", "☑综合部", "13"],
+            ["5", "综合部", "华东库", "14"],
+            ["6", "一车间", "综合部", "15"],
+        ]
+        confidence = [[0.99 for _ in row] for row in grid]
+
+        repaired = ocr_backend._repair_spurious_leading_checkmarks(grid, confidence)
+
+        self.assertEqual(repaired, {(4, 2)})
+        self.assertEqual(grid[4][2], "综合部")
+
     def test_spurious_checkmark_is_preserved_in_confirmation_column(self):
         grid = [
             ["编号", "裁判确认", "说明"],
@@ -1770,6 +1990,100 @@ class TablePipelineTests(unittest.TestCase):
 
         self.assertEqual(removed, set())
         self.assertEqual(grid[3], ["3", "常规项目", "常规项目"])
+
+    def test_single_ordinal_duplicate_is_cleared_from_blank_neighbour(self):
+        ocr_backend._load_runtime()
+        columns = [0, 100, 200, 300]
+        rows = [0, 40, 80, 120, 160, 200]
+        image = np.full((200, 300, 3), 255, dtype=np.uint8)
+        cv2.rectangle(image, (60, 129), (67, 150), (0, 0, 0), -1)
+        grid = [
+            ["序号", "部门", "姓名"],
+            ["1", "综合部", "张伟"],
+            ["2", "一车间", "李娜"],
+            ["5", "5", "赵敏"],
+            ["6", "华东库", "陈晨"],
+        ]
+        confidence = [[0.77 for _ in row] for row in grid]
+
+        removed = ocr_backend._remove_weak_adjacent_duplicate_fills(
+            image,
+            grid,
+            confidence,
+            columns,
+            rows,
+        )
+
+        self.assertEqual(removed, {(3, 1)})
+        self.assertEqual(grid[3], ["5", "", "赵敏"])
+
+    def test_single_ordinal_duplicate_is_kept_when_neighbour_has_ink(self):
+        ocr_backend._load_runtime()
+        columns = [0, 100, 200, 300]
+        rows = [0, 40, 80, 120, 160, 200]
+        image = np.full((200, 300, 3), 255, dtype=np.uint8)
+        for cell_left in (0, 100):
+            cv2.rectangle(
+                image,
+                (cell_left + 60, 129),
+                (cell_left + 67, 150),
+                (0, 0, 0),
+                -1,
+            )
+        grid = [
+            ["序号", "数量", "姓名"],
+            ["1", "10", "张伟"],
+            ["2", "12", "李娜"],
+            ["5", "5", "赵敏"],
+            ["6", "8", "陈晨"],
+        ]
+        confidence = [[0.77 for _ in row] for row in grid]
+
+        removed = ocr_backend._remove_weak_adjacent_duplicate_fills(
+            image,
+            grid,
+            confidence,
+            columns,
+            rows,
+        )
+
+        self.assertEqual(removed, set())
+        self.assertEqual(grid[3], ["5", "5", "赵敏"])
+
+    def test_categorical_duplicate_is_cleared_from_blank_neighbour(self):
+        ocr_backend._load_runtime()
+        columns = [0, 100, 200, 300]
+        rows = [0, 40, 80, 120, 160, 200]
+        for duplicated_text in ("A区", "中"):
+            with self.subTest(duplicated_text=duplicated_text):
+                image = np.full((200, 300, 3), 255, dtype=np.uint8)
+                for offset in (12, 28, 44, 60):
+                    cv2.rectangle(
+                        image,
+                        (100 + offset, 129),
+                        (100 + offset + 7, 150),
+                        (0, 0, 0),
+                        -1,
+                    )
+                grid = [
+                    ["编号", "区域", "部门"],
+                    ["1", "综合部", "张伟"],
+                    ["2", "一车间", "李娜"],
+                    ["3", duplicated_text, duplicated_text],
+                    ["4", "华东库", "陈晨"],
+                ]
+                confidence = [[0.77 for _ in row] for row in grid]
+
+                removed = ocr_backend._remove_weak_adjacent_duplicate_fills(
+                    image,
+                    grid,
+                    confidence,
+                    columns,
+                    rows,
+                )
+
+                self.assertEqual(removed, {(3, 2)})
+                self.assertEqual(grid[3], ["3", duplicated_text, ""])
 
     def test_incomplete_merged_metadata_is_recovered_by_small_multiview_consensus(self):
         ocr_backend._load_runtime()
@@ -2322,6 +2636,60 @@ class TablePipelineTests(unittest.TestCase):
             [(0, 3), (3, 2), (5, 4)],
         )
         self.assertTrue(all(confidence[0][column] <= 0.77 for column in (0, 3, 5, 9)))
+
+    def test_certified_group_headers_reread_one_missing_physical_interval(self):
+        ocr_backend._load_runtime()
+        columns = list(range(0, 801, 100))
+        rows = list(range(0, 321, 40))
+        image = np.full((320, 800, 3), 255, dtype=np.uint8)
+        for boundary in rows:
+            cv2.line(image, (0, min(boundary, 319)), (799, min(boundary, 319)), (0, 0, 0), 2)
+        for boundary in (0, 799):
+            cv2.line(image, (boundary, 0), (boundary, 79), (0, 0, 0), 2)
+        cv2.line(image, (400, 40), (400, 79), (0, 0, 0), 2)
+        for boundary in columns:
+            cv2.line(image, (min(boundary, 799), 80), (min(boundary, 799), 319), (0, 0, 0), 2)
+        grid = [
+            ["施工现场安全检查表", "", "", "", "", "", "", ""],
+            ["业务记录", "", "", "", "", "", "", ""],
+            ["编号", "检查区域", "检查项目", "风险等级", "责任单位", "整改期限", "复查结果", "检查人"],
+            *[[str(index)] * 8 for index in range(1, 6)],
+        ]
+        confidence = [[0.95 if value else 0.0 for value in row] for row in grid]
+        spans = [
+            {"row": 0, "column": 0, "row_span": 1, "column_span": 8, "role": "title"},
+            {"row": 1, "column": 0, "row_span": 1, "column_span": 8, "role": "title"},
+        ]
+        output = SimpleNamespace(
+            txts=["基础资料"] * 4,
+            scores=[0.95, 0.94, 0.93, 0.92],
+            imgs=None,
+        )
+        engine = SimpleNamespace(
+            text_rec=Mock(return_value=output),
+            server_text_rec=Mock(return_value=output),
+        )
+
+        observed_spans = ocr_backend._recover_certified_physical_group_header_spans(
+            image,
+            columns,
+            rows,
+            grid,
+            confidence,
+            [("业务记录", 600.0, 60.0, 0.96)],
+            spans,
+            ocr_engine=engine,
+        )
+
+        self.assertEqual(grid[1], ["基础资料", "", "", "", "业务记录", "", "", ""])
+        self.assertEqual(
+            [
+                (span["column"], span["column_span"], span["role"])
+                for span in observed_spans
+                if span["row"] == 1
+            ],
+            [(0, 4, "group_header"), (4, 4, "group_header")],
+        )
 
     def test_semantic_detail_row_is_not_displaced_by_stronger_data_rules(self):
         ocr_backend._load_runtime()
@@ -3149,6 +3517,19 @@ class TablePipelineTests(unittest.TestCase):
             set(),
         )
         self.assertEqual(sparse_grid[2][0], "12.34 345")
+        trailing_grid = [["金额"]] + [
+            ["19491. 1.39" if index == 7 else f"{19000 + index}.39"]
+            for index in range(1, 9)
+        ]
+        trailing_confidence = [[0.99] for _ in trailing_grid]
+        self.assertEqual(
+            ocr_backend._repair_overlapping_decimal_fragments(
+                trailing_grid,
+                trailing_confidence,
+            ),
+            {(7, 0)},
+        )
+        self.assertEqual(trailing_grid[7][0], "19491.39")
 
     def test_ipv4_spacing_normalization_requires_valid_ip_column(self):
         grid = [
@@ -3561,6 +3942,35 @@ class TablePipelineTests(unittest.TestCase):
 
         self.assertEqual(split[0][5:], ["状态", "备注"])
 
+    def test_low_confidence_exact_header_pair_uses_immediate_blank_cell(self):
+        grid = [
+            ["工单号 报修位置", "", "维修项目", "维修人 状态", ""],
+            ["WX-001", "A区", "检修", "张伟", "完成"],
+        ]
+        confidence = [[0.77, 0.0, 0.95, 0.77, 0.0], [0.95] * 5]
+
+        split, split_confidence, _ = ocr_backend._split_collapsed_header_data_row(
+            grid, confidence, []
+        )
+
+        self.assertEqual(split[0], ["工单号", "报修位置", "维修项目", "维修人", "状态"])
+        self.assertEqual(split_confidence[0], [0.77, 0.77, 0.95, 0.77, 0.77])
+
+    def test_numbered_header_suffixes_are_not_split_into_a_data_row(self):
+        grid = [
+            ["项目", "编号", "确认", "备注1", "备注2", "备注3"],
+            ["", "", "", "", "", ""],
+            ["", "", "", "", "", ""],
+        ]
+        confidence = [[0.99 if value else 0.0 for value in row] for row in grid]
+        original = [list(row) for row in grid]
+
+        observed, _, _ = ocr_backend._split_collapsed_header_data_row(
+            grid, confidence, []
+        )
+
+        self.assertEqual(observed, original)
+
     def test_adjacent_duplicate_header_uses_visible_suffix_without_dictionary_pair(self):
         grid = [
             ["编号", "姓名", "组别", "项目", "联系电话报名状态", "报名状态"],
@@ -3657,6 +4067,68 @@ class TablePipelineTests(unittest.TestCase):
         self.assertEqual(repaired, {(1, 2)})
         self.assertEqual(grid[1][2], "验收结果")
         self.assertEqual(len(scores), 8)
+
+    def test_common_header_multiview_recovers_dense_header_numeric_outlier(self):
+        ocr_backend._load_runtime()
+        grid = [
+            ["工程材料领用表", "", "", ""],
+            ["材料编码", "材料名称", "申请数量", "1207:"],
+            ["A001-30", "一车间", "6721.05", "1207.33"],
+        ]
+        confidence = [[0.99 if value else 0.0 for value in row] for row in grid]
+        image = np.full((90, 400, 3), 245, dtype=np.uint8)
+        output = SimpleNamespace(
+            txts=["实发数量", "实发数量", "实发数量", "实发数量"],
+            scores=[0.94, 0.93, 0.92, 0.91],
+            imgs=None,
+        )
+        engine = SimpleNamespace(
+            text_rec=Mock(return_value=output),
+            server_text_rec=Mock(return_value=output),
+        )
+
+        repaired, _ = ocr_backend._repair_common_header_multiview(
+            image,
+            grid,
+            confidence,
+            [0, 100, 200, 300, 400],
+            [0, 30, 60, 90],
+            engine,
+        )
+
+        self.assertEqual(repaired, {(1, 3)})
+        self.assertEqual(grid[1][3], "实发数量")
+
+    def test_common_header_multiview_removes_unverified_mark_from_nonboolean_header(self):
+        ocr_backend._load_runtime()
+        grid = [
+            ["报名表", "", ""],
+            ["☑项目", "姓名", "状态"],
+            ["", "", ""],
+        ]
+        confidence = [[0.77 if value else 0.0 for value in row] for row in grid]
+        image = np.full((90, 300, 3), 245, dtype=np.uint8)
+        output = SimpleNamespace(
+            txts=["项目"] * 4,
+            scores=[0.96, 0.95, 0.94, 0.93],
+            imgs=None,
+        )
+        engine = SimpleNamespace(
+            text_rec=Mock(return_value=output),
+            server_text_rec=Mock(return_value=output),
+        )
+
+        repaired, _ = ocr_backend._repair_common_header_multiview(
+            image,
+            grid,
+            confidence,
+            [0, 100, 200, 300],
+            [0, 30, 60, 90],
+            engine,
+        )
+
+        self.assertEqual(repaired, {(1, 0)})
+        self.assertEqual(grid[1][0], "项目")
 
     def test_leading_glyph_omission_multiview_restores_repeated_peer(self):
         ocr_backend._load_runtime()
@@ -3776,7 +4248,8 @@ class TablePipelineTests(unittest.TestCase):
 
         self.assertEqual(repaired, {(4, 1)})
         self.assertEqual(grid[4][1], "A区")
-        self.assertEqual(len(scores), 8)
+        self.assertEqual(len(scores), 4)
+        engine.server_text_rec.assert_not_called()
 
     def test_repeated_categorical_blank_completes_unique_repeated_prefix(self):
         ocr_backend._load_runtime()
@@ -3827,6 +4300,44 @@ class TablePipelineTests(unittest.TestCase):
 
         self.assertEqual(repaired, {(4, 1)})
         self.assertEqual(grid[4][1], "李娜")
+        engine.server_text_rec.assert_not_called()
+
+    def test_repeated_categorical_blank_skips_alternate_without_primary_candidate(self):
+        ocr_backend._load_runtime()
+        grid = [
+            ["编号", "区域"],
+            ["1", "A区"],
+            ["2", "一车间"],
+            ["3", "A区"],
+            ["4", ""],
+            ["5", "标准件"],
+            ["6", "A区"],
+        ]
+        confidence = [[0.99 if value else 0.0 for value in row] for row in grid]
+        image = np.full((210, 200, 3), 245, dtype=np.uint8)
+        cv2.putText(image, "X", (120, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (20, 20, 20), 2)
+        medium_output = SimpleNamespace(
+            txts=["未知"] * 4,
+            scores=[0.99] * 4,
+            imgs=None,
+        )
+        engine = SimpleNamespace(
+            text_rec=Mock(return_value=medium_output),
+            server_text_rec=Mock(side_effect=AssertionError("主视图无候选时不应调用备用模型")),
+        )
+
+        repaired, scores = ocr_backend._repair_repeated_categorical_blank_multiview(
+            image,
+            grid,
+            confidence,
+            [0, 100, 200],
+            [row * 30 for row in range(8)],
+            engine,
+        )
+
+        self.assertEqual(repaired, set())
+        self.assertEqual(len(scores), 4)
+        engine.server_text_rec.assert_not_called()
 
     def test_adjacent_duplicate_header_carries_verified_confidence_after_cleanup(self):
         grid = [
@@ -4709,6 +5220,106 @@ class TablePipelineTests(unittest.TestCase):
             )
         )
 
+    def test_aligned_page_metadata_row_is_not_dropped_by_spatial_header(self):
+        page_grid = [
+            ["售后服务回访表", "", "", ""],
+            ["部门：综合管理部", "", "批次：B84", ""],
+            ["编号", "客户", "日期", "状态"],
+            *[[str(row), f"客户{row}", f"2026-08-{row:02d}", "完成"] for row in range(1, 7)],
+        ]
+        spatial_grid = [page_grid[0], *page_grid[2:]]
+        page_confidence = [[0.99 if value else 0.0 for value in row] for row in page_grid]
+        spatial_confidence = [
+            [0.99 if value else 0.0 for value in row]
+            for row in spatial_grid
+        ]
+        spans = [
+            {"row": 0, "column": 0, "row_span": 1, "column_span": 4, "role": "title"}
+        ]
+
+        recovered = ocr_backend._recover_spatial_headers_with_aligned_page_body(
+            page_grid,
+            page_confidence,
+            spatial_grid,
+            spatial_confidence,
+            spans,
+            True,
+        )
+
+        self.assertIsNotNone(recovered)
+        assert recovered is not None
+        self.assertEqual(recovered[0], page_grid)
+        self.assertEqual(recovered[3]["inserted_metadata_rows"], 1)
+
+    def test_title_only_alignment_can_reuse_verified_physical_certificate(self):
+        page_grid = [
+            ["", "", "", ""],
+            ["编号", "名称", "数值", "状态"],
+            *[[str(row), f"设备{row}", f"{row}.25", "正常"] for row in range(1, 7)],
+        ]
+        recovered_grid = [
+            ["设备巡检记录表", "", "", ""],
+            *[list(row) for row in page_grid[1:]],
+        ]
+        spans = [
+            {"row": 0, "column": 0, "row_span": 1, "column_span": 4, "role": "title"}
+        ]
+        metrics = {
+            "page_start": 1,
+            "spatial_start": 1,
+            "overlap_rows": len(recovered_grid) - 1,
+            "inserted_metadata_rows": 0,
+        }
+        certificate = {
+            "verified": True,
+            "rows": len(recovered_grid),
+            "columns": 4,
+        }
+
+        self.assertTrue(
+            ocr_backend._aligned_header_can_keep_physical_certificate(
+                page_grid,
+                recovered_grid,
+                spans,
+                metrics,
+                certificate,
+            )
+        )
+
+        shifted_metrics = dict(metrics, page_start=2)
+        self.assertFalse(
+            ocr_backend._aligned_header_can_keep_physical_certificate(
+                page_grid,
+                recovered_grid,
+                spans,
+                shifted_metrics,
+                certificate,
+            )
+        )
+        mismatched = [list(row) for row in recovered_grid]
+        for row in range(3, 7):
+            mismatched[row] = [f"错位{row}-{column}" for column in range(4)]
+        self.assertFalse(
+            ocr_backend._aligned_header_can_keep_physical_certificate(
+                page_grid,
+                mismatched,
+                spans,
+                metrics,
+                certificate,
+            )
+        )
+        sparse_metadata = [list(row) for row in recovered_grid]
+        sparse_metadata[1] = ["制表：运营中心", "", "", "第2页"]
+        self.assertFalse(
+            ocr_backend._aligned_header_can_keep_physical_certificate(
+                page_grid,
+                sparse_metadata,
+                spans,
+                metrics,
+                certificate,
+            )
+        )
+
     def test_page_rows_are_ordered_subset_of_expanded_spatial_grid(self):
         spatial = [
             ["快递交接记录表", "", ""],
@@ -4782,6 +5393,32 @@ class TablePipelineTests(unittest.TestCase):
                 columns,
                 rows,
             )
+        )
+
+    def test_motion_deblurred_geometry_recovers_faint_vertical_rules(self):
+        ocr_backend._load_runtime()
+        image = np.full((720, 1000, 3), 244, dtype=np.uint8)
+        columns = np.linspace(0, 999, 10).round().astype(int).tolist()
+        rows = np.linspace(0, 719, 25).round().astype(int).tolist()
+        for boundary in rows:
+            cv2.line(image, (0, boundary), (999, boundary), (35, 35, 35), 1)
+        for boundary in columns:
+            cv2.line(image, (boundary, 0), (boundary, 719), (85, 85, 85), 1)
+        kernel = np.zeros((3, 7), dtype=np.float32)
+        kernel[1, :] = 1.0 / 7.0
+        blurred = cv2.filter2D(image, -1, kernel)
+
+        recovered = ocr_backend._recover_motion_blurred_photo_grid(
+            blurred,
+            None,
+            maximum_cells=720,
+        )
+
+        self.assertIsNotNone(recovered)
+        assert recovered is not None
+        self.assertEqual(
+            (len(recovered[1]) - 1, len(recovered[0]) - 1),
+            (24, 9),
         )
 
     def test_dense_axis_aligned_grid_accepts_a_bounded_top_frame_margin(self):
@@ -6086,6 +6723,60 @@ class TablePipelineTests(unittest.TestCase):
         )
         self.assertEqual(trailing_blank_grid[0], ["", "单价", "金额"])
 
+        repeated_header_grid = [["检查项目标准值", "检查项目标准值"]]
+        repeated_header_confidence = [[0.99, 0.99]]
+        self.assertEqual(
+            ocr_backend._split_patterned_adjacent_spills(
+                repeated_header_grid,
+                repeated_header_confidence,
+            ),
+            {(0, 0), (0, 1)},
+        )
+        self.assertEqual(repeated_header_grid[0], ["检查项目", "标准值"])
+
+        ocr_backend._load_runtime()
+        physical_grid = [
+            ["姓名", "位置"],
+            ["李娜", "A区"],
+            ["王强", "一车间"],
+            ["李娜 A区", ""],
+            ["李娜", "A区"],
+        ]
+        physical_confidence = [
+            [0.99 if value else 0.0 for value in row]
+            for row in physical_grid
+        ]
+        physical_image = np.full((250, 300, 3), 245, dtype=np.uint8)
+        cv2.putText(
+            physical_image,
+            "L",
+            (45, 190),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (20, 20, 20),
+            2,
+        )
+        cv2.putText(
+            physical_image,
+            "R",
+            (195, 190),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (20, 20, 20),
+            2,
+        )
+        self.assertEqual(
+            ocr_backend._split_physically_separated_adjacent_tokens(
+                physical_image,
+                physical_grid,
+                physical_confidence,
+                [0, 150, 300],
+                [0, 50, 100, 150, 200, 250],
+            ),
+            {(3, 0), (3, 1)},
+        )
+        self.assertEqual(physical_grid[3], ["李娜", "A区"])
+
         phone_grid = [
             ["编号", "联系电话"],
             ["1", "138****1000"],
@@ -7077,6 +7768,21 @@ class TablePipelineTests(unittest.TestCase):
         self.assertEqual(spans[0]["role"], "title")
         self.assertEqual(spans[0]["column_span"], 9)
 
+    def test_strict_simple_title_span_accepts_unlisted_textual_headers(self):
+        grid = [
+            ["采购询价对比表", "", "", "", "", "", "", ""],
+            ["物料名称", "规格", "供应商A", "供应商B", "供应商C", "最低价", "交期", "选择结果"],
+            *[["项目", "标准", "甲", "乙", "丙", "低", "本周", "选择"] for _ in range(5)],
+        ]
+        confidence = [[0.95 if value else 0.0 for value in row] for row in grid]
+
+        spans = ocr_backend._strict_simple_title_span(grid, confidence)
+
+        self.assertEqual(
+            spans,
+            [{"row": 0, "column": 0, "row_span": 1, "column_span": 8, "role": "title"}],
+        )
+
     def test_certified_page_headers_join_split_chinese_month_title(self):
         ocr_backend._load_runtime()
         image = np.full((320, 900, 3), 255, dtype=np.uint8)
@@ -8036,6 +8742,35 @@ class TablePipelineTests(unittest.TestCase):
             [],
         )
 
+    def test_broken_iso_date_is_repaired_only_from_bounded_model_consensus(self):
+        ocr_backend._load_runtime()
+        grid = [["日期", "状态"], ["2026- 5-03- -26", "完成"]]
+        confidence = [[0.99, 0.99], [0.77, 0.99]]
+        image = np.full((100, 240, 3), 245, dtype=np.uint8)
+
+        def recognizer(request):
+            self.assertEqual(len(request.img), 1)
+            return SimpleNamespace(txts=["2026-03-26"], scores=[0.99])
+
+        engine = SimpleNamespace(
+            fast_text_rec=recognizer,
+            text_rec=recognizer,
+            server_text_rec=recognizer,
+        )
+
+        scores = ocr_backend._repair_suspicious_ruled_semantic_cells(
+            image,
+            grid,
+            confidence,
+            [0, 120, 240],
+            [0, 50, 100],
+            engine,
+        )
+
+        self.assertEqual(grid[1][0], "2026-03-26")
+        self.assertEqual(confidence[1][0], 0.90)
+        self.assertEqual(len(scores), 3)
+
     def test_sample_rate_accepts_frequency_units_without_triggering_boundary_pair(self):
         ocr_backend._load_runtime()
         grid = [
@@ -8737,6 +9472,65 @@ class TablePipelineTests(unittest.TestCase):
         self.assertEqual(observed[0], ["编号", "频率", "信号类型", "占用带宽"])
         self.assertEqual(observed[1], ["1", "515.128MHz", "模拟", "9kHz"])
 
+    def test_repeated_title_before_collapsed_header_is_removed_then_split(self):
+        grid = [
+            ["工程材料领用表", "", "", "", "", "", "", ""],
+            ["工程材料领用表", "", "", "", "", "", "", ""],
+            [
+                "领料单号 CQ-2026020",
+                "材料编码 A001-30",
+                "材料名称 一车间",
+                "规格型号 标准件",
+                "单位 件",
+                "申请数量 6721.05",
+                "实发数量 1207.33",
+                "领用人 周林",
+            ],
+            ["QF-2026043", "B002-84", "现场复核", "常规项目", "件", "6136.84", "7134.28", "陈晨"],
+        ]
+        confidence = [[0.96 if value else 0.0 for value in row] for row in grid]
+        spans = [
+            {
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 8,
+                "role": "title",
+            }
+        ]
+
+        observed, observed_confidence, observed_spans = (
+            ocr_backend._split_collapsed_header_data_row(grid, confidence, spans)
+        )
+
+        self.assertEqual(len(observed), 4)
+        self.assertEqual(observed[0][0], "工程材料领用表")
+        self.assertEqual(
+            observed[1],
+            ["领料单号", "材料编码", "材料名称", "规格型号", "单位", "申请数量", "实发数量", "领用人"],
+        )
+        self.assertEqual(
+            observed[2],
+            ["CQ-2026020", "A001-30", "一车间", "标准件", "件", "6721.05", "1207.33", "周林"],
+        )
+        self.assertEqual(observed_spans, spans)
+        self.assertEqual(len(observed_confidence), len(observed))
+
+    def test_repeated_title_is_retained_without_collapsed_header_evidence(self):
+        grid = [
+            ["月度汇总表", "", "", ""],
+            ["月度汇总表", "", "", ""],
+            ["说明", "本页为补充记录", "", ""],
+            ["编号", "名称", "数量", "备注"],
+        ]
+        confidence = [[0.96 if value else 0.0 for value in row] for row in grid]
+
+        observed, _, _ = ocr_backend._split_collapsed_header_data_row(
+            grid, confidence, []
+        )
+
+        self.assertEqual(observed, grid)
+
     def test_single_detector_box_is_redistributed_across_known_header_cells(self):
         grid = [
             ["项目 类别 数值1 数值2 数值3 单位 备注", "", "", "", "", "", ""],
@@ -8992,6 +9786,86 @@ class TablePipelineTests(unittest.TestCase):
 
         self.assertEqual(grid[4][1], "XMI-A004")
 
+    def test_consistency_checks_normalize_numeric_confusables_from_column_format(self):
+        grid = [
+            ["编号", "日期"],
+            ["CQ-2026011", "2026-02-11"],
+            ["AP-2026022", "2026-03-12"],
+            ["QF-2026033", "2026-04-13"],
+            ["MR-2026044", "2026-05-14"],
+            ["CQ-20Z6055", "20Z6-D6-15"],
+            ["AP-2026066", "2026-07-16"],
+        ]
+        confidence = [[0.99, 0.99] for _ in grid]
+
+        ocr_backend._apply_consistency_checks(grid, confidence)
+
+        self.assertEqual(grid[5], ["CQ-2026055", "2026-06-15"])
+        self.assertEqual(confidence[5], [0.77, 0.77])
+
+    def test_consistency_checks_remove_spaces_from_valid_iso_date_only(self):
+        grid = [
+            ["日期", "备注"],
+            ["2026-02- 21", "2026-02- 99"],
+        ]
+        confidence = [[0.99, 0.99] for _ in grid]
+
+        ocr_backend._apply_consistency_checks(grid, confidence)
+
+        self.assertEqual(grid[1], ["2026-02-21", "2026-02- 99"])
+        self.assertEqual(confidence[1], [0.77, 0.99])
+
+    def test_consistency_checks_keep_alphanumeric_identifier_without_numeric_column_proof(self):
+        grid = [
+            ["编号", "名称"],
+            ["CQ-A0Z6055", "设备甲"],
+            ["AP-B126066", "设备乙"],
+            ["QF-C126077", "设备丙"],
+        ]
+        confidence = [[0.99, 0.99] for _ in grid]
+        original = [list(row) for row in grid]
+
+        ocr_backend._apply_consistency_checks(grid, confidence)
+
+        self.assertEqual(grid, original)
+
+    def test_consistency_checks_restore_reversed_percent_only_from_repeated_value(self):
+        grid = [
+            ["编号", "结果"],
+            ["1", "95%"],
+            ["2", "正常"],
+            ["3", "95%"],
+            ["4", "%56"],
+            ["5", "95%"],
+            ["6", "%S6"],
+            ["7", "完成"],
+        ]
+        confidence = [[0.99, 0.99] for _ in grid]
+
+        ocr_backend._apply_consistency_checks(grid, confidence)
+
+        self.assertEqual(grid[4][1], "95%")
+        self.assertEqual(grid[6][1], "95%")
+        self.assertEqual(confidence[4][1], 0.77)
+        self.assertEqual(confidence[6][1], 0.77)
+
+    def test_consistency_checks_restore_repeated_reversed_percent_without_clean_peer(self):
+        grid = [
+            ["编号", "结果"],
+            ["1", "%56"],
+            ["2", "正常"],
+            ["3", "%56"],
+            ["4", "完成"],
+            ["5", "%56"],
+            ["6", "合格"],
+            ["7", "待确认"],
+        ]
+        confidence = [[0.99, 0.99] for _ in grid]
+
+        ocr_backend._apply_consistency_checks(grid, confidence)
+
+        self.assertEqual([grid[index][1] for index in (1, 3, 5)], ["95%"] * 3)
+
     def test_consistency_checks_remove_column_proven_code_whitespace(self):
         grid = [["序号", "Code"]] + [
             [str(index), value]
@@ -9015,6 +9889,22 @@ class TablePipelineTests(unittest.TestCase):
         self.assertEqual(grid[5][1], "MOD-1000B-005")
         self.assertEqual(confidence[4][1], 0.77)
         self.assertEqual(confidence[5][1], 0.77)
+
+    def test_consistency_checks_remove_overlapping_identifier_tail_prefix(self):
+        grid = [["编号"]] + [
+            [
+                "AP-B7003-1 -19"
+                if index == 7
+                else f"AP-B{7000 + index:04d}-{10 + index:02d}"
+            ]
+            for index in range(1, 9)
+        ]
+        confidence = [[0.99] for _ in grid]
+
+        ocr_backend._apply_consistency_checks(grid, confidence)
+
+        self.assertEqual(grid[7][0], "AP-B7003-19")
+        self.assertEqual(confidence[7][0], 0.77)
 
     def test_consistency_checks_keep_unproved_code_whitespace(self):
         grid = [
@@ -9193,6 +10083,23 @@ class TablePipelineTests(unittest.TestCase):
         ]
 
         self.assertEqual(ocr_backend._dense_percentage_format_risks(grid), {(7, 1)})
+
+    def test_dense_percentage_format_risks_accepts_three_valid_peers(self):
+        grid = [
+            ["编号", "状态"],
+            ["1", "95%"],
+            ["2", "95%"],
+            ["3", "95%"],
+            ["4", "%56"],
+            ["5", "正常"],
+            ["6", "完成"],
+            ["7", "待确认"],
+        ]
+
+        self.assertEqual(
+            ocr_backend._dense_percentage_format_risks(grid),
+            {(4, 1)},
+        )
 
     def test_dense_b_eight_confusion_risks_use_table_formats(self):
         grid = [["序号", "区域", "设备编号"]] + [
@@ -10675,6 +11582,21 @@ class TablePipelineTests(unittest.TestCase):
         )
 
         self.assertEqual(recovered, rows)
+
+    def test_narrow_empty_trailing_frame_is_trimmed(self):
+        image = np.full((466, 800, 3), 240, dtype=np.uint8)
+        vertical = np.zeros((466, 800), dtype=np.uint8)
+        rows = [50, 100, 150, 200, 250, 300, 350, 400, 450, 465]
+        for column in [50, 250, 450, 650, 750]:
+            cv2.line(vertical, (column, rows[0]), (column, rows[-1]), 255, 2)
+
+        recovered = table_pipeline._trim_sparse_trailing_page_row(
+            image,
+            rows,
+            vertical,
+        )
+
+        self.assertEqual(recovered, rows[:-1])
 
     def test_disconnected_outer_frame_cells_are_trimmed_without_dropping_header(self):
         image = np.full((520, 920, 3), 235, dtype=np.uint8)
@@ -14473,6 +15395,41 @@ class TablePipelineTests(unittest.TestCase):
         self.assertLessEqual(confidence[1][0], 0.0)
         self.assertEqual(calls, {"medium": 2, "server": 1})
 
+    def test_raw_blank_retry_skips_degenerate_tight_crop(self):
+        ocr_backend._load_runtime()
+        image = np.full((80, 80, 3), 240, dtype=np.uint8)
+        grid = [["类别"], [""]]
+        confidence = [[0.99], [-1.0]]
+        calls = {"medium": 0, "server": 0}
+
+        def medium(request):
+            calls["medium"] += 1
+            return SimpleNamespace(txts=["类刷1"] * len(request.img), scores=[0.99] * len(request.img))
+
+        def server(request):
+            calls["server"] += 1
+            return SimpleNamespace(txts=["类别1"] * len(request.img), scores=[0.90] * len(request.img))
+
+        with patch.object(
+            ocr_backend,
+            "_tight_text_crop",
+            return_value=np.full((4, 24, 3), 220, dtype=np.uint8),
+        ):
+            ocr_backend._verify_motion_blurred_ruled_cells(
+                image,
+                grid,
+                confidence,
+                [0, 80],
+                [0, 40, 80],
+                SimpleNamespace(text_rec=medium, server_text_rec=server),
+                view_mode="standard",
+                first_row=1,
+            )
+
+        self.assertEqual(grid[1][0], "")
+        self.assertLessEqual(confidence[1][0], 0.0)
+        self.assertEqual(calls, {"medium": 1, "server": 1})
+
     def test_raw_blank_retry_batches_only_base_ratio_primary_views(self):
         ocr_backend._load_runtime()
         image = np.full((80, 240, 3), 240, dtype=np.uint8)
@@ -15471,6 +16428,62 @@ class TablePipelineTests(unittest.TestCase):
         self.assertEqual(result[1], [0.99, 0.88])
         self.assertEqual(result[2], [0.76, 0.95])
 
+    def test_strong_borderless_title_limits_review_to_risk_cells(self):
+        grid = [
+            ["设备状态表", "", ""],
+            ["编号", "设备号", "状态"],
+            ["1", "AP-001", "在用"],
+            ["2", "AP-002", "正常"],
+            ["3", "AP-003", "待复核"],
+            ["4", "AP-004", "已确认"],
+        ]
+        spans = [
+            {"row": 0, "column": 0, "row_span": 1, "column_span": 3, "role": "title"}
+        ]
+
+        self.assertTrue(
+            ocr_backend._spatial_review_can_be_limited(
+                grid,
+                spans,
+                ["未取得可锁定的物理网格，合并关系未自动应用，请核对行列。"],
+                document_mode="borderless_columns",
+                engine_name="Hybrid OCR + borderless spatial layout",
+                rectification_mode="screen",
+            )
+        )
+        self.assertFalse(
+            ocr_backend._spatial_review_can_be_limited(
+                grid,
+                spans,
+                ["检测到疑似行融合，结果已保留供人工调整。"],
+                document_mode="borderless_columns",
+                engine_name="Hybrid OCR + borderless spatial layout",
+                rectification_mode="screen",
+            )
+        )
+        self.assertTrue(
+            ocr_backend._spatial_review_can_be_limited(
+                grid,
+                spans,
+                ["物理网格遗漏顶部合并标题。"],
+                document_mode="borderless_columns",
+                engine_name="Hybrid OCR + review-only page spatial recovery",
+                rectification_mode="screen",
+                photographic_background=False,
+            )
+        )
+        self.assertFalse(
+            ocr_backend._spatial_review_can_be_limited(
+                grid,
+                spans,
+                ["物理网格遗漏顶部合并标题。"],
+                document_mode="borderless_columns",
+                engine_name="Hybrid OCR + review-only page spatial recovery",
+                rectification_mode="auto",
+                photographic_background=True,
+            )
+        )
+
     def test_missing_confidence_with_warning_creates_review_grid(self):
         result = ocr_backend._apply_structure_review_policy(
             [["编号", "名称"], ["1", "设备"]],
@@ -15599,6 +16612,30 @@ class TablePipelineTests(unittest.TestCase):
             )
         )
 
+        paged_grid = [list(row) for row in grid]
+        paged_grid[1] = ["制表：运营中心", "", "", "", "第8页"]
+        paged_confidence = [
+            [0.99 if value else 0.0 for value in row]
+            for row in paged_grid
+        ]
+        paged_grid, _, paged_spans = ocr_backend._recover_leading_metadata_spans(
+            paged_grid,
+            paged_confidence,
+            list(spans),
+            image=image,
+            columns=columns,
+            rows=rows,
+            page_text_evidence=[
+                ("制表：运营中心", 90.0, 75.0, 0.97),
+                ("第8页", 450.0, 75.0, 0.98),
+            ],
+        )
+        self.assertEqual(
+            paged_grid[1],
+            ["制表：运营中心", "", "", "", "第8页"],
+        )
+        self.assertFalse(any(span["row"] == 1 for span in paged_spans))
+
         split_image = image.copy()
         cv2.line(
             split_image,
@@ -15626,6 +16663,34 @@ class TablePipelineTests(unittest.TestCase):
         self.assertEqual(split_grid[1], ["单位：服务中心", "", "批次：B84", "", ""])
         self.assertEqual(
             [span for span in split_spans if span["row"] == 1],
+            [
+                {"row": 1, "column": 0, "row_span": 1, "column_span": 2, "role": "subtitle"},
+                {"row": 1, "column": 2, "row_span": 1, "column_span": 3, "role": "subtitle"},
+            ],
+        )
+
+        wrong_spans = list(spans) + [
+            {"row": 1, "column": 0, "row_span": 1, "column_span": 2, "role": "group_header"},
+            {"row": 1, "column": 2, "row_span": 1, "column_span": 1, "role": "group_header"},
+            {"row": 1, "column": 3, "row_span": 1, "column_span": 2, "role": "group_header"},
+        ]
+        rebuilt_grid = [list(row) for row in grid]
+        rebuilt_grid[1] = ["", "单位：服务中心", "", "批次：B84", ""]
+        rebuilt_confidence = [
+            [0.99 if value else 0.0 for value in row]
+            for row in rebuilt_grid
+        ]
+        rebuilt_grid, _, rebuilt_spans = ocr_backend._recover_leading_metadata_spans(
+            rebuilt_grid,
+            rebuilt_confidence,
+            wrong_spans,
+            image=split_image,
+            columns=columns,
+            rows=rows,
+            page_text_evidence=split_evidence,
+        )
+        self.assertEqual(
+            [span for span in rebuilt_spans if span["row"] == 1],
             [
                 {"row": 1, "column": 0, "row_span": 1, "column_span": 2, "role": "subtitle"},
                 {"row": 1, "column": 2, "row_span": 1, "column_span": 3, "role": "subtitle"},
@@ -15856,6 +16921,33 @@ class TablePipelineTests(unittest.TestCase):
                 group_confidence,
                 [],
             )
+        )
+
+    def test_stacked_two_field_subtitle_uses_balanced_export_spans(self):
+        grid = [
+            ["运输车辆调度表", "", "", "", "", "", "", ""],
+            ["部门：综合管理部", "", "批次：B63", "", "", "", "", ""],
+            ["任务号", "车牌号", "司机", "出发地", "目的地", "计划时间", "实际时间", "状态"],
+            *[[str(index)] * 8 for index in range(1, 6)],
+        ]
+        confidence = [[0.95 if value else 0.0 for value in row] for row in grid]
+        spans: list[dict[str, object]] = []
+
+        self.assertTrue(
+            ocr_backend._recover_stacked_subtitle_for_review(
+                grid, confidence, spans
+            )
+        )
+
+        self.assertEqual(grid[1][0], "部门：综合管理部")
+        self.assertEqual(grid[1][4], "批次：B63")
+        self.assertEqual(
+            [
+                (span["column"], span["column_span"])
+                for span in spans
+                if span["role"] == "subtitle"
+            ],
+            [(0, 4), (4, 4)],
         )
 
     def test_source_margin_title_requires_small_medium_consensus(self):
@@ -20886,7 +21978,7 @@ class TablePipelineTests(unittest.TestCase):
         # scheduling while keeping width-sorted batches bounded.
         self.assertEqual(parameters["Rec.rec_batch_num"], 8)
         self.assertEqual(server_parameters["Rec.rec_batch_num"], 8)
-        self.assertEqual(parameters["EngineConfig.openvino.inference_num_threads"], 4)
+        self.assertEqual(parameters["EngineConfig.openvino.inference_num_threads"], 3)
         self.assertEqual(parameters["EngineConfig.openvino.performance_hint"], "LATENCY")
         self.assertEqual(parameters["EngineConfig.openvino.num_streams"], 1)
         self.assertEqual(parameters["Global.model_root_dir"], str(Path(directory).resolve()))
@@ -21537,6 +22629,16 @@ class TablePipelineTests(unittest.TestCase):
                 }
             )
 
+        with self.assertRaisesRegex(ValueError, "selected_table_region"):
+            validate_request(
+                {
+                    "protocol": PROTOCOL_VERSION,
+                    "action": "recognize",
+                    "image_path": "C:/input.png",
+                    "options": {"selected_table_region": "yes"},
+                }
+            )
+
     def test_request_validation_rejects_non_rectangular_export_grid(self):
         with self.assertRaisesRegex(ValueError, "rectangular"):
             validate_request(
@@ -21622,6 +22724,13 @@ class TablePipelineTests(unittest.TestCase):
             cv2.line(horizontal, (columns[0], boundary), (columns[-1], boundary), 255, 2)
         cv2.line(vertical, (columns[0], rows[0]), (columns[0], rows[-1]), 255, 2)
         cv2.line(vertical, (columns[-1], rows[0]), (columns[-1], rows[-1]), 255, 2)
+        cv2.line(
+            vertical,
+            (columns[1], rows[0] + 4),
+            (columns[1], rows[0] + int((rows[1] - rows[0]) * 0.65)),
+            255,
+            2,
+        )
         for row in range(1, 10):
             for boundary in columns[1:-1]:
                 cv2.line(
@@ -21738,6 +22847,209 @@ class TablePipelineTests(unittest.TestCase):
                     photographic_background=False,
                 )
             )
+
+    def test_blank_form_collapses_only_weak_split_inside_tall_header(self):
+        ocr_backend._load_runtime()
+        columns = [8, 108, 208, 308]
+        rows = [8, 64, 110, 152, 188, 216, 252, 288, 326, 358, 395, 433, 471, 509]
+        image = np.full((518, 317, 3), 245, dtype=np.uint8)
+        horizontal = np.zeros(image.shape[:2], dtype=np.uint8)
+        vertical = np.zeros(image.shape[:2], dtype=np.uint8)
+        for index, boundary in enumerate(rows):
+            right = columns[0] + 60 if index == 2 else columns[-1]
+            cv2.line(horizontal, (columns[0], boundary), (right, boundary), 255, 2)
+        for boundary in columns:
+            cv2.line(vertical, (boundary, rows[0]), (boundary, rows[-1]), 255, 2)
+        grid = [
+            ["维修验收记录表", "", ""],
+            ["项目", "编号", "确认"],
+            ["", "", ""],
+            *[["", "", ""] for _ in range(6)],
+            ["开始时间", "", ""],
+            ["结束时间", "", ""],
+            ["经办人签字", "", ""],
+            ["负责人签字", "", ""],
+        ]
+        confidence = [[0.99 if value else 0.0 for value in row] for row in grid]
+
+        with patch.object(
+            table_pipeline,
+            "_grid_maps",
+            return_value=(horizontal, vertical, cv2.bitwise_or(horizontal, vertical)),
+        ):
+            collapsed = ocr_backend._collapse_blank_form_split_header_row(
+                image, columns, rows, grid, confidence
+            )
+
+        self.assertIsNotNone(collapsed)
+        collapsed_rows, collapsed_grid, collapsed_confidence = collapsed
+        self.assertEqual(len(collapsed_grid), 12)
+        self.assertEqual(collapsed_grid[1], ["项目", "编号", "确认"])
+        self.assertEqual(collapsed_rows, [*rows[:2], *rows[3:]])
+        self.assertEqual(len(collapsed_confidence), 12)
+
+        strong_horizontal = horizontal.copy()
+        cv2.line(
+            strong_horizontal,
+            (columns[0], rows[2]),
+            (columns[-1], rows[2]),
+            255,
+            2,
+        )
+        with patch.object(
+            table_pipeline,
+            "_grid_maps",
+            return_value=(strong_horizontal, vertical, cv2.bitwise_or(strong_horizontal, vertical)),
+        ):
+            self.assertIsNone(
+                ocr_backend._collapse_blank_form_split_header_row(
+                    image, columns, rows, grid, confidence
+                )
+            )
+
+    def test_raw_blank_form_grid_recovers_body_only_column_and_ignores_dense_table(self):
+        ocr_backend._load_runtime()
+        columns = [8, 208, 424, 604, 851]
+        rows = [8, 64, 152, 190, 228, 264, 292, 332, 369, 407, 445, 483, 521]
+        image = np.full((529, 859, 3), 245, dtype=np.uint8)
+        horizontal = np.zeros(image.shape[:2], dtype=np.uint8)
+        vertical = np.zeros(image.shape[:2], dtype=np.uint8)
+        for boundary in rows:
+            cv2.line(horizontal, (columns[0], boundary), (columns[-1], boundary), 255, 2)
+        for boundary in (columns[0], columns[-1]):
+            cv2.line(vertical, (boundary, rows[0]), (boundary, rows[-1]), 255, 2)
+        for row in range(1, 8):
+            for boundary in columns[1:-1]:
+                cv2.line(vertical, (boundary, rows[row]), (boundary, rows[row + 1]), 255, 2)
+        for row in range(8, len(rows) - 1):
+            cv2.line(vertical, (columns[1], rows[row]), (columns[1], rows[row + 1]), 255, 2)
+        current = ([8, 208, 424, 851], rows, image.copy())
+
+        with patch.object(
+            table_pipeline,
+            "_grid_maps",
+            return_value=(horizontal, vertical, cv2.bitwise_or(horizontal, vertical)),
+        ):
+            recovered = ocr_backend._raw_blank_form_grid_candidate(
+                image, current, maximum_cells=320
+            )
+
+        self.assertIsNotNone(recovered)
+        self.assertEqual(recovered[0], columns)
+        self.assertEqual(recovered[1], rows)
+
+        dense_vertical = vertical.copy()
+        for row in range(8, len(rows) - 1):
+            for boundary in columns[2:-1]:
+                cv2.line(
+                    dense_vertical,
+                    (boundary, rows[row]),
+                    (boundary, rows[row + 1]),
+                    255,
+                    2,
+                )
+        with patch.object(
+            table_pipeline,
+            "_grid_maps",
+            return_value=(horizontal, dense_vertical, cv2.bitwise_or(horizontal, dense_vertical)),
+        ):
+            self.assertIsNone(
+                ocr_backend._raw_blank_form_grid_candidate(
+                    image, current, maximum_cells=320
+                )
+            )
+
+    def test_blank_form_title_uses_full_span_three_model_consensus(self):
+        ocr_backend._load_runtime()
+        image = np.full((120, 300, 3), 245, dtype=np.uint8)
+        cv2.putText(image, "TITLE", (80, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (20, 20, 20), 2)
+        grid = [["误读标题", "", ""], ["项目", "编号", "确认"], ["", "", ""]]
+        confidence = [[0.77, 0.0, 0.0], [0.99] * 3, [0.0] * 3]
+        spans = [
+            {"row": 0, "column": 0, "row_span": 1, "column_span": 3, "role": "title"}
+        ]
+        output = SimpleNamespace(
+            txts=["维修验收记录表"] * 3,
+            scores=[0.99, 0.98, 0.97],
+            imgs=None,
+        )
+        engine = SimpleNamespace(
+            fast_text_rec=Mock(return_value=output),
+            text_rec=Mock(return_value=output),
+            server_text_rec=Mock(return_value=output),
+        )
+
+        scores = ocr_backend._recover_blank_form_title_multiview(
+            image,
+            [0, 100, 200, 300],
+            [0, 60, 90, 120],
+            grid,
+            confidence,
+            spans,
+            engine,
+        )
+
+        self.assertEqual(grid[0][0], "维修验收记录表")
+        self.assertEqual(confidence[0][0], 0.97)
+        self.assertEqual(len(scores), 9)
+
+    def test_blank_form_clears_model_fills_from_merged_subordinates(self):
+        grid = [
+            ["维修验收记录表", "误填标题", ""],
+            ["项目", "编号", "确认"],
+            ["开始时间", "误填内容", ""],
+        ]
+        confidence = [[0.77 if value else 0.0 for value in row] for row in grid]
+        spans = [
+            {"row": 0, "column": 0, "row_span": 1, "column_span": 3, "role": "title"},
+            {"row": 2, "column": 0, "row_span": 1, "column_span": 3, "role": "merged"},
+        ]
+
+        cleared = ocr_backend._clear_blank_form_span_subordinates(
+            grid, confidence, spans
+        )
+
+        self.assertEqual(cleared, {(0, 1), (2, 1)})
+        self.assertEqual(grid[0], ["维修验收记录表", "", ""])
+        self.assertEqual(grid[2], ["开始时间", "", ""])
+        self.assertEqual(confidence[0][1:], [0.0, 0.0])
+        self.assertEqual(confidence[2][1:], [0.0, 0.0])
+
+    def test_spatial_title_requires_large_centered_text(self):
+        ocr_backend._load_runtime()
+        grid = [
+            ["设备状态表", "", "", ""],
+            ["编号", "设备号", "频率", "状态"],
+            ["1", "AP-001", "562.990", "在用"],
+            ["2", "AP-002", "563.360", "正常"],
+            ["3", "AP-003", "563.730", "待复核"],
+            ["4", "AP-004", "564.100", "已确认"],
+        ]
+
+        def entry(center_x: float, height: float, score: float = 0.99):
+            return {"center_x": center_x, "height": height, "score": score}
+
+        ordinary_row = [entry(value, 30.0) for value in (100, 300, 500, 700)]
+        geometry = {
+            "anchors": [100.0, 300.0, 500.0, 700.0],
+            "grouped_rows": [
+                [entry(400.0, 40.0)],
+                ordinary_row,
+                ordinary_row,
+                ordinary_row,
+                ordinary_row,
+                ordinary_row,
+            ],
+        }
+        self.assertTrue(ocr_backend._spatial_title_is_prominent(grid, geometry))
+
+        small = copy.deepcopy(geometry)
+        small["grouped_rows"][0][0]["height"] = 32.0
+        self.assertFalse(ocr_backend._spatial_title_is_prominent(grid, small))
+
+        off_center = copy.deepcopy(geometry)
+        off_center["grouped_rows"][0][0]["center_x"] = 180.0
+        self.assertFalse(ocr_backend._spatial_title_is_prominent(grid, off_center))
 
     def test_runtime_trace_converts_numpy_scalars_without_failing_recognition(self):
         ocr_backend._load_runtime()
@@ -22034,6 +23346,118 @@ class TablePipelineTests(unittest.TestCase):
                 scores,
             )
         )
+
+    def test_table_structure_cell_geometry_preserves_exact_cell_bounds(self):
+        boxes = np.asarray(
+            [
+                [0, 0, 200, 0, 200, 30, 0, 30],
+                [0, 30, 100, 30, 100, 60, 0, 60],
+                [100, 30, 200, 30, 200, 60, 100, 60],
+                [0, 60, 100, 60, 100, 90, 0, 90],
+                [100, 60, 200, 60, 200, 90, 100, 90],
+            ],
+            dtype=float,
+        )
+        logic = np.asarray(
+            [
+                [0, 0, 0, 1],
+                [1, 1, 0, 0],
+                [1, 1, 1, 1],
+                [2, 2, 0, 0],
+                [2, 2, 1, 1],
+            ],
+            dtype=int,
+        )
+
+        with patch.object(ocr_backend, "np", np):
+            geometry = ocr_backend._table_structure_cell_recovery_geometry(
+                boxes,
+                logic,
+                3,
+                2,
+            )
+
+        self.assertIsNotNone(geometry)
+        self.assertEqual(geometry["first_structured_row"], 1)
+        self.assertEqual(geometry["cell_bounds"][(1, 0)], (0, 100, 30, 60))
+        self.assertEqual(geometry["cell_bounds"][(2, 1)], (100, 200, 60, 90))
+        self.assertEqual(geometry["anchors"], [50.0, 150.0])
+        self.assertEqual(geometry["row_centers"], [15.0, 45.0, 75.0])
+
+    def test_table_structure_cell_geometry_rejects_shape_drift(self):
+        boxes = np.asarray(
+            [[0, 0, 100, 0, 100, 30, 0, 30]],
+            dtype=float,
+        )
+        logic = np.asarray([[0, 0, 0, 2]], dtype=int)
+
+        with patch.object(ocr_backend, "np", np):
+            self.assertIsNone(
+                ocr_backend._table_structure_cell_recovery_geometry(
+                    boxes,
+                    logic,
+                    3,
+                    2,
+                )
+            )
+
+    def test_aligned_table_structure_geometry_accepts_unique_split_tail(self):
+        final_grid = [
+            ["标题", ""],
+            ["编号", "数值"],
+        ] + [[f"A{row}", f"V{row}"] for row in range(2, 10)]
+        table_grid = [list(row) for row in final_grid[:-1]] + [
+            ["A9", ""],
+            ["", "V9"],
+        ]
+        boxes = []
+        logic = []
+        for row in range(len(table_grid)):
+            for column in range(2):
+                left = column * 100
+                top = row * 30
+                boxes.append(
+                    [left, top, left + 100, top, left + 100, top + 30, left, top + 30]
+                )
+                logic.append([row, row, column, column])
+
+        with patch.object(ocr_backend, "np", np):
+            geometry = ocr_backend._aligned_table_structure_cell_recovery_geometry(
+                table_grid,
+                np.asarray(boxes, dtype=float),
+                np.asarray(logic, dtype=int),
+                final_grid,
+            )
+
+        self.assertIsNotNone(geometry)
+        self.assertTrue(geometry["restrict_to_cell_bounds"])
+        self.assertEqual(geometry["aligned_prefix_rows"], 9)
+        self.assertIn((8, 1), geometry["cell_bounds"])
+        self.assertNotIn((9, 0), geometry["cell_bounds"])
+
+    def test_aligned_table_structure_geometry_rejects_ambiguous_rows(self):
+        final_grid = [["重复", "值"] for _ in range(8)]
+        table_grid = [["重复", "值"] for _ in range(9)]
+        boxes = []
+        logic = []
+        for row in range(9):
+            for column in range(2):
+                left = column * 100
+                top = row * 30
+                boxes.append(
+                    [left, top, left + 100, top, left + 100, top + 30, left, top + 30]
+                )
+                logic.append([row, row, column, column])
+
+        with patch.object(ocr_backend, "np", np):
+            self.assertIsNone(
+                ocr_backend._aligned_table_structure_cell_recovery_geometry(
+                    table_grid,
+                    np.asarray(boxes, dtype=float),
+                    np.asarray(logic, dtype=int),
+                    final_grid,
+                )
+            )
 
 
 if __name__ == "__main__":
