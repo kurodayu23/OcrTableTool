@@ -99,7 +99,8 @@ int OcrTableClient::health()
 
 int OcrTableClient::recognize(const QString &imagePath,
                               const QString &outputDirectory,
-                              bool inputRectified)
+                              bool inputRectified,
+                              bool selectedTableRegion)
 {
     QJsonObject options;
     options.insert(QStringLiteral("crop_mode"), QStringLiteral("auto"));
@@ -107,6 +108,8 @@ int OcrTableClient::recognize(const QString &imagePath,
     options.insert(QStringLiteral("deadline_seconds"), 0);
     if (inputRectified)
         options.insert(QStringLiteral("input_rectified"), true);
+    if (selectedTableRegion)
+        options.insert(QStringLiteral("selected_table_region"), true);
 
     QJsonObject request;
     request.insert(QStringLiteral("protocol"), kProtocolVersion);

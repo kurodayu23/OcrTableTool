@@ -60,7 +60,9 @@
           "properties": {
             "crop_mode": {"enum": ["auto", "grid", "full"]},
             "accuracy_mode": {"enum": ["adaptive", "adaptive_high", "maximum"]},
-            "deadline_seconds": {"type": "number", "minimum": 0}
+            "deadline_seconds": {"type": "number", "minimum": 0},
+            "input_rectified": {"type": "boolean"},
+            "selected_table_region": {"type": "boolean"}
           },
           "additionalProperties": false
         }

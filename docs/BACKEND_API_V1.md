@@ -77,7 +77,9 @@ stderr : 日志，不属于协议
   "options": {
     "crop_mode": "auto",
     "accuracy_mode": "maximum",
-    "deadline_seconds": 0
+    "deadline_seconds": 0,
+    "input_rectified": false,
+    "selected_table_region": false
   }
 }
 ```
@@ -85,6 +87,8 @@ stderr : 日志，不属于协议
 - `image_path`：本机绝对图片路径，支持 Unicode。
 - `output_directory`：本请求独占的可写临时目录。
 - 正式集成固定使用 `crop_mode=auto`、`accuracy_mode=maximum`、`deadline_seconds=0`，不要向普通用户暴露降低精度的开关。
+- `input_rectified=true` 表示输入图已经完成透视矫正。
+- `selected_table_region=true` 表示输入图来自用户框选的单个表格区域，后端会启用框选区域的运动模糊恢复路线。
 
 成功响应的稳定业务字段：`rows`、`columns`、`cells`、`spans`、`recognition_state`、`publication_blocked`、`publication_block_reasons`、`structure_verified`、`structure_certificate`、`image_quality`、`rectified_image`、`elapsed_seconds`、`review_cell_count`。
 

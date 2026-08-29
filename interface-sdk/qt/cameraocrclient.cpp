@@ -541,7 +541,10 @@ void CameraOcrClient::imageSaved(int, const QString &fileName)
     emit captured(recognitionPath);
     emit stageChanged(QStringLiteral("recognizing"),
                       QString::fromWCharArray(L"\u62cd\u7167\u5b8c\u6210\uff0c\u6b63\u5728\u8bc6\u522b\u8868\u683c\u3002"));
-    m_ocr->recognize(recognitionPath, m_requestDirectory);
+    m_ocr->recognize(recognitionPath,
+                     m_requestDirectory,
+                     false,
+                     m_tableRegion.isValid());
 }
 
 void CameraOcrClient::captureReadyChanged(bool ready)
@@ -622,7 +625,12 @@ void CameraOcrClient::ocrRequestFailed(int,
                 return;
             m_ocrRetryPending = false;
             if (!m_ocr->isBusy())
-                m_ocr->recognize(m_capturePath, m_requestDirectory);
+                m_ocr->recognize(
+                    m_capturePath,
+                    m_requestDirectory,
+                    false,
+                    m_tableRegion.isValid()
+                        && m_capturePath != m_originalCapturePath);
         });
         return;
     }
@@ -632,16 +640,36 @@ void CameraOcrClient::ocrRequestFailed(int,
         && !m_originalCapturePath.isEmpty()
         && QFileInfo::exists(m_originalCapturePath)
         && m_capturePath != m_originalCapturePath) {
-        m_regionFallbackAttempted = true;
-        m_ocrRetryCount = 0;
-        m_capturePath = m_originalCapturePath;
-        emit stageChanged(QStringLiteral("table_region_fallback"),
-                          QString::fromWCharArray(L"框选区域未能形成可靠结果，正在保留原图数据并自动重试。"));
-        QTimer::singleShot(300, this, [this]() {
-            if (!m_ocr->isBusy())
-                m_ocr->recognize(m_capturePath, m_requestDirectory);
-        });
-        return;
+        QImageReader reader(m_originalCapturePath);
+        reader.setAutoTransform(true);
+        const QImage originalImage = reader.read();
+        if (!originalImage.isNull()) {
+            const QRect cropRect = resolvedTableRegion(originalImage.size());
+            const int extraX = qMax(8, qCeil(cropRect.width() * 0.04));
+            const int extraY = qMax(8, qCeil(cropRect.height() * 0.06));
+            const QRect expandedCropRect = cropRect.adjusted(
+                -extraX, -extraY, extraX, extraY).intersected(originalImage.rect());
+            const QImage expandedTable = originalImage.copy(expandedCropRect);
+            const QString retryPath = QDir(m_requestDirectory).filePath(
+                QStringLiteral("camera-table-retry.png"));
+            if (!expandedTable.isNull() && expandedTable.save(retryPath, "PNG")) {
+                m_regionFallbackAttempted = true;
+                m_ocrRetryCount = 0;
+                m_capturePath = retryPath;
+                emit stageChanged(
+                    QStringLiteral("table_region_fallback"),
+                    QString::fromWCharArray(L"框选区域首次识别未形成可靠结果，正在扩大少量边缘后重试。"));
+                QTimer::singleShot(300, this, [this]() {
+                    if (!m_ocr->isBusy())
+                        m_ocr->recognize(
+                            m_capturePath,
+                            m_requestDirectory,
+                            false,
+                            true);
+                });
+                return;
+            }
+        }
     }
     m_ocrRetryPending = false;
     if (insufficientMemory) {

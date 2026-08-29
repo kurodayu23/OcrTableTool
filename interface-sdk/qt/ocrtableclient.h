@@ -27,7 +27,8 @@ public:
     int health();
     int recognize(const QString &imagePath,
                   const QString &outputDirectory,
-                  bool inputRectified = false);
+                  bool inputRectified = false,
+                  bool selectedTableRegion = false);
     int exportXlsx(const QString &outputPath,
                    const QJsonArray &cells,
                    const QJsonArray &spans = QJsonArray());
