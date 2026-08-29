@@ -30,7 +30,8 @@ public:
     void recognize(const QString &imagePath,
                    const QString &outputDirectory,
                    const QString &cropMode,
-                   bool inputRectified = false);
+                   bool inputRectified = false,
+                   bool selectedTableRegion = false);
     void exportXlsx(const QString &outputPath, const TableData &table, const QJsonArray &spans);
     void cancel();
 

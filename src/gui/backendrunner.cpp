@@ -126,7 +126,8 @@ QString BackendRunner::findPython(const QString &backendScript) const
 void BackendRunner::recognize(const QString &imagePath,
                               const QString &outputDirectory,
                               const QString &cropMode,
-                              bool inputRectified)
+                              bool inputRectified,
+                              bool selectedTableRegion)
 {
     QJsonObject request;
     request.insert(QStringLiteral("protocol"), 1);
@@ -139,6 +140,8 @@ void BackendRunner::recognize(const QString &imagePath,
     options.insert(QStringLiteral("accuracy_mode"), QStringLiteral("maximum"));
     if (inputRectified)
         options.insert(QStringLiteral("input_rectified"), true);
+    if (selectedTableRegion)
+        options.insert(QStringLiteral("selected_table_region"), true);
     request.insert(QStringLiteral("options"), options);
     startRequest(QStringLiteral("recognize"), request, 0);
 }

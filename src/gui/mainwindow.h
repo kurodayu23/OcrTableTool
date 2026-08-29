@@ -28,6 +28,7 @@ class MainWindow : public QMainWindow
 public:
     explicit MainWindow(QWidget *parent = 0);
     ~MainWindow();
+    bool loadImageFile(const QString &path);
 
 protected:
     void dragEnterEvent(QDragEnterEvent *event) override;

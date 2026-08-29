@@ -10,6 +10,7 @@
 
 #include <QBrush>
 #include <QColor>
+#include <QCryptographicHash>
 #include <QDateTime>
 #include <QDir>
 #include <QDragEnterEvent>
@@ -26,9 +27,11 @@
 #include <QIcon>
 #include <QImageReader>
 #include <QJsonObject>
+#include <QJsonDocument>
 #include <QLabel>
 #include <QMenu>
 #include <QMimeData>
+#include <QPainter>
 #include <QPixmap>
 #include <QProgressBar>
 #include <QProcess>
@@ -58,6 +61,47 @@
 
 namespace
 {
+const QIcon &reviewMarkerIcon()
+{
+    static const QIcon icon = []() {
+        QPixmap marker(12, 12);
+        marker.fill(Qt::transparent);
+        QPainter painter(&marker);
+        painter.setRenderHint(QPainter::Antialiasing, true);
+        painter.setPen(QColor(QStringLiteral("#C88900")));
+        painter.setBrush(QColor(QStringLiteral("#F7C948")));
+        painter.drawEllipse(1, 1, 9, 9);
+        return QIcon(marker);
+    }();
+    return icon;
+}
+
+QString canonicalDisplayedResultHash(const TableData &table,
+                                     const QJsonArray &spans,
+                                     bool publicationBlocked)
+{
+    QJsonArray rows;
+    for (int row = 0; row < table.rowCount(); ++row) {
+        QJsonArray cells;
+        for (int column = 0; column < table.columnCount(); ++column) {
+            QJsonObject cell;
+            cell.insert(QStringLiteral("text"), table.cell(row, column));
+            cell.insert(QStringLiteral("needs_review"), table.needsReview(row, column));
+            cells.append(cell);
+        }
+        rows.append(cells);
+    }
+    QJsonObject payload;
+    payload.insert(QStringLiteral("rows"), table.rowCount());
+    payload.insert(QStringLiteral("columns"), table.columnCount());
+    payload.insert(QStringLiteral("cells"), rows);
+    payload.insert(QStringLiteral("spans"), spans);
+    payload.insert(QStringLiteral("publication_blocked"), publicationBlocked);
+    const QByteArray canonical = QJsonDocument(payload).toJson(QJsonDocument::Compact);
+    return QString::fromLatin1(
+        QCryptographicHash::hash(canonical, QCryptographicHash::Sha256).toHex());
+}
+
 QString localizedBackendError(const QString &message)
 {
     if (message.contains(QStringLiteral("严重模糊")))
@@ -251,6 +295,11 @@ MainWindow::~MainWindow()
     clearOwnedCroppedImage();
 }
 
+bool MainWindow::loadImageFile(const QString &path)
+{
+    return loadImage(path);
+}
+
 QPushButton *MainWindow::createButton(const QString &text, const QString &objectName)
 {
     QPushButton *button = new QPushButton(text, this);
@@ -432,6 +481,7 @@ void MainWindow::buildInterface()
     m_table->setAlternatingRowColors(true);
     m_table->setSelectionMode(QAbstractItemView::ContiguousSelection);
     m_table->setSelectionBehavior(QAbstractItemView::SelectItems);
+    m_table->setIconSize(QSize(12, 12));
     m_table->setEditTriggers(QAbstractItemView::SelectedClicked
                              | QAbstractItemView::DoubleClicked
                              | QAbstractItemView::EditKeyPressed);
@@ -650,9 +700,7 @@ bool MainWindow::loadImage(const QString &path)
         m_statusLabel->setToolTip(reader.errorString());
         return false;
     }
-    if (m_backend->isRunning()
-        && m_recognitionActive
-        && !m_recognitionDisplayRequested) {
+    if (m_backend->isRunning() && m_recognitionActive) {
         m_restartRecognitionAfterCancel = true;
         m_backend->cancel();
     } else if (!m_backend->isRunning()) {
@@ -695,7 +743,12 @@ bool MainWindow::loadImage(const QString &path)
     m_statusLabel->setText(QStringLiteral("图片已打开，后台识别即将开始；点击开始识别可查看进度"));
     m_recognizeButton->setText(QStringLiteral("开始识别"));
     updateActions();
-    QTimer::singleShot(0, this, [this]() { startBackgroundRecognition(); });
+    QTimer::singleShot(0, this, [this]() {
+        if (qgetenv("OCR_TABLE_GUI_TEST_AUTO_DISPLAY") == QByteArray("1"))
+            recognizeImage();
+        else
+            startBackgroundRecognition();
+    });
     if (qgetenv("OCR_TABLE_GUI_TEST_CROP_FULL") == QByteArray("1")
         && !sourceInfo.completeBaseName().startsWith(
             QStringLiteral("crop-"), Qt::CaseInsensitive)) {
@@ -826,11 +879,17 @@ void MainWindow::startRecognitionRequest()
                         m_recognitionDisplayRequested);
     requestTrace.insert(QStringLiteral("input_rectified"),
                         m_recognitionSourceIsRectified);
+    const bool selectedTableRegion = !m_ownedCroppedImagePath.isEmpty()
+        && QFileInfo(m_ownedCroppedImagePath).absoluteFilePath()
+            == QFileInfo(m_sourceImagePath).absoluteFilePath();
+    requestTrace.insert(QStringLiteral("selected_table_region"),
+                        selectedTableRegion);
     GuiTrace::write(QStringLiteral("recognition_requested"), requestTrace);
     m_backend->recognize(m_sourceImagePath,
                          outputDirectory,
                          QStringLiteral("auto"),
-                         m_recognitionSourceIsRectified);
+                         m_recognitionSourceIsRectified,
+                         selectedTableRegion);
 }
 
 TableData MainWindow::currentTable() const
@@ -1003,6 +1062,22 @@ void MainWindow::backendSucceeded(const QString &action, const QJsonObject &resp
                                    .arg(QDir::toNativeSeparators(response.value(QStringLiteral("output_path")).toString())));
         return;
     }
+    if (action == QStringLiteral("recognize")
+        && m_restartRecognitionAfterCancel) {
+        m_recognitionActive = false;
+        m_restartRecognitionAfterCancel = false;
+        m_pendingRecognitionResponse = QJsonObject();
+        m_pendingRecognitionError.clear();
+        setBusy(false);
+        GuiTrace::write(QStringLiteral("stale_recognition_discarded"));
+        QTimer::singleShot(0, this, [this]() {
+            if (m_recognitionDisplayRequested)
+                startRecognitionRequest();
+            else
+                startBackgroundRecognition();
+        });
+        return;
+    }
     m_recognitionActive = false;
     if (!m_recognitionDisplayRequested) {
         m_pendingRecognitionResponse = response;
@@ -1134,6 +1209,11 @@ void MainWindow::publishRecognitionResult(const QJsonObject &response)
     publishedTrace.insert(QStringLiteral("columns"), table.columnCount());
     publishedTrace.insert(QStringLiteral("span_count"), m_spans.size());
     publishedTrace.insert(QStringLiteral("publication_blocked"), m_publicationBlocked);
+    publishedTrace.insert(QStringLiteral("review_cell_count"), pendingReviewCount());
+    publishedTrace.insert(QStringLiteral("canonical_result_hash"),
+                          canonicalDisplayedResultHash(table,
+                                                       m_spans,
+                                                       m_publicationBlocked));
     publishedTrace.insert(QStringLiteral("unsafe_spans_discarded"),
                           unsafeSpansDiscarded);
     GuiTrace::write(QStringLiteral("result_published"), publishedTrace);
@@ -1181,9 +1261,9 @@ void MainWindow::publishRecognitionResult(const QJsonObject &response)
     if (!publicationBlockReasonTexts.isEmpty()) {
         detailTexts.append(QStringLiteral("风险原因：%1")
                                .arg(publicationBlockReasonTexts.join(QStringLiteral("；"))));
-        m_reviewNotice->setText(QStringLiteral("结果存在风险；仍可导出当前结果，黄色单元格请重点核对。"));
+        m_reviewNotice->setText(QStringLiteral("结果存在风险；仍可导出当前结果，带黄色标记的单元格请重点核对。"));
     } else {
-        m_reviewNotice->setText(QStringLiteral("请核对黄色单元格，确认后导出。"));
+        m_reviewNotice->setText(QStringLiteral("请核对带黄色标记的单元格，确认后导出。"));
     }
     const QJsonArray structureWarnings = response.value(QStringLiteral("structure_warnings")).toArray();
     QStringList structureWarningTexts;
@@ -1295,7 +1375,12 @@ void MainWindow::backendFailed(const QString &action, const QString &message)
             if (m_restartRecognitionAfterCancel) {
                 m_restartRecognitionAfterCancel = false;
                 m_statusLabel->setText(QStringLiteral("图片已打开，后台识别即将重新开始；点击开始识别可查看进度"));
-                QTimer::singleShot(0, this, [this]() { startBackgroundRecognition(); });
+                QTimer::singleShot(0, this, [this]() {
+                    if (m_recognitionDisplayRequested)
+                        startRecognitionRequest();
+                    else
+                        startBackgroundRecognition();
+                });
                 return;
             }
             m_statusLabel->setText(QStringLiteral("识别已取消"));
@@ -1386,14 +1471,15 @@ void MainWindow::showTable(const TableData &table, const QJsonArray &spans)
             item->setData(Qt::UserRole, confidence);
             item->setData(Qt::UserRole + 1, needsReview);
             if (needsReview) {
-                item->setToolTip(QStringLiteral("两次识别结果不一致或置信度不足，请对照原图填写"));
-                item->setBackground(QColor(QStringLiteral("#FFF4D6")));
+                item->setToolTip(QStringLiteral("待确认：请对照原图核对文字、数字、符号和位置"));
+                item->setIcon(reviewMarkerIcon());
                 ++reviewCount;
             } else {
                 item->setToolTip(QStringLiteral("OCR 置信度：%1%").arg(qRound(confidence * 100.0)));
             }
             if (!needsReview && confidence < 0.78 && !item->text().isEmpty()) {
-                item->setBackground(QColor(QStringLiteral("#FFF4D6")));
+                item->setToolTip(QStringLiteral("待确认：请对照原图核对文字、数字、符号和位置"));
+                item->setIcon(reviewMarkerIcon());
                 ++reviewCount;
             }
             m_table->setItem(row, column, item);
@@ -1512,7 +1598,7 @@ void MainWindow::showTable(const TableData &table, const QJsonArray &spans)
     if (m_publicationBlocked)
         m_statusLabel->setText(QStringLiteral("识别完成 · 结果有风险，仍可导出当前结果"));
     else if (reviewCount > 0)
-        m_statusLabel->setText(QStringLiteral("识别完成 · 黄色单元格待核对，可随时导出"));
+        m_statusLabel->setText(QStringLiteral("识别完成 · 黄色标记项待核对，可随时导出"));
     else
         m_statusLabel->setText(QStringLiteral("识别完成 · 可以正式导出"));
     updateActions();
@@ -1609,7 +1695,7 @@ void MainWindow::updateActions()
                              && exportReady
                              && m_backend->isConfigured());
     const QString exportTip = pending > 0
-        ? QStringLiteral("可导出当前结果；其中 %1 个黄色单元格仍需核对").arg(pending)
+        ? QStringLiteral("可导出当前结果；其中 %1 个黄色标记项仍需核对").arg(pending)
         : QString();
     m_csvButton->setToolTip(exportTip);
     m_xlsxButton->setToolTip(exportTip);

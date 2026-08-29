@@ -5,6 +5,7 @@
 #include <QDir>
 #include <QFile>
 #include <QLocale>
+#include <QTimer>
 #include <QTranslator>
 
 int main(int argc, char *argv[])
@@ -30,5 +31,12 @@ int main(int argc, char *argv[])
 
     MainWindow window;
     window.show();
+    const QStringList arguments = application.arguments();
+    if (arguments.size() > 1) {
+        const QString imagePath = arguments.at(1);
+        QTimer::singleShot(0, &window, [&window, imagePath]() {
+            window.loadImageFile(imagePath);
+        });
+    }
     return application.exec();
 }
