@@ -3703,6 +3703,121 @@ def _recover_missing_photo_grid_from_shadowed_expansions(
     return candidate_image, candidate_grid, metadata
 
 
+def _more_complete_perspective_grid_than_partial_screen(
+    image: np.ndarray,
+    screen_grid: tuple[list[int], list[int], np.ndarray] | None,
+    *,
+    maximum_cells: int,
+) -> tuple[np.ndarray, tuple[list[int], list[int], np.ndarray], dict[str, Any]] | None:
+    """Reject a locally straight grid when perspective reveals the full table."""
+    if screen_grid is None or image is None or image.size == 0:
+        return None
+    screen_columns, screen_rows, _ = screen_grid
+    screen_row_count = len(screen_rows) - 1
+    screen_column_count = len(screen_columns) - 1
+    height = image.shape[0]
+    if (
+        not 2 <= screen_row_count <= 10
+        or not 2 <= screen_column_count <= 12
+        or len(screen_rows) < 2
+        or (screen_rows[-1] - screen_rows[0]) >= height * 0.55
+        or screen_rows[0] < height * 0.10
+        or screen_rows[-1] > height * 0.90
+    ):
+        return None
+
+    candidate_image, metadata = pipeline.prepare_image(image, "auto")
+    if not (
+        metadata.get("detected") is True
+        and metadata.get("full_frame_perspective_grid") is True
+    ):
+        return None
+    candidate_grid = pipeline.extract_ruled_grid(
+        candidate_image,
+        prefer_adaptive=True,
+    )
+    if candidate_grid is None:
+        return None
+    candidate_columns, candidate_rows, _ = candidate_grid
+    candidate_row_count = len(candidate_rows) - 1
+    candidate_column_count = len(candidate_columns) - 1
+    candidate_height = candidate_image.shape[0]
+    if (
+        candidate_row_count < max(12, screen_row_count * 2)
+        or not screen_column_count - 1
+        <= candidate_column_count
+        <= screen_column_count + 2
+        or candidate_rows[0] > candidate_height * 0.12
+        or candidate_rows[-1] < candidate_height * 0.88
+        or not _grid_geometry_is_bounded(
+            candidate_columns,
+            candidate_rows,
+            maximum_cells=maximum_cells,
+        )
+        or not _photographic_ruled_grid_is_credible(
+            candidate_image,
+            candidate_columns,
+            candidate_rows,
+        )
+    ):
+        return None
+    return candidate_image, candidate_grid, metadata
+
+
+def _restore_expanded_perspective_crop_edges(
+    image: np.ndarray,
+    grid: tuple[list[int], list[int], np.ndarray] | None,
+    *,
+    expected_columns: int,
+    base_rows: int,
+) -> tuple[list[int], list[int], np.ndarray] | None:
+    """Restore symmetric crop-edge columns and one trailing row from regular rules."""
+    if grid is None or image is None or image.size == 0:
+        return grid
+    columns, rows, cleaned = grid
+    height, width = image.shape[:2]
+    if (
+        expected_columns < 4
+        or len(columns) - 1 != expected_columns - 2
+        or len(rows) - 1 < max(8, base_rows + 1)
+        or len(columns) < 4
+        or len(rows) < 8
+    ):
+        return grid
+
+    column_gaps = np.diff(columns).astype(float)
+    typical_column = float(np.median(column_gaps)) if column_gaps.size else 0.0
+    column_tolerance = max(5.0, typical_column * 0.15)
+    leading_margin = float(columns[0])
+    trailing_margin = float((width - 1) - columns[-1])
+    if (
+        typical_column < 12.0
+        or float(np.max(np.abs(column_gaps - typical_column))) > column_tolerance
+        or not typical_column * 0.35 <= leading_margin <= typical_column * 1.15
+        or not typical_column * 0.35 <= trailing_margin <= typical_column * 1.15
+    ):
+        return grid
+
+    restored_columns = [0, *[int(value) for value in columns], width - 1]
+    restored_rows = [int(value) for value in rows]
+    row_gaps = np.diff(restored_rows).astype(float)
+    typical_row = float(np.median(row_gaps)) if row_gaps.size else 0.0
+    trailing_row_margin = float((height - 1) - restored_rows[-1])
+    regular_rows = bool(
+        typical_row >= 8.0
+        and float(np.mean(np.abs(row_gaps - typical_row) <= max(4.0, typical_row * 0.16)))
+        >= 0.85
+    )
+    if (
+        regular_rows
+        and typical_row * 0.65 <= trailing_row_margin <= typical_row * 1.20
+        and restored_rows[0] <= height * 0.08
+        and restored_rows[-1] >= height * 0.90
+    ):
+        restored_rows.append(height - 1)
+    return restored_columns, restored_rows, cleaned
+
+
 def _recover_vertically_truncated_photo_grid(
     source: np.ndarray,
     rectified: np.ndarray,
@@ -3802,6 +3917,25 @@ def _recover_vertically_truncated_photo_grid(
         ruled_grid,
         maximum_cells=maximum_cells,
     )
+    merged_columns = pipeline._merge_nearby_centers(
+        ruled_grid[0],
+        maximum_gap=5,
+    )
+    if (
+        len(merged_columns) == len(ruled_grid[0]) - 1
+        and _grid_geometry_is_bounded(
+            merged_columns,
+            ruled_grid[1],
+            maximum_cells=maximum_cells,
+        )
+        and _photographic_ruled_grid_is_credible(
+            rectified,
+            merged_columns,
+            ruled_grid[1],
+        )
+    ):
+        ruled_grid = (merged_columns, ruled_grid[1], ruled_grid[2])
+        metadata["merged_duplicate_vertical_rule"] = True
     original_corners = np.asarray(corners, dtype=np.float32).reshape(4, 2)
     baseline = _ruled_grid_edge_evidence(rectified, ruled_grid)
     if baseline is None:
@@ -3830,6 +3964,12 @@ def _recover_vertically_truncated_photo_grid(
             return None
         candidate_image, transform, expanded_corners = expanded
         candidate_grid = pipeline.extract_ruled_grid(candidate_image, prefer_adaptive=True)
+        candidate_grid = _restore_expanded_perspective_crop_edges(
+            candidate_image,
+            candidate_grid,
+            expected_columns=base_columns,
+            base_rows=base_rows,
+        )
         evidence = _ruled_grid_edge_evidence(candidate_image, candidate_grid)
         if evidence is None or candidate_grid is None:
             return None
@@ -3859,7 +3999,7 @@ def _recover_vertically_truncated_photo_grid(
             and bool(metadata.get("full_frame_perspective_grid", False))
             and preserves
             and not strong_additions
-            and recovered_rows in (1, 2)
+            and recovered_rows in (1, 2, 3)
             and column_growth == 0
         )
         stable_balanced_header_replacement = bool(
@@ -3930,6 +4070,12 @@ def _recover_vertically_truncated_photo_grid(
             candidate_grid = pipeline.extract_ruled_grid(
                 candidate_image,
                 prefer_adaptive=True,
+            )
+            candidate_grid = _restore_expanded_perspective_crop_edges(
+                candidate_image,
+                candidate_grid,
+                expected_columns=base_columns,
+                base_rows=base_rows,
             )
             candidate_grid = _restore_visible_top_interval_boundary(
                 candidate_image,
@@ -4185,13 +4331,16 @@ def _recover_vertically_truncated_photo_grid(
             (0.034, 0.035),
             (0.06, 0.065),
             (0.075, 0.08),
+            (0.095, 0.10),
             (0.04, 0.045),
         )
     )
     stable_candidates: list[candidate_type] = []
+    qualified_regular_candidates: list[candidate_type] = []
     selected_candidate: candidate_type | None = None
     saw_qualified_regular_candidate = False
     selected_from_stable_clipped_edge = False
+    selected_from_shape_consensus = False
     for group_index, ratio_group in enumerate(ratio_groups):
         group_candidates = [
             candidate
@@ -4201,6 +4350,7 @@ def _recover_vertically_truncated_photo_grid(
         saw_qualified_regular_candidate = bool(
             saw_qualified_regular_candidate or group_candidates
         )
+        qualified_regular_candidates.extend(group_candidates)
         group_stable: list[candidate_type] = []
         for first, second in zip(group_candidates, group_candidates[1:]):
             first_shape = (len(first[2][1]) - 1, len(first[2][0]) - 1)
@@ -4221,6 +4371,34 @@ def _recover_vertically_truncated_photo_grid(
                 key=lambda candidate: (len(candidate[2][1]), -candidate[0]),
             )
             break
+
+    if selected_candidate is None and qualified_regular_candidates:
+        candidates_by_shape: dict[tuple[int, int], list[candidate_type]] = {}
+        for candidate in qualified_regular_candidates:
+            shape = (len(candidate[2][1]) - 1, len(candidate[2][0]) - 1)
+            candidates_by_shape.setdefault(shape, []).append(candidate)
+        stable_shape_groups = [
+            candidates
+            for candidates in candidates_by_shape.values()
+            if len(candidates) >= 3
+            and max(candidate[0] for candidate in candidates)
+            - min(candidate[0] for candidate in candidates)
+            >= 0.02
+        ]
+        if stable_shape_groups:
+            selected_group = max(
+                stable_shape_groups,
+                key=lambda candidates: (
+                    len(candidates[0][2][1]),
+                    len(candidates[0][2][0]),
+                    len(candidates),
+                ),
+            )
+            selected_candidate = min(
+                selected_group,
+                key=lambda candidate: candidate[0],
+            )
+            selected_from_shape_consensus = True
 
     if selected_candidate is None and not saw_qualified_regular_candidate:
         clipped_edge_candidates = [
@@ -4358,6 +4536,7 @@ def _recover_vertically_truncated_photo_grid(
                 - original_base_columns,
                 "vertical_expansion_ratio": ratio,
                 "stable_clipped_edge_pair": selected_from_stable_clipped_edge,
+                "stable_expansion_shape_consensus": selected_from_shape_consensus,
             }
         )
         if bottom_expansion_ratio is not None:
@@ -12878,6 +13057,128 @@ def _verify_motion_blurred_ruled_cells(
                     semantic_headers_by_column = semantic_headers()
         unresolved = still_unresolved
 
+    leading_line_indices = [
+        index
+        for index in range(len(locations))
+        if "信号名称" in semantic_headers_by_column[locations[index][1]]
+        and re.match(
+            r"[1Iil][A-Za-z]{2,}",
+            re.sub(
+                r"[\s_]+",
+                "",
+                str(grid[locations[index][0]][locations[index][1]]).strip(),
+            ),
+        )
+    ]
+    small_recognizer = getattr(ocr_engine, "fast_text_rec", None)
+    if leading_line_indices and callable(small_recognizer):
+        small_view_outputs = []
+        for source_views in (views, raw_views):
+            output = small_recognizer(
+                TextRecInput(img=[source_views[index] for index in leading_line_indices])
+            )
+            _release_recognition_images(output)
+            texts = [str(text).strip() for text in output.txts]
+            scores = [float(score) for score in output.scores]
+            all_scores.extend(scores)
+            if (
+                len(texts) != len(leading_line_indices)
+                or len(scores) != len(leading_line_indices)
+            ):
+                small_view_outputs = []
+                break
+            small_view_outputs.append(list(zip(texts, scores)))
+        corrected_leading_lines: set[int] = set()
+        if len(small_view_outputs) == 2:
+            line_like = {"1", "I", "i", "l"}
+            for offset, index in enumerate(leading_line_indices):
+                first_text, first_score = small_view_outputs[0][offset]
+                second_text, second_score = small_view_outputs[1][offset]
+                first_key = re.sub(
+                    r"[\s_]+", "", _motion_cell_consensus_key(first_text)
+                )
+                second_key = re.sub(
+                    r"[\s_]+", "", _motion_cell_consensus_key(second_text)
+                )
+                row, column = locations[index]
+                current = str(grid[row][column]).strip()
+                current_key = re.sub(
+                    r"[\s_]+", "", _motion_cell_consensus_key(current)
+                )
+                if (
+                    first_key
+                    and first_key == second_key
+                    and min(first_score, second_score) >= 0.94
+                    and len(first_key) == len(current_key)
+                    and first_key[1:].casefold() == current_key[1:].casefold()
+                    and first_key[0] in line_like
+                    and current_key[0] in line_like
+                    and first_key[0] != current_key[0]
+                ):
+                    grid[row][column] = first_text
+                    confidence_grid[row][column] = 0.77
+                    corrected_leading_lines.add(index)
+                    if verified_cells_out is not None:
+                        verified_cells_out.add((row, column))
+        unresolved = [
+            index for index in unresolved if index not in corrected_leading_lines
+        ]
+
+    decimal_comma_indices = [
+        index
+        for index in range(len(locations))
+        if "信号名称" in semantic_headers_by_column[locations[index][1]]
+        and re.search(
+            r"\d,\d",
+            str(grid[locations[index][0]][locations[index][1]]),
+        )
+    ]
+    if decimal_comma_indices and callable(small_recognizer):
+        small_output = small_recognizer(
+            TextRecInput(img=[raw_views[index] for index in decimal_comma_indices])
+        )
+        medium_output = medium_recognizer(
+            TextRecInput(img=[raw_views[index] for index in decimal_comma_indices])
+        )
+        _release_recognition_images(small_output)
+        _release_recognition_images(medium_output)
+        small_texts = [str(text).strip() for text in small_output.txts]
+        medium_texts = [str(text).strip() for text in medium_output.txts]
+        small_scores = [float(score) for score in small_output.scores]
+        medium_scores = [float(score) for score in medium_output.scores]
+        all_scores.extend(small_scores)
+        all_scores.extend(medium_scores)
+        corrected_decimal_commas: set[int] = set()
+        if (
+            len(small_texts) == len(decimal_comma_indices)
+            and len(medium_texts) == len(decimal_comma_indices)
+            and len(small_scores) == len(decimal_comma_indices)
+            and len(medium_scores) == len(decimal_comma_indices)
+        ):
+            for offset, index in enumerate(decimal_comma_indices):
+                small_key = re.sub(
+                    r"[\s_]+", "", _motion_cell_consensus_key(small_texts[offset])
+                )
+                medium_key = re.sub(
+                    r"[\s_]+", "", _motion_cell_consensus_key(medium_texts[offset])
+                )
+                if (
+                    small_key
+                    and small_key == medium_key
+                    and min(small_scores[offset], medium_scores[offset]) >= 0.90
+                    and "," not in small_key
+                    and re.search(r"\d\.\d", small_key)
+                ):
+                    row, column = locations[index]
+                    grid[row][column] = medium_texts[offset]
+                    confidence_grid[row][column] = 0.77
+                    corrected_decimal_commas.add(index)
+                    if verified_cells_out is not None:
+                        verified_cells_out.add((row, column))
+        unresolved = [
+            index for index in unresolved if index not in corrected_decimal_commas
+        ]
+
     # A dense recognizer batch can normalize one narrow four-digit quantity to
     # the width of its neighbours (for example, 9000 -> 0006).  Re-read only
     # the independently selected magnitude outliers as single physical cells.
@@ -14308,6 +14609,92 @@ def _repair_periodic_categorical_confusions(
             confidence_grid[row][column] = 0.77
             repairs.append((row, column, expected_text))
     return repairs
+
+
+def _short_categorical_token_visual_risks(
+    grid: list[list[str]],
+    *,
+    include_all: bool = False,
+) -> set[tuple[int, int]]:
+    """Select rare one-glyph category values for bounded cross-model rereading."""
+    if len(grid) < 9 or not grid[0]:
+        return set()
+    column_count = len(grid[0])
+    if any(len(row) != column_count for row in grid):
+        return set()
+    header_row = -1
+    category_columns: list[int] = []
+    header_tokens = ("状态", "结果", "类别", "分类", "等级", "模式", "班次")
+    for row in range(min(3, len(grid) - 1)):
+        columns = [
+            column
+            for column, value in enumerate(grid[row])
+            if any(token in str(value).strip() for token in header_tokens)
+        ]
+        if len(columns) > len(category_columns):
+            header_row = row
+            category_columns = columns
+    if header_row < 0:
+        return set()
+
+    selected: set[tuple[int, int]] = set()
+    for column in category_columns:
+        values = [
+            str(grid[row][column]).strip()
+            for row in range(header_row + 1, len(grid))
+            if str(grid[row][column]).strip()
+        ]
+        lengths = [len(_comparable_text(value)) for value in values]
+        ordinary = [length for length in lengths if length >= 2]
+        if len(values) < 8 or len(ordinary) < 6 or float(np.median(ordinary)) < 2.0:
+            continue
+        counts: dict[str, int] = {}
+        for value in values:
+            key = _motion_cell_consensus_key(value)
+            if key:
+                counts[key] = counts.get(key, 0) + 1
+        for row in range(header_row + 1, len(grid)):
+            value = str(grid[row][column]).strip()
+            key = _motion_cell_consensus_key(value)
+            if include_all and key:
+                selected.add((row, column))
+            elif key and len(_comparable_text(value)) == 1 and counts.get(key, 0) <= 2:
+                selected.add((row, column))
+    return selected
+
+
+def _signal_name_visual_risks(
+    grid: list[list[str]],
+) -> set[tuple[int, int]]:
+    """Select punctuation and leading-line ambiguities in signal-name columns."""
+    if len(grid) < 2 or not grid[0]:
+        return set()
+    column_count = len(grid[0])
+    if any(len(row) != column_count for row in grid):
+        return set()
+    header_row = -1
+    columns: list[int] = []
+    for row in range(min(3, len(grid) - 1)):
+        found = [
+            column
+            for column, value in enumerate(grid[row])
+            if "信号名称" in str(value)
+        ]
+        if len(found) > len(columns):
+            header_row = row
+            columns = found
+    if header_row < 0:
+        return set()
+    selected: set[tuple[int, int]] = set()
+    for row in range(header_row + 1, len(grid)):
+        for column in columns:
+            value = str(grid[row][column]).strip()
+            compact = re.sub(r"[\s_]+", "", value)
+            if re.search(r"\d,\d", compact) or re.match(
+                r"[1Iil][A-Za-z]{2,}", compact
+            ):
+                selected.add((row, column))
+    return selected
 
 
 def _repair_periodic_unit_blanks(
@@ -24231,18 +24618,32 @@ def _recover_missing_title_from_source_margin(
         return False, []
     column_count = len(grid[0])
     first_values = [str(value).strip() for value in grid[0] if str(value).strip()]
+    has_title_span = any(
+        int(span.get("row", -1)) == 0
+        and int(span.get("column", -1)) == 0
+        and int(span.get("column_span", 1)) == column_count
+        and span.get("role") == "title"
+        for span in spans
+    )
     existing_blank_title_row = bool(
         not first_values
-        and any(
-            int(span.get("row", -1)) == 0
-            and int(span.get("column", -1)) == 0
-            and int(span.get("column_span", 1)) == column_count
-            and span.get("role") == "title"
-            for span in spans
+        and has_title_span
+    )
+    existing_weak_title_row = bool(
+        has_title_span
+        and len(first_values) == 1
+        and min(
+            (
+                float(confidence_grid[0][column])
+                for column, value in enumerate(grid[0])
+                if str(value).strip()
+            ),
+            default=1.0,
         )
+        <= 0.80
     )
     metadata_row_index = 1 if existing_blank_title_row else 0
-    detail_row_index = metadata_row_index + 1
+    detail_row_index = 1 if existing_weak_title_row else metadata_row_index + 1
     metadata_values = [
         str(value).strip()
         for value in grid[metadata_row_index]
@@ -24268,7 +24669,7 @@ def _recover_missing_title_from_source_margin(
         )
         or detail_populated < max(4, column_count - 2)
         or dense_body_rows < 4
-        or not (metadata_first or group_first)
+        or not (metadata_first or group_first or existing_weak_title_row)
     ):
         return False, []
     corners = rectification.get("base_corners") or rectification.get("corners")
@@ -24284,13 +24685,29 @@ def _recover_missing_title_from_source_margin(
         int(max(float(corners[1][0]), float(corners[2][0]))),
     )
     band_height = max(36, int(round(source_height * 0.075)))
+    crop_top = max(0, top - band_height)
     crop_bottom = min(
         source_height,
         top + int(round(source_height * 0.025))
         if existing_blank_title_row
         else top,
     )
-    crop = source[max(0, top - band_height) : crop_bottom, left:right]
+    if existing_weak_title_row:
+        title_band = source[crop_top:top, left:right]
+        if title_band.size:
+            title_gray = cv2.cvtColor(title_band, cv2.COLOR_BGR2GRAY)
+            dark_projection = np.count_nonzero(title_gray < 190, axis=1)
+            separators = np.flatnonzero(
+                dark_projection >= title_gray.shape[1] * 0.35
+            )
+            if separators.size:
+                crop_bottom = crop_top + int(separators[0])
+            else:
+                crop_bottom = max(
+                    crop_top + 12,
+                    top - int(round(source_height * 0.04)),
+                )
+    crop = source[crop_top:crop_bottom, left:right]
     tight = _tight_text_crop(crop) if crop.size else crop
     if tight.size == 0 or min(tight.shape[:2]) < 6:
         return False, []
@@ -24337,19 +24754,52 @@ def _recover_missing_title_from_source_margin(
         if len(supported_by_model[0][key]) >= 3
         and len(supported_by_model[1][key]) >= 3
     ]
-    if len(accepted) != 1:
+    title = None
+    if len(accepted) == 1:
+        title = max(
+            supported_by_model[1][accepted[0]],
+            key=lambda item: item[1],
+        )[0]
+    elif existing_weak_title_row and callable(ocr_engine):
+        with contextlib.redirect_stdout(sys.stderr):
+            source_output = ocr_engine(source)
+        source_candidates: dict[str, list[tuple[str, float]]] = {}
+        for box, text, score in zip(
+            source_output.boxes,
+            source_output.txts,
+            source_output.scores,
+        ):
+            points = np.asarray(box, dtype=float)
+            value = str(text).strip()
+            confidence = float(score)
+            key = _comparable_text(value)
+            if (
+                points.shape != (4, 2)
+                or confidence < 0.95
+                or not key
+                or key not in supported_by_model[1]
+                or len(supported_by_model[1][key]) < 2
+                or float(np.mean(points[:, 1])) >= top
+                or float(np.mean(points[:, 0])) < left
+                or float(np.mean(points[:, 0])) > right
+            ):
+                continue
+            source_candidates.setdefault(key, []).append((value, confidence))
+        _release_recognition_images(source_output)
+        if len(source_candidates) == 1:
+            title = max(
+                next(iter(source_candidates.values())),
+                key=lambda item: item[1],
+            )[0]
+    if title is None:
         return False, all_scores
-    title = max(
-        supported_by_model[1][accepted[0]],
-        key=lambda item: item[1],
-    )[0]
     if (
         not 3 <= len(_comparable_text(title)) <= 24
         or sum("\u3400" <= character <= "\u9fff" for character in title) < 2
         or re.search(r"[:：]", title)
     ):
         return False, all_scores
-    if existing_blank_title_row:
+    if existing_blank_title_row or existing_weak_title_row:
         grid[0] = [title] + [""] * (column_count - 1)
         confidence_grid[0] = [0.77] + [0.0] * (column_count - 1)
         return True, all_scores
@@ -29268,6 +29718,33 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             screen_grid[0], screen_grid[1], maximum_cells=maximum_grid_cells
         )
     )
+    perspective_grid_candidate = None
+    if (
+        not photographic_background
+        and screen_grid_is_credible
+        and screen_grid_is_bounded
+    ):
+        perspective_grid_candidate = _more_complete_perspective_grid_than_partial_screen(
+            image,
+            screen_grid,
+            maximum_cells=maximum_grid_cells,
+        )
+        if perspective_grid_candidate is not None:
+            photographic_background = True
+            screen_grid_is_credible = False
+            screen_grid_is_bounded = False
+            processing_notices.append(
+                "局部规则网格未覆盖完整画面，已切换到透视表格完整性恢复。"
+            )
+            _write_runtime_trace(
+                "route",
+                force_flush=True,
+                name="partial_screen_grid_rejected_for_perspective",
+                screen_rows=len(screen_grid[1]) - 1,
+                screen_columns=len(screen_grid[0]) - 1,
+                candidate_rows=len(perspective_grid_candidate[1][1]) - 1,
+                candidate_columns=len(perspective_grid_candidate[1][0]) - 1,
+            )
     if photographic_background:
         full_frame_ruled_grid = pipeline.extract_ruled_grid(
             image,
@@ -29539,7 +30016,19 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
         ):
             ruled_grid = None
     else:
-        rectified, rectification = pipeline.prepare_image(image, str(options.get("crop_mode", "auto")))
+        if perspective_grid_candidate is not None:
+            rectified, ruled_grid, rectification = perspective_grid_candidate
+            rectification = dict(rectification)
+            rectification["partial_screen_grid_rejected"] = True
+        else:
+            rectified, rectification = pipeline.prepare_image(
+                image,
+                str(options.get("crop_mode", "auto")),
+            )
+            ruled_grid = pipeline.extract_ruled_grid(
+                rectified,
+                prefer_adaptive=photographic_background,
+            )
         complementary_photo_grid_recovered = False
         paper_touches_image_edge = bool(
             photographic_background
@@ -29548,10 +30037,6 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 image.shape[1],
                 image.shape[0],
             )
-        )
-        ruled_grid = pipeline.extract_ruled_grid(
-            rectified,
-            prefer_adaptive=photographic_background,
         )
         if photographic_background and ruled_grid is None:
             shadowed_recovery = _recover_missing_photo_grid_from_shadowed_expansions(
@@ -31405,6 +31890,19 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 if reason == "power_missing_sign"
                 and (row, column) not in locked_physical_cells
             }
+            short_categorical_cells = (
+                _short_categorical_token_visual_risks(
+                    page_grid,
+                    include_all=bool(
+                        rectification.get("partial_screen_grid_rejected", False)
+                    ),
+                )
+                - locked_physical_cells
+            )
+            signal_name_visual_cells = (
+                _signal_name_visual_risks(page_grid)
+                - locked_physical_cells
+            )
             visible_blank_cells = _bounded_visible_blank_body_cells(
                 page_grid,
                 locked_physical_cells,
@@ -31422,6 +31920,8 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             unit_confusion_cells = _short_unit_visual_confusion_risks(page_grid)
             expanded_consensus_cells = set(physical_consensus_cells or set()).union(
                 semantic_power_cells,
+                short_categorical_cells,
+                signal_name_visual_cells,
             )
             if not large_certified_page_consensus or len(expanded_consensus_cells) <= 144:
                 physical_consensus_cells = expanded_consensus_cells
@@ -35035,7 +35535,7 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             structure_certificate = None
             review_only_physical_spans = True
             structural_warnings.append(
-                "检测裁剪遗漏了源图顶部主标题，已按Small与Medium跨模型一致结果补回；整表仍需人工核对。"
+                "顶部主标题已按源图Small与Medium跨模型一致结果恢复；整表仍需人工核对。"
             )
         unresolved_visible_blanks = _blocking_unresolved_visible_blank_locations(
             grid, confidence_grid

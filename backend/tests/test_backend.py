@@ -17002,6 +17002,138 @@ class TablePipelineTests(unittest.TestCase):
             any(span["row"] == 0 and span["role"] == "title" for span in spans)
         )
 
+    def test_source_margin_consensus_replaces_one_weak_existing_title(self):
+        ocr_backend._load_runtime()
+        source = np.full((200, 300, 3), 245, dtype=np.uint8)
+        cv2.putText(
+            source,
+            "TITLE",
+            (100, 70),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (20, 20, 20),
+            2,
+            cv2.LINE_AA,
+        )
+        grid = [
+            ["错误标题", "", "", ""],
+            ["编号", "名称", "数量", "状态"],
+            *[[str(row), "设备", "1", "正常"] for row in range(5)],
+        ]
+        confidence = [[0.95 if value else 0.0 for value in row] for row in grid]
+        confidence[0][0] = 0.77
+        spans = [
+            {"row": 0, "column": 0, "row_span": 1, "column_span": 4, "role": "title"}
+        ]
+        output = SimpleNamespace(
+            txts=["设备维护记录表"] * 4,
+            scores=[0.99, 0.98, 0.97, 0.96],
+            imgs=None,
+        )
+        engine = SimpleNamespace(
+            fast_text_rec=Mock(return_value=output),
+            text_rec=Mock(return_value=output),
+        )
+
+        recovered, _ = ocr_backend._recover_missing_title_from_source_margin(
+            source,
+            {"corners": [[10, 100], [290, 100], [290, 190], [10, 190]]},
+            grid,
+            confidence,
+            spans,
+            engine,
+        )
+
+        self.assertTrue(recovered)
+        self.assertEqual(grid[0], ["设备维护记录表", "", "", ""])
+        self.assertEqual(len(grid), 7)
+        self.assertEqual(spans[0]["role"], "title")
+
+    def test_weak_title_accepts_source_page_and_medium_agreement(self):
+        ocr_backend._load_runtime()
+        source = np.full((200, 300, 3), 245, dtype=np.uint8)
+        grid = [
+            ["错误标题", "", "", ""],
+            ["编号", "名称", "数量", "状态"],
+            *[[str(row), "设备", "1", "正常"] for row in range(5)],
+        ]
+        confidence = [[0.95 if value else 0.0 for value in row] for row in grid]
+        confidence[0][0] = 0.77
+        spans = [
+            {"row": 0, "column": 0, "row_span": 1, "column_span": 4, "role": "title"}
+        ]
+        small = SimpleNamespace(
+            txts=["设备维护表"] * 4,
+            scores=[0.99, 0.98, 0.97, 0.96],
+            imgs=None,
+        )
+        medium = SimpleNamespace(
+            txts=["设备维护记录表"] * 4,
+            scores=[0.99, 0.98, 0.97, 0.96],
+            imgs=None,
+        )
+        source_page = SimpleNamespace(
+            boxes=[np.asarray([[80, 20], [220, 20], [220, 45], [80, 45]])],
+            txts=["设备维护记录表"],
+            scores=[0.995],
+            imgs=None,
+        )
+
+        class Engine:
+            fast_text_rec = Mock(return_value=small)
+            text_rec = Mock(return_value=medium)
+
+            def __call__(self, _image):
+                return source_page
+
+        recovered, _ = ocr_backend._recover_missing_title_from_source_margin(
+            source,
+            {"corners": [[10, 100], [290, 100], [290, 190], [10, 190]]},
+            grid,
+            confidence,
+            spans,
+            Engine(),
+        )
+
+        self.assertTrue(recovered)
+        self.assertEqual(grid[0], ["设备维护记录表", "", "", ""])
+
+    def test_short_categorical_token_is_selected_for_visual_rereading(self):
+        ocr_backend._load_runtime()
+        grid = [
+            ["编号", "设备", "状态"],
+            ["1", "A", "异"],
+            ["2", "B", "待复核"],
+            ["3", "C", "已确认"],
+            ["4", "D", "停用"],
+            ["5", "E", "在用"],
+            ["6", "F", "正常"],
+            ["7", "G", "异常"],
+            ["8", "H", "待复核"],
+            ["9", "I", "已确认"],
+        ]
+
+        risks = ocr_backend._short_categorical_token_visual_risks(grid)
+        all_risks = ocr_backend._short_categorical_token_visual_risks(
+            grid,
+            include_all=True,
+        )
+
+        self.assertEqual(risks, {(1, 2)})
+        self.assertEqual(all_risks, {(row, 2) for row in range(1, 10)})
+
+    def test_signal_name_visual_risks_select_decimal_comma_and_leading_line(self):
+        grid = [
+            ["编号", "信号名称"],
+            ["1", "dmr_7,3k 12.5k"],
+            ["2", "1ora 52.3k 62.5k"],
+            ["3", "qpsk 25.4k"],
+        ]
+
+        risks = ocr_backend._signal_name_visual_risks(grid)
+
+        self.assertEqual(risks, {(1, 1), (2, 1)})
+
     def test_ruled_recovery_geometry_preserves_physical_cell_boundaries(self):
         geometry = ocr_backend._ruled_grid_recovery_geometry(
             [3, 41, 96],
@@ -21199,7 +21331,99 @@ class TablePipelineTests(unittest.TestCase):
 
         self.assertIn("morphology_columns_recovered", source)
         self.assertIn("(0.08, 0.085)", source)
+        self.assertIn("(0.095, 0.10)", source)
         self.assertIn("morphology_columns_recovered and recovered_rows >= 2", source)
+
+    def test_partial_screen_grid_yields_to_more_complete_perspective_geometry(self):
+        ocr_backend._load_runtime()
+        image = np.full((1000, 900, 3), 255, dtype=np.uint8)
+        screen_grid = (
+            [100, 260, 420, 580, 740, 899],
+            [450, 490, 530, 570, 610, 650],
+            image.copy(),
+        )
+        candidate_image = np.full((800, 900, 3), 255, dtype=np.uint8)
+        candidate_grid = (
+            [0, 150, 300, 450, 600, 750, 899],
+            list(range(0, 801, 40)),
+            candidate_image.copy(),
+        )
+        metadata = {
+            "detected": True,
+            "full_frame_perspective_grid": True,
+            "corners": [[10, 100], [890, 90], [899, 900], [0, 910]],
+        }
+
+        with (
+            patch.object(
+                ocr_backend.pipeline,
+                "prepare_image",
+                return_value=(candidate_image, metadata),
+            ),
+            patch.object(
+                ocr_backend.pipeline,
+                "extract_ruled_grid",
+                return_value=candidate_grid,
+            ),
+            patch.object(ocr_backend, "_grid_geometry_is_bounded", return_value=True),
+            patch.object(
+                ocr_backend,
+                "_photographic_ruled_grid_is_credible",
+                return_value=True,
+            ),
+        ):
+            selected = (
+                ocr_backend._more_complete_perspective_grid_than_partial_screen(
+                    image,
+                    screen_grid,
+                    maximum_cells=1280,
+                )
+            )
+
+        self.assertIsNotNone(selected)
+        self.assertIs(selected[0], candidate_image)
+        self.assertIs(selected[1], candidate_grid)
+
+    def test_expanded_perspective_restores_symmetric_columns_and_trailing_row(self):
+        ocr_backend._load_runtime()
+        image = np.full((1002, 913, 3), 255, dtype=np.uint8)
+        columns = [84, 256, 428, 600, 762]
+        rows = [
+            29,
+            87,
+            128,
+            169,
+            210,
+            251,
+            292,
+            334,
+            375,
+            416,
+            458,
+            500,
+            542,
+            584,
+            626,
+            668,
+            710,
+            752,
+            794,
+            836,
+            879,
+            922,
+            964,
+        ]
+        grid = (columns, rows, image.copy())
+
+        restored = ocr_backend._restore_expanded_perspective_crop_edges(
+            image,
+            grid,
+            expected_columns=6,
+            base_rows=20,
+        )
+
+        self.assertEqual(restored[0], [0, *columns, 912])
+        self.assertEqual(restored[1], [*rows, 1001])
 
     def test_vertical_crop_recovery_accepts_one_stable_supported_edge_row(self):
         ocr_backend._load_runtime()
