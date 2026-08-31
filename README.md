@@ -2,6 +2,10 @@
 
 OcrTableTool 是面向 Windows 平板的离线图片转表格工具，支持打开图片和摄像头拍照。
 
+## 下载
+
+Windows 版本见 [Releases](https://github.com/kurodayu23/OcrTableTool/releases/latest)。
+
 ## 开发环境
 
 - Windows 11 x64
@@ -43,3 +47,7 @@ Qt 接口位于 `interface-sdk/qt`，调用示例位于 `interface-sdk/example`�
 .\.venv\Scripts\python.exe -m unittest discover -s backend\tests -p "test_*.py"
 python -m pytest -q tests\test_ui_contract.py tests\test_interface_sdk_contract.py
 ```
+
+## 许可证
+
+项目源码采用 MIT 许可证，第三方组件说明见 `THIRD_PARTY_NOTICES.md`。
