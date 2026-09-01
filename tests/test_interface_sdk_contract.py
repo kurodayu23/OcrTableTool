@@ -33,12 +33,24 @@ class InterfaceSdkContractTests(unittest.TestCase):
         self.assertNotIn('QStringLiteral("--persistent")', source)
         self.assertNotIn("m_process->kill();\n        m_pendingResponse = response", source)
         self.assertNotIn("warmup()", CLIENT_H.read_text(encoding="utf-8"))
+        backend = (ROOT / "backend/ocr_backend.py").read_text(encoding="utf-8")
+        self.assertIn("pipeline.end_ruled_grid_request_cache()", backend)
+        self.assertIn("gc.collect()", backend)
 
     def test_client_locks_maximum_accuracy(self):
         source = CLIENT_CPP.read_text(encoding="utf-8")
         self.assertIn('QStringLiteral("crop_mode"), QStringLiteral("auto")', source)
         self.assertIn('QStringLiteral("accuracy_mode"), QStringLiteral("maximum")', source)
         self.assertIn('QStringLiteral("deadline_seconds"), 0', source)
+
+    def test_camera_and_rectified_inputs_have_named_entry_points(self):
+        header = CLIENT_H.read_text(encoding="utf-8")
+        source = CLIENT_CPP.read_text(encoding="utf-8")
+        camera_source = CAMERA_CPP.read_text(encoding="utf-8")
+        self.assertIn("recognizeCameraPhoto", header)
+        self.assertIn("recognizeRectifiedTable", header)
+        self.assertIn("return recognize(imagePath,", source)
+        self.assertIn("m_ocr->recognizeCameraPhoto(recognitionPath", camera_source)
 
     def test_client_validates_publication_and_structure_contracts(self):
         source = CLIENT_CPP.read_text(encoding="utf-8")
@@ -65,6 +77,7 @@ class InterfaceSdkContractTests(unittest.TestCase):
         self.assertIn("startCamera", camera)
         self.assertIn("exportLastCsv", camera)
         self.assertIn("needs_review", api)
+        self.assertIn("memory_mode", api)
 
     def test_camera_facade_exposes_one_complete_business_flow(self):
         header = CAMERA_H.read_text(encoding="utf-8")
@@ -116,6 +129,7 @@ class InterfaceSdkContractTests(unittest.TestCase):
         self.assertIn('QStringLiteral("image_quality_warning")', source)
         self.assertNotIn('pixels < 7LL * 1000LL * 1000LL) {\n        emitFailure', source)
         self.assertIn("m_ocrRetryCount < 1", source)
+        self.assertIn("&& !m_tableRegion.isValid()", source)
         self.assertIn('QStringLiteral("recognizing_retry")', source)
         self.assertIn("int m_ocrRetryCount;", header)
         self.assertIn("bool m_ocrRetryPending;", header)
@@ -125,6 +139,7 @@ class InterfaceSdkContractTests(unittest.TestCase):
         self.assertIn('QStringLiteral("table_region_fallback")', source)
         self.assertIn("m_regionFallbackAttempted", source + header)
         self.assertIn('QStringLiteral("camera-table-retry.png")', source)
+        self.assertIn("m_ocrRetryCount = 1;", source)
         self.assertNotIn("m_capturePath = m_originalCapturePath;", source)
 
     def test_camera_sdk_crops_one_selected_table_on_the_full_resolution_photo(self):
@@ -135,8 +150,9 @@ class InterfaceSdkContractTests(unittest.TestCase):
         self.assertIn("reader.setAutoTransform(true);", source)
         self.assertIn('QStringLiteral("camera-table.png")', source)
         self.assertIn("resolvedTableRegion(capturedImage.size())", source)
-        self.assertIn("bounded.width() * 0.015", source)
-        self.assertIn("bounded.height() * 0.025", source)
+        self.assertIn("bounded.width() * 0.02", source)
+        self.assertIn("bounded.height() * 0.08", source)
+        self.assertIn("bounded.height() * 0.04", source)
         self.assertIn('QStringLiteral("table_region_cropped")', source)
         self.assertIn("m_capturePath = recognitionPath;", source)
         self.assertIn("m_tableRegion.isValid());", source)

@@ -358,9 +358,10 @@ QRect CameraOcrClient::resolvedTableRegion(const QSize &imageSize) const
     const QRect bounded = requested.intersected(QRect(QPoint(0, 0), imageSize));
     if (!bounded.isValid())
         return QRect();
-    const int paddingX = qMax(4, qCeil(bounded.width() * 0.015));
-    const int paddingY = qMax(4, qCeil(bounded.height() * 0.025));
-    return bounded.adjusted(-paddingX, -paddingY, paddingX, paddingY)
+    const int paddingX = qMax(4, qCeil(bounded.width() * 0.02));
+    const int paddingTop = qMax(8, qCeil(bounded.height() * 0.08));
+    const int paddingBottom = qMax(4, qCeil(bounded.height() * 0.04));
+    return bounded.adjusted(-paddingX, -paddingTop, paddingX, paddingBottom)
         .intersected(QRect(QPoint(0, 0), imageSize));
 }
 
@@ -541,10 +542,9 @@ void CameraOcrClient::imageSaved(int, const QString &fileName)
     emit captured(recognitionPath);
     emit stageChanged(QStringLiteral("recognizing"),
                       QString::fromWCharArray(L"\u62cd\u7167\u5b8c\u6210\uff0c\u6b63\u5728\u8bc6\u522b\u8868\u683c\u3002"));
-    m_ocr->recognize(recognitionPath,
-                     m_requestDirectory,
-                     false,
-                     m_tableRegion.isValid());
+    m_ocr->recognizeCameraPhoto(recognitionPath,
+                                m_requestDirectory,
+                                m_tableRegion.isValid());
 }
 
 void CameraOcrClient::captureReadyChanged(bool ready)
@@ -614,6 +614,7 @@ void CameraOcrClient::ocrRequestFailed(int,
     const bool insufficientMemory = errorCode == QStringLiteral("INSUFFICIENT_MEMORY");
     if (!insufficientMemory
         && retryable
+        && !m_tableRegion.isValid()
         && m_ocrRetryCount < 1
         && QFileInfo::exists(m_capturePath)) {
         ++m_ocrRetryCount;
@@ -625,10 +626,9 @@ void CameraOcrClient::ocrRequestFailed(int,
                 return;
             m_ocrRetryPending = false;
             if (!m_ocr->isBusy())
-                m_ocr->recognize(
+                m_ocr->recognizeCameraPhoto(
                     m_capturePath,
                     m_requestDirectory,
-                    false,
                     m_tableRegion.isValid()
                         && m_capturePath != m_originalCapturePath);
         });
@@ -654,17 +654,20 @@ void CameraOcrClient::ocrRequestFailed(int,
                 QStringLiteral("camera-table-retry.png"));
             if (!expandedTable.isNull() && expandedTable.save(retryPath, "PNG")) {
                 m_regionFallbackAttempted = true;
-                m_ocrRetryCount = 0;
+                m_ocrRetryCount = 1;
+                m_ocrRetryPending = true;
                 m_capturePath = retryPath;
                 emit stageChanged(
                     QStringLiteral("table_region_fallback"),
                     QString::fromWCharArray(L"框选区域首次识别未形成可靠结果，正在扩大少量边缘后重试。"));
                 QTimer::singleShot(300, this, [this]() {
+                    if (!m_ocrRetryPending)
+                        return;
+                    m_ocrRetryPending = false;
                     if (!m_ocr->isBusy())
-                        m_ocr->recognize(
+                        m_ocr->recognizeCameraPhoto(
                             m_capturePath,
                             m_requestDirectory,
-                            false,
                             true);
                 });
                 return;

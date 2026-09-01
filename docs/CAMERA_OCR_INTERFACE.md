@@ -68,6 +68,10 @@ ocr->captureAndRecognize();
 坐标范围为 `0.0～1.0`。接口会在高清原始照片上裁剪，不会对预览图做低清放大。识别整张照片时调用 `clearTableRegion()`。
 框选区域首次识别异常时，接口只会扩大少量框选边缘后重试，不会退回整张多表照片。
 
+框选坐标必须先由产品界面从屏幕坐标换算为最终照片的归一化坐标。接口会额外保留顶部标题安全边距。不要把屏幕像素坐标直接传给 `setTableRegion()`。
+
+`CameraOcrClient` 已固定使用摄像头照片入口。若直接使用底层 `OcrTableClient`：普通摄像头照片或仅做矩形框选裁剪的图片调用 `recognizeCameraPhoto()`；只有已经完成透视矫正的图片才能调用 `recognizeRectifiedTable()`。不要通过布尔值猜测图片是否已经矫正。
+
 ## 3. 返回数据
 
 - `rows`：表格行数；
@@ -76,6 +80,10 @@ ocr->captureAndRecognize();
 - `cells[row][column].text`：单元格文字；
 - `spans`：合并单元格信息；
 - `response`：完整识别结果。
+
+`response["memory_mode"]` 为 `normal` 或 `low_memory`。可用内存低于4 GB时，后端自动使用串行小批量模式，识别与复核步骤不变，但耗时可能增加；只有物理内存低于1.5 GB或提交空间低于1 GB时才返回 `INSUFFICIENT_MEMORY`。
+
+接口每次识别启动一个独立的 `OcrBackend.exe`，返回结果后进程退出，由系统回收OpenVINO模型和推理缓存；请求结束时后端还会清理图片证据、网格缓存并执行垃圾回收。框选识别最多执行“首次识别+扩边重试”两次，内存不足不自动重试。
 
 ## 4. 添加和修改数据
 

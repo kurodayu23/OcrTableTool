@@ -120,6 +120,26 @@ int OcrTableClient::recognize(const QString &imagePath,
     return startRequest(QStringLiteral("recognize"), request, 0);
 }
 
+int OcrTableClient::recognizeCameraPhoto(const QString &imagePath,
+                                         const QString &outputDirectory,
+                                         bool selectedTableRegion)
+{
+    return recognize(imagePath,
+                     outputDirectory,
+                     false,
+                     selectedTableRegion);
+}
+
+int OcrTableClient::recognizeRectifiedTable(const QString &imagePath,
+                                            const QString &outputDirectory,
+                                            bool selectedTableRegion)
+{
+    return recognize(imagePath,
+                     outputDirectory,
+                     true,
+                     selectedTableRegion);
+}
+
 int OcrTableClient::exportXlsx(const QString &outputPath,
                                const QJsonArray &cells,
                                const QJsonArray &spans)

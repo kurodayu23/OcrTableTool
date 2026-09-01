@@ -229,7 +229,7 @@ private slots:
         QVERIFY2(client.setTableRegion(region, &errorMessage), qPrintable(errorMessage));
         QCOMPARE(client.tableRegion(), region);
         QCOMPARE(client.resolvedTableRegion(QSize(1000, 500)),
-                 QRect(67, 51, 866, 378));
+                 QRect(63, 31, 874, 404));
         QVERIFY(errorMessage.isEmpty());
 
         QVERIFY(!client.setTableRegion(QRectF(-0.1, 0.1, 0.5, 0.5), &errorMessage));
