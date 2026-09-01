@@ -90,7 +90,9 @@ stderr : 日志，不属于协议
 - `input_rectified=true` 表示输入图已经完成透视矫正。
 - `selected_table_region=true` 表示输入图来自用户框选的单个表格区域，后端会启用框选区域的运动模糊恢复路线。
 
-成功响应的稳定业务字段：`rows`、`columns`、`cells`、`spans`、`recognition_state`、`publication_blocked`、`publication_block_reasons`、`structure_verified`、`structure_certificate`、`image_quality`、`rectified_image`、`elapsed_seconds`、`review_cell_count`。
+成功响应的稳定业务字段：`rows`、`columns`、`cells`、`spans`、`recognition_state`、`publication_blocked`、`publication_block_reasons`、`structure_verified`、`structure_certificate`、`image_quality`、`rectified_image`、`elapsed_seconds`、`review_cell_count`、`memory_mode`。
+
+`memory_mode=normal` 使用正常批量；`memory_mode=low_memory` 在可用内存低于4 GB时使用串行小批量，识别与复核步骤不变。只有物理内存低于1.5 GB或提交空间低于1 GB时才返回 `INSUFFICIENT_MEMORY`。
 
 单元格结构：
 

@@ -127,7 +127,8 @@
         },
         "rectified_image": {"type": "string", "minLength": 1},
         "elapsed_seconds": {"type": "number", "minimum": 0},
-        "review_cell_count": {"type": "integer", "minimum": 0}
+        "review_cell_count": {"type": "integer", "minimum": 0},
+        "memory_mode": {"enum": ["normal", "low_memory"]}
       },
       "additionalProperties": true
     }

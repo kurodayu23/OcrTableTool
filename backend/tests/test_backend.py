@@ -415,13 +415,37 @@ class TablePipelineTests(unittest.TestCase):
         self.assertEqual(response["status"], "ok")
         self.assertTrue(response["warmed_up"])
 
-    def test_low_memory_preflight_stops_before_model_loading(self):
+    def test_low_memory_preflight_uses_serial_small_batches(self):
+        gibibyte = 1024**3
+        with patch.object(
+            ocr_backend,
+            "_available_memory_bytes",
+            return_value=(3 * gibibyte, 3 * gibibyte),
+        ):
+            mode = ocr_backend._require_recognition_memory_headroom()
+
+        self.assertEqual(mode, "low_memory")
+        self.assertEqual(ocr_backend._MEDIUM_RECOGNITION_BATCH_SIZE, 4)
+        self.assertEqual(ocr_backend._SERVER_RECOGNITION_BATCH_SIZE, 4)
+        self.assertEqual(ocr_backend._RECOGNITION_CALL_GROUP_SIZE, 8)
+        self.assertEqual(ocr_backend._RECOGNITION_INFERENCE_THREADS, 1)
+        with patch.object(
+            ocr_backend,
+            "_available_memory_bytes",
+            return_value=(8 * gibibyte, 8 * gibibyte),
+        ):
+            self.assertEqual(
+                ocr_backend._require_recognition_memory_headroom(),
+                "normal",
+            )
+
+    def test_critical_memory_preflight_stops_before_model_loading(self):
         gibibyte = 1024**3
         with (
             patch.object(
                 ocr_backend,
                 "_available_memory_bytes",
-                return_value=(3 * gibibyte, 8 * gibibyte),
+                return_value=(gibibyte // 2, 8 * gibibyte),
             ),
             patch.object(ocr_backend, "_engines") as engines,
         ):
@@ -3122,7 +3146,7 @@ class TablePipelineTests(unittest.TestCase):
             image, columns, rows, grid, confidence, evidence, spans
         )
 
-        self.assertEqual(grid[0], ["无框浅线登记-2026-02批次"] + [""] * 8)
+        self.assertEqual(grid[0], ["无框浅线登记 — 2026-02 批次"] + [""] * 8)
         self.assertEqual(
             grid[1],
             ["基础信息", "", "", "", "目标与测量", "", "", "", "过程记录"],
@@ -4129,6 +4153,110 @@ class TablePipelineTests(unittest.TestCase):
 
         self.assertEqual(repaired, {(1, 0)})
         self.assertEqual(grid[1][0], "项目")
+
+    def test_certified_header_consensus_accepts_four_strong_small_views(self):
+        ocr_backend._load_runtime()
+        grid = [
+            ["非法设备频平", "非法设备编号", "裁判确认"],
+            ["出发时间", "", ""],
+            ["返回时间", "", ""],
+        ]
+        confidence = [[0.77, 0.99, 0.99], [0.99, 0.0, 0.0], [0.99, 0.0, 0.0]]
+        image = np.full((120, 360, 3), 245, dtype=np.uint8)
+        small = SimpleNamespace(
+            txts=["非法设备频率"] * 5,
+            scores=[0.86, 0.85, 0.88, 0.84, 0.83],
+            imgs=None,
+        )
+        empty = SimpleNamespace(txts=[""] * 5, scores=[0.0] * 5, imgs=None)
+        engine = SimpleNamespace(
+            fast_text_rec=Mock(return_value=small),
+            text_rec=Mock(return_value=empty),
+            server_text_rec=Mock(return_value=empty),
+        )
+
+        repaired, _ = ocr_backend._repair_certified_header_multiview_consensus(
+            image,
+            grid,
+            confidence,
+            [0, 120, 240, 360],
+            [0, 40, 80, 120],
+            engine,
+        )
+
+        self.assertEqual(repaired, {(0, 0)})
+        self.assertEqual(grid[0][0], "非法设备频率")
+
+    def test_certified_header_consensus_accepts_two_models_with_near_small_text(self):
+        ocr_backend._load_runtime()
+        grid = [
+            ["非法设备频率", "非法设备编号", "裁判确以（或）"],
+            ["出发时间", "", ""],
+            ["返回时间", "", ""],
+        ]
+        confidence = [[0.99, 0.99, 0.77], [0.99, 0.0, 0.0], [0.99, 0.0, 0.0]]
+        image = np.full((120, 360, 3), 245, dtype=np.uint8)
+        small = SimpleNamespace(
+            txts=["裁判确认（V或）"] * 5,
+            scores=[0.85] * 5,
+            imgs=None,
+        )
+        confirmed = SimpleNamespace(
+            txts=["", "", "", "", "裁判确认（√ 或×）"],
+            scores=[0.0, 0.0, 0.0, 0.0, 0.94],
+            imgs=None,
+        )
+        engine = SimpleNamespace(
+            fast_text_rec=Mock(return_value=small),
+            text_rec=Mock(return_value=confirmed),
+            server_text_rec=Mock(return_value=confirmed),
+        )
+
+        repaired, _ = ocr_backend._repair_certified_header_multiview_consensus(
+            image,
+            grid,
+            confidence,
+            [0, 120, 240, 360],
+            [0, 40, 80, 120],
+            engine,
+        )
+
+        self.assertEqual(repaired, {(0, 2)})
+        self.assertEqual(grid[0][2], "裁判确认（√ 或×）")
+
+    def test_last_column_overflow_recovers_only_longer_prefix_consensus(self):
+        ocr_backend._load_runtime()
+        image = np.full((120, 240, 3), 255, dtype=np.uint8)
+        cv2.putText(
+            image,
+            "TAIL",
+            (184, 66),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            (0, 0, 0),
+            1,
+        )
+        grid = [["编号", "备注"], ["1", "VISIBLE"], ["2", ""]]
+        confidence = [[0.99, 0.99], [0.99, 0.77], [0.99, 0.0]]
+        output = SimpleNamespace(
+            txts=["VISIBLE-LONG-TEXT"] * 5,
+            scores=[0.99, 0.98, 0.97, 0.96, 0.95],
+            imgs=None,
+        )
+        engine = SimpleNamespace(fast_text_rec=Mock(return_value=output))
+
+        repaired, scores = ocr_backend._recover_last_column_overflow_text(
+            image,
+            grid,
+            confidence,
+            [0, 80, 180],
+            [0, 40, 80, 120],
+            engine,
+        )
+
+        self.assertEqual(repaired, {(1, 1)})
+        self.assertEqual(grid[1][1], "VISIBLE-LONG-TEXT")
+        self.assertEqual(len(scores), 5)
 
     def test_leading_glyph_omission_multiview_restores_repeated_peer(self):
         ocr_backend._load_runtime()
@@ -5351,6 +5479,40 @@ class TablePipelineTests(unittest.TestCase):
             )
         )
 
+    def test_page_rows_prove_one_fused_spatial_column(self):
+        spatial_grid = [
+            ["标题", "", "", ""],
+            ["编号", "名称", "日期", "状态"],
+            *[
+                [str(row), f"设备{row}", f"2026-08-{row:02d}", "正常"]
+                for row in range(1, 8)
+            ],
+        ]
+        page_grid = [
+            ["标题", "", ""],
+            ["编号", "名称", "日期状态"],
+            *[
+                [str(row), f"设备{row}", f"2026-08-{row:02d}正常"]
+                for row in range(1, 8)
+            ],
+        ]
+
+        self.assertTrue(
+            ocr_backend._page_rows_support_one_column_spatial_recovery(
+                page_grid,
+                spatial_grid,
+            )
+        )
+        unrelated = [list(row) for row in spatial_grid]
+        for row in range(2, len(unrelated)):
+            unrelated[row][1] = f"其他{row}"
+        self.assertFalse(
+            ocr_backend._page_rows_support_one_column_spatial_recovery(
+                page_grid,
+                unrelated,
+            )
+        )
+
     def test_dense_axis_aligned_grid_overrides_dark_screenshot_chrome(self):
         ocr_backend._load_runtime()
         image = np.full((1068, 1857, 3), 245, dtype=np.uint8)
@@ -5420,6 +5582,29 @@ class TablePipelineTests(unittest.TestCase):
             (len(recovered[1]) - 1, len(recovered[0]) - 1),
             (24, 9),
         )
+
+    def test_motion_grid_does_not_replace_a_normal_grid_without_motion_signature(self):
+        ocr_backend._load_runtime()
+        rng = np.random.default_rng(20260831)
+        image = rng.integers(0, 256, size=(360, 480, 3), dtype=np.uint8)
+        current = (
+            [0, 120, 240, 360, 479],
+            [0, 90, 180, 270, 359],
+            np.full_like(image, 255),
+        )
+
+        with patch.object(
+            ocr_backend.pipeline,
+            "extract_ruled_grid",
+            side_effect=AssertionError("non-motion image must keep its certified grid"),
+        ):
+            recovered = ocr_backend._recover_motion_blurred_photo_grid(
+                image,
+                current,
+                maximum_cells=720,
+            )
+
+        self.assertIsNone(recovered)
 
     def test_dense_axis_aligned_grid_accepts_a_bounded_top_frame_margin(self):
         ocr_backend._load_runtime()
@@ -5909,10 +6094,34 @@ class TablePipelineTests(unittest.TestCase):
         self.assertIsNotNone(recovered)
         values, scores, adjusted_geometry = recovered
         self.assertEqual((len(values), len(values[0])), (12, 7))
-        self.assertEqual(values[0][0], "审批勾选表单一2026-09批次")
+        self.assertEqual(values[0][0], "审批勾选表单 — 2026-09 批次")
         self.assertTrue(all(not value for value in values[0][1:]))
         self.assertEqual(values[10][0], "8")
         self.assertEqual(scores[10][0], 0.77)
+        self.assertEqual(len(adjusted_geometry["anchors"]), 7)
+
+    def test_review_recovery_accepts_fused_chinese_month_title(self):
+        grid = [
+            ["1", "A", "B", "C 工程参数配置", "2026年03月 D", "E", "F", ""],
+            ["2", "序号", "设备号", "名称", "数量", "状态", "负责人", "备注"],
+            *[
+                [str(row + 1), str(row - 1), f"AP-{row:03d}", "设备", "1", "正常", "张伟", ""]
+                for row in range(2, 12)
+            ],
+        ]
+        confidence = [[0.99 if value else -1.0 for value in row] for row in grid]
+        geometry = {
+            "anchors": [float(index * 100 + 50) for index in range(8)],
+            "row_centers": [float(index * 30 + 15) for index in range(12)],
+        }
+
+        recovered = ocr_backend._repair_fused_spreadsheet_ruler_title_for_review(
+            grid, confidence, geometry
+        )
+
+        self.assertIsNotNone(recovered)
+        values, _, adjusted_geometry = recovered
+        self.assertEqual(values[0][0], "工程参数配置  2026年03月")
         self.assertEqual(len(adjusted_geometry["anchors"]), 7)
 
     def test_standalone_row_ruler_requires_independent_business_ordinal(self):
@@ -6690,6 +6899,97 @@ class TablePipelineTests(unittest.TestCase):
         )
         self.assertEqual(spaced_grid[0][0], "146****2001")
 
+    def test_adjacent_duplicate_suffix_spill_preserves_decimal_before_number(self):
+        grid = [["568.950", "50", "类型20"]]
+        confidence = [[0.99, 0.99, 0.99]]
+
+        repaired = ocr_backend._trim_adjacent_duplicate_suffix_spills(
+            grid,
+            confidence,
+        )
+
+        self.assertEqual(repaired, set())
+        self.assertEqual(grid[0][0], "568.950")
+
+    def test_blank_repeated_header_row_fill_is_cleared_by_physical_ink(self):
+        ocr_backend._load_runtime()
+        image = np.full((200, 400, 3), 255, dtype=np.uint8)
+        cv2.putText(
+            image,
+            "META",
+            (12, 72),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 0, 0),
+            2,
+        )
+        grid = [
+            ["标题", "", "", ""],
+            ["META", "", "SITE", ""],
+            ["META", "", "SITE", ""],
+            ["编号", "频率", "类型", "状态"],
+        ]
+        cv2.putText(
+            image,
+            "SITE",
+            (212, 72),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 0, 0),
+            2,
+        )
+        confidence = [[0.99 if value else 0.0 for value in row] for row in grid]
+
+        removed = ocr_backend._remove_blank_repeated_header_row_fills(
+            image,
+            grid,
+            confidence,
+            [0, 100, 200, 300, 400],
+            [0, 50, 100, 150, 200],
+        )
+
+        self.assertEqual(removed, {(2, 0), (2, 2)})
+        self.assertEqual(grid[2], ["", "", "", ""])
+
+    def test_repeated_metadata_before_dense_header_is_cleared(self):
+        ocr_backend._load_runtime()
+        image = np.full((200, 400, 3), 220, dtype=np.uint8)
+        grid = [
+            ["标题", "", "", ""],
+            ["任务编号：JC-01", "", "地点：二号站", ""],
+            ["任务编号：JC-01", "", "地点：二号站", ""],
+            ["编号", "频率", "类型", "状态"],
+        ]
+        confidence = [[0.99 if value else 0.0 for value in row] for row in grid]
+
+        removed = ocr_backend._remove_blank_repeated_header_row_fills(
+            image,
+            grid,
+            confidence,
+            [0, 100, 200, 300, 400],
+            [0, 50, 100, 150, 200],
+        )
+
+        self.assertEqual(removed, {(2, 0), (2, 2)})
+        self.assertEqual(grid[2], ["", "", "", ""])
+
+        structural_grid = [
+            ["标题", "", "", ""],
+            ["任务编号：JC-01", "", "地点：二号站", ""],
+            ["任务编号：JC-01", "", "地点：二号站", ""],
+            ["编号", "频率", "类型", "状态"],
+        ]
+        structural_confidence = [
+            [0.99 if value else 0.0 for value in row]
+            for row in structural_grid
+        ]
+        self.assertEqual(
+            ocr_backend._clear_repeated_metadata_before_dense_header(
+                structural_grid, structural_confidence
+            ),
+            {(2, 0), (2, 2)},
+        )
+
     def test_patterned_adjacent_spills_split_headers_names_and_status(self):
         grid = [
             ["学", "学号姓名", "上期读数本期读数", ""],
@@ -6861,6 +7161,51 @@ class TablePipelineTests(unittest.TestCase):
         self.assertEqual(
             [flow_grid[row][1] for row in range(2, 7)],
             ["李娜", "陈晨", "张伟", "王强", "陈晨"],
+        )
+
+        fused_rows = [
+            ["编号", "设备", "状态", "负责人", "备注"],
+            ["1", "设备A", "正常", "张伟", ""],
+            ["2", "设备B 设备C", "待复核 已确认", "李娜 王强", "备注2"],
+            ["3", "", "", "", "备注3"],
+            ["4", "设备D", "正常", "赵敏", ""],
+            ["5", "设备E", "已完成", "陈晨", ""],
+        ]
+        fused_confidence = [
+            [0.99 if value else 0.0 for value in row] for row in fused_rows
+        ]
+        repaired_fusions = ocr_backend._split_whitespace_fused_adjacent_rows(
+            fused_rows,
+            fused_confidence,
+        )
+        self.assertTrue(repaired_fusions)
+        self.assertEqual(
+            fused_rows[2][1:4], ["设备B", "待复核", "李娜"]
+        )
+        self.assertEqual(
+            fused_rows[3][1:4], ["设备C", "已确认", "王强"]
+        )
+
+        fused_columns = [
+            ["编号", "设备", "故障描述", "原因分类", "状态"],
+            ["1", "A", "现场复核", "A区", "正常"],
+            ["2", "B", "", "更换连接线 二车间", "待复核"],
+            ["3", "C", "", "参数轻微波动 华东仓", "已确认"],
+            ["4", "D", "", "等待供应商 夜班", "异常"],
+            ["5", "E", "无异常", "B区", "正常"],
+            ["6", "F", "现场复核", "A区", "正常"],
+            ["7", "G", "无异常", "B区", "正常"],
+        ]
+        fused_column_confidence = [
+            [0.99 if value else 0.0 for value in row] for row in fused_columns
+        ]
+        repaired_columns = ocr_backend._split_whitespace_fused_adjacent_columns(
+            fused_columns,
+            fused_column_confidence,
+        )
+        self.assertTrue(repaired_columns)
+        self.assertEqual(
+            fused_columns[2][2:4], ["更换连接线", "二车间"]
         )
 
     def test_adjacent_duplicate_suffix_spill_does_not_trim_textual_prefix(self):
@@ -7763,7 +8108,7 @@ class TablePipelineTests(unittest.TestCase):
             image, columns, rows, grid, confidence, evidence
         )
 
-        self.assertEqual(grid[0], ["教学课表成绩-2026-07 批次"] + [""] * 8)
+        self.assertEqual(grid[0], ["教学课表成绩 — 2026-07 批次"] + [""] * 8)
         self.assertEqual(confidence[0][0], 0.97)
         self.assertEqual(spans[0]["role"], "title")
         self.assertEqual(spans[0]["column_span"], 9)
@@ -8103,7 +8448,7 @@ class TablePipelineTests(unittest.TestCase):
             confusable_dash,
             confusable_confidence,
         )
-        self.assertEqual(confusable_dash[0][0], "安全检查一2026-05批次")
+        self.assertEqual(confusable_dash[0][0], "安全检查 — 2026-05 批次")
         self.assertEqual(confusable_spans[0]["column_span"], 8)
 
         split_date = [list(row) for row in grid]
@@ -8531,6 +8876,12 @@ class TablePipelineTests(unittest.TestCase):
                 "教学课表成绩— 2026-07批次"
             ),
             "教学课表成绩 — 2026-07 批次",
+        )
+        self.assertEqual(
+            ocr_backend._normalize_certified_batch_title(
+                "库存出入库一2026-10批次"
+            ),
+            "库存出入库 — 2026-10 批次",
         )
         self.assertEqual(
             ocr_backend._normalize_certified_batch_title("设备台账—第一批"),
@@ -9005,6 +9356,216 @@ class TablePipelineTests(unittest.TestCase):
         self.assertEqual(grid[3][1], "已审")
         self.assertEqual(confidence[3][1], 0.77)
         self.assertEqual(scores, [0.99, 0.90])
+
+    def test_two_repeated_status_typos_are_repaired_from_stronger_peer(self):
+        ocr_backend._load_runtime()
+        grid = [
+            ["编号", "审核状态"],
+            ["1", "已完成"],
+            ["2", "已完成"],
+            ["3", "已完成"],
+            ["4", "已完成"],
+            ["5", "己完成"],
+            ["6", "己完成"],
+        ]
+        confidence = [[0.99, 0.99] for _ in grid]
+        image = np.full((350, 200, 3), 245, dtype=np.uint8)
+        engine = SimpleNamespace(
+            text_rec=lambda _: SimpleNamespace(txts=["已完成"], scores=[0.99]),
+            server_text_rec=lambda _: SimpleNamespace(txts=["已完成"], scores=[0.98]),
+        )
+        with patch.object(
+            ocr_backend,
+            "_tight_text_crop",
+            return_value=np.full((12, 40, 3), 220, dtype=np.uint8),
+        ):
+            scores = ocr_backend._repair_repeated_semantic_singletons(
+                image,
+                grid,
+                confidence,
+                [0, 100, 200],
+                [0, 50, 100, 150, 200, 250, 300, 350],
+                engine,
+            )
+
+        self.assertEqual([grid[5][1], grid[6][1]], ["已完成", "已完成"])
+        self.assertEqual([confidence[5][1], confidence[6][1]], [0.77, 0.77])
+        self.assertEqual(scores, [0.99, 0.98, 0.99, 0.98])
+
+    def test_repeated_categorical_value_repairs_one_missing_character_with_model_agreement(self):
+        ocr_backend._load_runtime()
+        grid = [
+            ["编号", "工作区域"],
+            ["1", "二号线"],
+            ["2", "二号线"],
+            ["3", "二号线"],
+            ["4", "二号线"],
+            ["5", "二号线"],
+            ["6", "第二"],
+        ]
+        confidence = [[0.99, 0.99] for _ in grid]
+        image = np.full((350, 200, 3), 245, dtype=np.uint8)
+        engine = SimpleNamespace(
+            text_rec=lambda _: SimpleNamespace(txts=["二号线"], scores=[0.99]),
+            server_text_rec=lambda _: SimpleNamespace(txts=["☑二号线"], scores=[0.98]),
+        )
+        with patch.object(
+            ocr_backend,
+            "_tight_text_crop",
+            return_value=np.full((12, 40, 3), 220, dtype=np.uint8),
+        ):
+            scores = ocr_backend._repair_repeated_semantic_singletons(
+                image,
+                grid,
+                confidence,
+                [0, 100, 200],
+                [0, 50, 100, 150, 200, 250, 300, 350],
+                engine,
+            )
+
+        self.assertEqual(grid[6][1], "二号线")
+        self.assertEqual(confidence[6][1], 0.77)
+        self.assertEqual(scores, [0.99, 0.98])
+
+    def test_trailing_single_metadata_label_moves_to_its_detail_column(self):
+        grid = [
+            ["标题", "", "", "", "", ""],
+            ["基础信息", "", "过程记录", "", "追溯信息", ""],
+            ["编号", "名称", "频率", "结果", "状态", "备注"],
+            ["1", "A", "100", "通过", "正常", "无"],
+            ["2", "B", "200", "通过", "正常", "无"],
+            ["3", "C", "300", "通过", "正常", "无"],
+        ]
+        confidence = [[0.99 for _ in row] for row in grid]
+
+        repaired = ocr_backend._move_trailing_single_group_label(
+            grid,
+            confidence,
+        )
+
+        self.assertEqual(repaired, {(1, 5)})
+        self.assertEqual(grid[1][4:], ["", "追溯信息"])
+
+    def test_trailing_status_group_label_is_not_moved_without_span_evidence(self):
+        grid = [
+            ["标题", "", "", "", "", ""],
+            ["基础信息", "", "过程记录", "", "状态判定", ""],
+            ["编号", "名称", "频率", "结果", "状态", "备注"],
+            ["1", "A", "100", "通过", "正常", "无"],
+            ["2", "B", "200", "通过", "正常", "无"],
+            ["3", "C", "300", "通过", "正常", "无"],
+        ]
+        confidence = [[0.99 for _ in row] for row in grid]
+
+        repaired = ocr_backend._move_trailing_single_group_label(
+            grid,
+            confidence,
+        )
+
+        self.assertEqual(repaired, set())
+        self.assertEqual(grid[1][4:], ["状态判定", ""])
+
+    def test_trailing_quality_label_moves_only_with_a_physical_final_boundary(self):
+        ocr_backend._load_runtime()
+        grid = [
+            ["标题", "", "", "", "", ""],
+            ["基础信息", "", "过程记录", "", "质量判定", ""],
+            ["编号", "名称", "频率", "结果", "状态", "备注"],
+            ["1", "A", "100", "通过", "正常", "无"],
+            ["2", "B", "200", "通过", "正常", "无"],
+            ["3", "C", "300", "通过", "正常", "无"],
+        ]
+        confidence = [[0.99 for _ in row] for row in grid]
+        image = np.full((120, 120, 3), 255, dtype=np.uint8)
+        cv2.line(image, (100, 20), (100, 40), (0, 0, 0), 2)
+
+        repaired = ocr_backend._move_trailing_single_group_label(
+            grid,
+            confidence,
+            image=image,
+            columns=[0, 20, 40, 60, 80, 100, 119],
+            rows=[0, 20, 40, 60, 80, 100, 119],
+        )
+
+        self.assertEqual(repaired, {(1, 5)})
+        self.assertEqual(grid[1][4:], ["", "质量判定"])
+
+    def test_cell_local_warning_does_not_claim_whole_table_geometry_risk(self):
+        self.assertTrue(
+            ocr_backend._warning_is_cell_local(
+                "有可见内容但未能安全确认的单元格（R4C2）已留空或标黄。"
+            )
+        )
+        self.assertFalse(
+            ocr_backend._warning_is_cell_local(
+                "检测到疑似列融合，结果已保留供人工调整。"
+            )
+        )
+
+    def test_physical_header_reanchor_prefers_complete_overlapping_fragment(self):
+        ocr_backend._load_runtime()
+        grid = [[""] * 11 for _ in range(7)]
+        grid[1][2] = "基础信息"
+        grid[1][6] = "目标"
+        grid[1][7] = "目标与测量"
+        grid[1][9] = "过程记录"
+        grid[1][10] = "记录"
+        grid[2] = [f"字段{column}" for column in range(11)]
+        for row in range(3, 7):
+            grid[row] = [f"值{row}-{column}" for column in range(11)]
+        confidence = [[0.99 if value else 0.0 for value in row] for row in grid]
+        image = np.full((140, 220, 3), 255, dtype=np.uint8)
+        columns = [20 * index for index in range(12)]
+        rows = [20 * index for index in range(8)]
+        for boundary in (columns[0], columns[5], columns[9], columns[-1]):
+            cv2.line(image, (boundary, 0), (boundary, 139), (0, 0, 0), 2)
+        spans = []
+
+        repaired = ocr_backend._reanchor_physical_horizontal_header_spans(
+            image,
+            grid,
+            confidence,
+            spans,
+            columns,
+            rows,
+        )
+
+        self.assertEqual(repaired, {(1, 0), (1, 5), (1, 9)})
+        self.assertEqual(
+            [grid[1][0], grid[1][5], grid[1][9]],
+            ["基础信息", "目标与测量", "过程记录"],
+        )
+        self.assertEqual(
+            [(span["column"], span["column_span"]) for span in spans],
+            [(0, 5), (5, 4), (9, 2)],
+        )
+
+    def test_bounded_ordinal_rereads_two_vertical_strokes_as_eleven(self):
+        ocr_backend._load_runtime()
+        grid = [["序号", "名称"]] + [
+            [str(index) if index != 11 else "II", f"项目{index}"]
+            for index in range(1, 13)
+        ]
+        confidence = [[0.99, 0.99] for _ in grid]
+        image = np.full((260, 200, 3), 245, dtype=np.uint8)
+        engine = SimpleNamespace(
+            text_rec=lambda request: SimpleNamespace(
+                txts=["11"] * len(request.img),
+                scores=[0.99] * len(request.img),
+            )
+        )
+
+        recovered = ocr_backend._recover_bounded_ordinal_and_vocabulary_cells(
+            image,
+            grid,
+            confidence,
+            [0, 100, 200],
+            [20 * index for index in range(14)],
+            engine,
+        )
+
+        self.assertIn((11, 0, "11"), recovered)
+        self.assertEqual(grid[11][0], "11")
 
     def test_source_grid_must_span_most_of_frame_before_skipping_rectification(self):
         image = np.full((600, 800, 3), 255, dtype=np.uint8)
@@ -9653,7 +10214,7 @@ class TablePipelineTests(unittest.TestCase):
 
         self.assertEqual(confidence[1][0], 0.99)
 
-    def test_consistency_checks_restore_proven_measurement_trailing_zero(self):
+    def test_consistency_checks_mark_measurement_precision_without_padding(self):
         grid = [["序号", "电流/A"]] + [
             [str(index), "8.42" if index == 8 else f"{index}.125"]
             for index in range(1, 10)
@@ -9662,7 +10223,7 @@ class TablePipelineTests(unittest.TestCase):
 
         ocr_backend._apply_consistency_checks(grid, confidence)
 
-        self.assertEqual(grid[8][1], "8.420")
+        self.assertEqual(grid[8][1], "8.42")
         self.assertEqual(confidence[8][1], 0.77)
 
     def test_consistency_checks_do_not_pad_nonmeasurement_decimal(self):
@@ -9676,7 +10237,7 @@ class TablePipelineTests(unittest.TestCase):
 
         self.assertEqual(grid[8][1], "8.42")
 
-    def test_consistency_checks_restore_proven_financial_trailing_zero(self):
+    def test_consistency_checks_mark_financial_precision_without_padding(self):
         grid = [["序号", "费用类型"]] + [
             [str(index), "2712.1" if index == 8 else f"{index * 100}.25"]
             for index in range(1, 11)
@@ -9685,10 +10246,10 @@ class TablePipelineTests(unittest.TestCase):
 
         ocr_backend._apply_consistency_checks(grid, confidence)
 
-        self.assertEqual(grid[8][1], "2712.10")
+        self.assertEqual(grid[8][1], "2712.1")
         self.assertEqual(confidence[8][1], 0.77)
 
-    def test_consistency_checks_restore_proven_detection_limit_trailing_zero(self):
+    def test_consistency_checks_mark_detection_limit_precision_without_padding(self):
         grid = [["序号", "检出限"]] + [
             [str(index), "970.55" if index == 8 else f"{index}.125"]
             for index in range(1, 11)
@@ -9697,10 +10258,10 @@ class TablePipelineTests(unittest.TestCase):
 
         ocr_backend._apply_consistency_checks(grid, confidence)
 
-        self.assertEqual(grid[8][1], "970.550")
+        self.assertEqual(grid[8][1], "970.55")
         self.assertEqual(confidence[8][1], 0.77)
 
-    def test_consistency_checks_restore_proven_current_value_trailing_zero(self):
+    def test_consistency_checks_mark_current_value_precision_without_padding(self):
         grid = [["序号", "当前值"]] + [
             [str(index), "486.72" if index == 8 else f"{index}.125"]
             for index in range(1, 11)
@@ -9709,10 +10270,10 @@ class TablePipelineTests(unittest.TestCase):
 
         ocr_backend._apply_consistency_checks(grid, confidence)
 
-        self.assertEqual(grid[8][1], "486.720")
+        self.assertEqual(grid[8][1], "486.72")
         self.assertEqual(confidence[8][1], 0.77)
 
-    def test_consistency_checks_restore_proven_test_result_trailing_zero(self):
+    def test_consistency_checks_mark_test_result_precision_without_padding(self):
         for header in ("实测值", "偏差", "峰值", "复测值"):
             with self.subTest(header=header):
                 grid = [["序号", header]] + [
@@ -9723,7 +10284,7 @@ class TablePipelineTests(unittest.TestCase):
 
                 ocr_backend._apply_consistency_checks(grid, confidence)
 
-                self.assertEqual(grid[8][1], "486.720")
+                self.assertEqual(grid[8][1], "486.72")
                 self.assertEqual(confidence[8][1], 0.77)
 
     def test_consistency_checks_find_four_level_detail_header(self):
@@ -9746,7 +10307,7 @@ class TablePipelineTests(unittest.TestCase):
 
         ocr_backend._apply_consistency_checks(grid, confidence)
 
-        self.assertEqual(grid[11][1], "486.720")
+        self.assertEqual(grid[11][1], "486.72")
         self.assertEqual(confidence[11][1], 0.77)
 
     def test_consistency_checks_normalize_unique_structured_insertions(self):
@@ -10063,7 +10624,7 @@ class TablePipelineTests(unittest.TestCase):
 
         ocr_backend._apply_consistency_checks(grid, confidence)
 
-        self.assertEqual(grid[10][2], "8.420")
+        self.assertEqual(grid[10][2], "8.42")
 
     def test_dense_identifier_case_risks_select_lowercase_prefix_only(self):
         grid = [["序号", "设备编号"]] + [
@@ -15809,6 +16370,48 @@ class TablePipelineTests(unittest.TestCase):
         self.assertEqual(scores, [])
         self.assertEqual(grid, [["编号", "名称"], ["1", ""]])
 
+    def test_motion_refinement_finishes_each_model_family_before_switching(self):
+        ocr_backend._load_runtime()
+        grid = [[""] for _ in range(10)]
+        confidence = [[-1.0] for _ in grid]
+        crops = [np.full((12, 24, 3), 220, dtype=np.uint8) for _ in grid]
+        locations = [(row, 0, 0, 1) for row in range(len(grid))]
+        calls = []
+
+        def recognizer(name):
+            def run(request):
+                calls.append(name)
+                return SimpleNamespace(
+                    txts=["中"] * len(request.img),
+                    scores=[0.99] * len(request.img),
+                )
+
+            return run
+
+        engine = SimpleNamespace(
+            fast_text_rec=recognizer("mobile"),
+            text_rec=recognizer("medium"),
+            server_text_rec=recognizer("server"),
+        )
+        with patch.object(ocr_backend, "_MEDIUM_RECOGNITION_BATCH_SIZE", 4), patch.object(
+            ocr_backend,
+            "_wiener_motion_deblur_view",
+            side_effect=lambda gray, *_: gray,
+        ):
+            ocr_backend._refine_motion_blurred_ruled_lines(
+                grid,
+                confidence,
+                crops,
+                locations,
+                engine,
+            )
+
+        self.assertEqual(
+            calls,
+            ["mobile"] * 3 + ["medium"] * 3 + ["server"] * 3,
+        )
+        self.assertEqual(grid, [["中"] for _ in range(10)])
+
     def test_motion_refinement_never_replaces_a_horizontal_dash(self):
         grid = [["—", ""], ["", "正常"]]
         confidence = [[0.86, -1.0], [-1.0, 0.99]]
@@ -16428,6 +17031,29 @@ class TablePipelineTests(unittest.TestCase):
         self.assertEqual(result[1], [0.99, 0.88])
         self.assertEqual(result[2], [0.76, 0.95])
 
+    def test_local_structure_review_marks_only_explicit_cells(self):
+        confidence = [[0.99, 0.96], [0.94, 0.91], [0.89, 0.87]]
+
+        result = ocr_backend._apply_structure_review_policy(
+            [["标题", ""], ["区域1", "1"], ["", "2"]],
+            confidence,
+            structure_verified=False,
+            structural_warnings=["已恢复局部纵向合并单元格。"],
+            review_cells={(0, 0), (1, 0)},
+        )
+
+        self.assertEqual(result, [[0.77, 0.96], [0.77, 0.91], [0.89, 0.87]])
+
+        banner_only_confidence = [[0.99, 0.96], [0.94, 0.91]]
+        banner_only = ocr_backend._apply_structure_review_policy(
+            [["编号", "名称"], ["1", "设备"]],
+            banner_only_confidence,
+            structure_verified=False,
+            structural_warnings=["已按连续行列标尺恢复结构。"],
+            review_cells=set(),
+        )
+        self.assertEqual(banner_only, [[0.99, 0.96], [0.94, 0.91]])
+
     def test_strong_borderless_title_limits_review_to_risk_cells(self):
         grid = [
             ["设备状态表", "", ""],
@@ -17001,6 +17627,365 @@ class TablePipelineTests(unittest.TestCase):
         self.assertTrue(
             any(span["row"] == 0 and span["role"] == "title" for span in spans)
         )
+
+    def test_certified_screen_grid_recovers_one_prominent_centered_title(self):
+        ocr_backend._load_runtime()
+        grid = [
+            ["编号", "设备号", "频率", "状态"],
+            ["1", "AP-001", "560.125", "正常"],
+            ["2", "AP-002", "560.250", "在用"],
+        ]
+        confidence = [[0.99] * 4 for _ in grid]
+        spans = []
+        certificate = {
+            "source": "screen_physical_grid",
+            "row_offset": 0,
+            "column_offset": 0,
+            "row_boundaries": [60, 90, 120, 150],
+            "column_boundaries": [10, 80, 170, 260, 350],
+        }
+        output = SimpleNamespace(
+            boxes=[
+                np.asarray([[105, 12], [255, 12], [255, 39], [105, 39]]),
+                np.asarray([[18, 66], [60, 66], [60, 82], [18, 82]]),
+                np.asarray([[95, 66], [150, 66], [150, 82], [95, 82]]),
+            ],
+            txts=["设备维护记录表", "编号", "设备号"],
+            scores=[0.99, 0.99, 0.99],
+        )
+
+        recovered = ocr_backend._recover_title_above_certified_screen_grid(
+            grid, confidence, spans, certificate, output
+        )
+
+        self.assertTrue(recovered)
+        self.assertEqual(grid[0], ["设备维护记录表", "", "", ""])
+        self.assertEqual(len(grid), 4)
+        self.assertEqual(
+            spans,
+            [
+                {
+                    "row": 0,
+                    "column": 0,
+                    "row_span": 1,
+                    "column_span": 4,
+                    "role": "title",
+                }
+            ],
+        )
+
+    def test_certified_screen_grid_requires_visible_top_margin_before_page_probe(self):
+        ocr_backend._load_runtime()
+        image = np.full((120, 240, 3), 255, dtype=np.uint8)
+        certificate = {
+            "source": "screen_ruled_grid",
+            "row_offset": 0,
+            "column_offset": 0,
+            "row_boundaries": [50, 80, 110],
+            "column_boundaries": [0, 120, 239],
+        }
+        self.assertFalse(
+            ocr_backend._certified_screen_grid_has_top_margin_ink(
+                image, certificate
+            )
+        )
+        cv2.putText(
+            image,
+            "TITLE",
+            (70, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (0, 0, 0),
+            2,
+        )
+        self.assertTrue(
+            ocr_backend._certified_screen_grid_has_top_margin_ink(
+                image, certificate
+            )
+        )
+
+    def test_certified_screen_margin_recovers_title_without_page_detector(self):
+        ocr_backend._load_runtime()
+        image = np.full((160, 300, 3), 255, dtype=np.uint8)
+        cv2.putText(
+            image,
+            "TITLE",
+            (100, 35),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (0, 0, 0),
+            2,
+        )
+        grid = [
+            ["编号", "设备号", "状态"],
+            ["1", "AP-001", "正常"],
+            ["2", "AP-002", "在用"],
+        ]
+        confidence = [[0.99] * 3 for _ in grid]
+        spans = []
+        certificate = {
+            "source": "screen_ruled_grid",
+            "row_offset": 0,
+            "column_offset": 0,
+            "row_boundaries": [60, 90, 120, 150],
+            "column_boundaries": [0, 100, 200, 299],
+        }
+        output = SimpleNamespace(
+            txts=["设备维护记录表"] * 5,
+            scores=[0.99, 0.98, 0.97, 0.96, 0.95],
+            imgs=None,
+        )
+        engine = SimpleNamespace(fast_text_rec=Mock(return_value=output))
+
+        recovered, scores = ocr_backend._recover_title_from_certified_screen_margin(
+            image,
+            grid,
+            confidence,
+            spans,
+            certificate,
+            engine,
+        )
+
+        self.assertTrue(recovered)
+        self.assertEqual(grid[0], ["设备维护记录表", "", ""])
+        self.assertEqual(spans[0]["role"], "title")
+        self.assertEqual(len(scores), 5)
+
+    def test_certified_screen_grid_does_not_treat_metadata_as_title(self):
+        ocr_backend._load_runtime()
+        grid = [
+            ["编号", "设备号", "频率", "状态"],
+            ["1", "AP-001", "560.125", "正常"],
+        ]
+        confidence = [[0.99] * 4 for _ in grid]
+        spans = []
+        certificate = {
+            "source": "screen_physical_grid",
+            "row_offset": 0,
+            "column_offset": 0,
+            "row_boundaries": [60, 90, 120],
+            "column_boundaries": [10, 80, 170, 260, 350],
+        }
+        output = SimpleNamespace(
+            boxes=[
+                np.asarray([[25, 20], [120, 20], [120, 39], [25, 39]]),
+                np.asarray([[230, 20], [330, 20], [330, 39], [230, 39]]),
+                np.asarray([[18, 66], [60, 66], [60, 82], [18, 82]]),
+            ],
+            txts=["部门：综合组", "日期：2026-08", "编号"],
+            scores=[0.99, 0.99, 0.99],
+        )
+
+        recovered = ocr_backend._recover_title_above_certified_screen_grid(
+            grid, confidence, spans, certificate, output
+        )
+
+        self.assertFalse(recovered)
+        self.assertEqual(grid[0], ["编号", "设备号", "频率", "状态"])
+        self.assertEqual(spans, [])
+
+    def test_certified_screen_grid_recovers_local_vertical_merge(self):
+        ocr_backend._load_runtime()
+        image = np.full((330, 720, 3), 255, dtype=np.uint8)
+        columns = [10, 160, 400, 700]
+        rows = [10, 70, 130, 190, 250, 310]
+        for column in columns:
+            cv2.line(image, (column, rows[0]), (column, rows[-1]), (0, 0, 0), 2)
+        for index, row in enumerate(rows):
+            start_x = columns[1] if index in {2, 3} else columns[0]
+            cv2.line(image, (start_x, row), (columns[-1], row), (0, 0, 0), 2)
+        grid = [
+            ["区域", "序号", "设备号"],
+            ["", "1", "DEV-001"],
+            ["区域1", "2", "DEV-002"],
+            ["区域1", "3", "DEV-003"],
+            ["区域2", "4", "DEV-004"],
+        ]
+        confidence = [[0.99 if value else 0.0 for value in row] for row in grid]
+        spans = []
+        certificate = {
+            "source": "screen_ruled_grid",
+            "row_offset": 0,
+            "column_offset": 0,
+            "row_boundaries": rows,
+            "column_boundaries": columns,
+        }
+
+        recovered = ocr_backend._recover_certified_screen_vertical_spans(
+            image, grid, confidence, spans, certificate
+        )
+
+        self.assertTrue(recovered)
+        self.assertEqual(grid[1][0], "区域1")
+        self.assertEqual(grid[2][0], "")
+        self.assertEqual(grid[3][0], "")
+        self.assertIn(
+            {
+                "row": 1,
+                "column": 0,
+                "row_span": 3,
+                "column_span": 1,
+                "role": "group_header",
+            },
+            spans,
+        )
+
+    def test_certified_screen_grid_does_not_merge_globally_missing_row_rule(self):
+        ocr_backend._load_runtime()
+        image = np.full((210, 520, 3), 255, dtype=np.uint8)
+        columns = [10, 160, 330, 500]
+        rows = [10, 70, 130, 190]
+        for column in columns:
+            cv2.line(image, (column, rows[0]), (column, rows[-1]), (0, 0, 0), 2)
+        for index, row in enumerate(rows):
+            if index != 2:
+                cv2.line(image, (columns[0], row), (columns[-1], row), (0, 0, 0), 2)
+        grid = [
+            ["区域", "序号", "设备号"],
+            ["区域1", "1", "DEV-001"],
+            ["区域2", "2", "DEV-002"],
+        ]
+        confidence = [[0.99] * 3 for _ in grid]
+        spans = []
+        certificate = {
+            "source": "screen_ruled_grid",
+            "row_offset": 0,
+            "column_offset": 0,
+            "row_boundaries": rows,
+            "column_boundaries": columns,
+        }
+
+        recovered = ocr_backend._recover_certified_screen_vertical_spans(
+            image, grid, confidence, spans, certificate
+        )
+
+        self.assertFalse(recovered)
+        self.assertEqual(spans, [])
+
+    def test_physical_header_spans_reanchor_centered_group_text(self):
+        ocr_backend._load_runtime()
+        image = np.full((330, 630, 3), 255, dtype=np.uint8)
+        columns = [10, 110, 210, 310, 410, 510, 610]
+        rows = [10, 70, 130, 190, 250, 310]
+        for row in rows:
+            cv2.line(image, (columns[0], row), (columns[-1], row), (0, 0, 0), 2)
+        cv2.line(image, (columns[0], rows[0]), (columns[0], rows[-1]), (0, 0, 0), 2)
+        cv2.line(image, (columns[-1], rows[0]), (columns[-1], rows[-1]), (0, 0, 0), 2)
+        for index, column in enumerate(columns[1:-1], start=1):
+            top = rows[1] if index == 3 else rows[2]
+            cv2.line(image, (column, top), (column, rows[-1]), (0, 0, 0), 2)
+        grid = [
+            ["", "", "", "设备检查表", "", ""],
+            ["", "基础信息", "", "", "", "质量判定"],
+            ["序号", "设备号", "名称", "数量", "结果", "备注"],
+            ["1", "AP-001", "设备A", "1", "正常", ""],
+            ["2", "AP-002", "设备B", "2", "正常", ""],
+        ]
+        confidence = [[0.99 if value else 0.0 for value in row] for row in grid]
+        spans = [
+            {"row": 1, "column": 1, "row_span": 1, "column_span": 2, "role": "group_header"}
+        ]
+
+        recovered = ocr_backend._reanchor_physical_horizontal_header_spans(
+            image,
+            grid,
+            confidence,
+            spans,
+            columns,
+            rows,
+        )
+
+        self.assertEqual(recovered, {(0, 0), (1, 0), (1, 3)})
+        self.assertEqual(grid[0], ["设备检查表", "", "", "", "", ""])
+        self.assertEqual(grid[1], ["基础信息", "", "", "质量判定", "", ""])
+        self.assertEqual(
+            spans,
+            [
+                {"row": 0, "column": 0, "row_span": 1, "column_span": 6, "role": "title"},
+                {"row": 1, "column": 0, "row_span": 1, "column_span": 3, "role": "group_header"},
+                {"row": 1, "column": 3, "row_span": 1, "column_span": 3, "role": "group_header"},
+            ],
+        )
+
+    def test_physical_header_spans_split_combined_three_group_text(self):
+        ocr_backend._load_runtime()
+        image = np.full((260, 820, 3), 255, dtype=np.uint8)
+        columns = [10 + 100 * index for index in range(9)]
+        rows = [10, 60, 110, 160, 210, 250]
+        for row in rows:
+            cv2.line(image, (columns[0], row), (columns[-1], row), (0, 0, 0), 2)
+        for index, column in enumerate(columns):
+            if index in {0, 8}:
+                top = rows[0]
+            elif index in {4, 6}:
+                top = rows[1]
+            else:
+                top = rows[2]
+            cv2.line(image, (column, top), (column, rows[-1]), (0, 0, 0), 2)
+        grid = [
+            ["", "", "", "监测记录表", "", "", "", ""],
+            ["监测任务  频率配置  结果", "", "", "", "频率", "配置", "", "结果"],
+            ["编号", "任务", "人员", "备注", "下限", "上限", "状态", "结果"],
+            ["1", "A", "张伟", "", "1", "2", "正常", "通过"],
+            ["2", "B", "李娜", "", "3", "4", "正常", "通过"],
+        ]
+        confidence = [[0.99 if value else 0.0 for value in row] for row in grid]
+        spans = []
+
+        recovered = ocr_backend._reanchor_physical_horizontal_header_spans(
+            image, grid, confidence, spans, columns, rows
+        )
+
+        self.assertTrue({(1, 0), (1, 4), (1, 6)}.issubset(recovered))
+        self.assertEqual(
+            grid[1],
+            ["监测任务", "", "", "", "频率配置", "", "结果", ""],
+        )
+
+    def test_equal_pair_nested_header_recovers_repeated_labels(self):
+        grid = [
+            ["库存表", "", "", "", "", "", "", "", "", ""],
+            ["", "基础信息", "", "数量与金额", "", "", "过程记录", "", "状态判定", ""],
+            ["", "累计", "累计", "", "计划", "", "累计", "", "实际", ""],
+            ["序号", "编码", "名称", "仓库", "库位", "批次", "期初", "入库", "出库", "结存"],
+            ["1", "A", "设备", "A区", "1", "P1", "1", "2", "3", "4"],
+            ["2", "B", "设备", "B区", "1", "P2", "1", "2", "3", "4"],
+            ["3", "C", "设备", "A区", "1", "P3", "1", "2", "3", "4"],
+            ["4", "D", "设备", "B区", "1", "P4", "1", "2", "3", "4"],
+        ]
+        confidence = [[0.99 if value else 0.0 for value in row] for row in grid]
+        spans = [
+            {"row": 0, "column": 0, "row_span": 1, "column_span": 10, "role": "title"}
+        ]
+
+        anchors = ocr_backend._recover_equal_pair_nested_header_spans(
+            grid, confidence, spans
+        )
+        for _ in range(2):
+            grid, confidence, spans = ocr_backend._infer_sparse_group_header_spans(
+                grid, confidence, spans
+            )
+
+        self.assertEqual(anchors, {(2, 0), (2, 2), (2, 4), (2, 6), (2, 8)})
+        self.assertEqual(grid[2], ["累计", "", "累计", "", "计划", "", "累计", "", "实际", ""])
+        self.assertEqual(grid[1], ["基础信息", "", "数量与金额", "", "", "过程记录", "", "", "状态判定", ""])
+
+    def test_concatenated_group_labels_split_before_later_group(self):
+        grid = [
+            ["基础信息数量与金额", "", "", "", "", "过程记录", "", "", "", "状态判定"],
+            ["序号", "编号", "名称", "数量", "金额", "处理", "记录", "备注", "结果", "状态"],
+            *[[str(row), "A", "设备", "1", "2", "正常", "完成", "", "通过", "已确认"] for row in range(1, 6)],
+        ]
+        confidence = [[0.99 if value else 0.0 for value in row] for row in grid]
+        spans = []
+
+        repaired = ocr_backend._split_concatenated_group_labels(
+            grid, confidence, spans
+        )
+
+        self.assertEqual(repaired, {(0, 0), (0, 2)})
+        self.assertEqual(grid[0][0], "基础信息")
+        self.assertEqual(grid[0][2], "数量与金额")
 
     def test_source_margin_consensus_replaces_one_weak_existing_title(self):
         ocr_backend._load_runtime()
