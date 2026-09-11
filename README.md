@@ -4,6 +4,14 @@ OcrTableTool 是面向 Windows 平板和桌面设备的图片转表格工具。�
 
 [下载 Windows 版本](https://github.com/kurodayu23/OcrTableTool/releases/latest)
 
+## Vibe Coding / AI 辅助开发
+
+本项目采用 AI 辅助开发，通过需求描述与迭代反馈，使用 AI 辅助编写和修改代码。Vibe Coding 在这里描述开发方式；项目的具体功能与完成度以源码、运行说明和验证记录为准。
+
+项目本身使用 OCR 和表格结构识别模型。展示重点是 Qt/C++ 桌面交互、Python 识别后端、进程通信与数据导出。
+
+维护时以明确需求、审查代码改动和可复现验证为准；具体测试及尚未验证的部分见下方说明。
+
 ## 主要功能
 
 - 读取 PNG、JPG、BMP、TIFF 和 WebP 图片。
