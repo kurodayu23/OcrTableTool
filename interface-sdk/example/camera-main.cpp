@@ -32,10 +32,16 @@ int main(int argc, char *argv[])
         if (ready && !captureIssued) {
             captureIssued = true;
             QTimer::singleShot(500, [&]() {
-                if (!client.captureAndRecognize())
+                if (!client.captureImage())
                     application.exit(1);
             });
         }
+    });
+    QObject::connect(&client, &CameraOcrClient::captured,
+                     [&](const QString &path) {
+        QString errorMessage;
+        if (!client.recognizeImage(path, QRectF(), &errorMessage))
+            application.exit(1);
     });
     QObject::connect(&client, &CameraOcrClient::stageChanged,
                      [&](const QString &stage, const QString &message) {

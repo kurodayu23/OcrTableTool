@@ -27,6 +27,9 @@ public:
     ~CameraOcrClient();
 
     static QStringList availableCameraDescriptions();
+    static QString preferredStillImageCodec(const QStringList &supportedCodecs);
+    static bool ensureWritableWorkRoot(const QString &root,
+                                       QString *errorMessage = 0);
 
     // The viewfinder belongs to the caller. Passing 0 enables capture without
     // an SDK-provided preview widget.
@@ -36,9 +39,16 @@ public:
     bool isCameraReady() const;
     bool isBusy() const;
 
-    // Captures one high-resolution JPEG and immediately recognizes its table.
-    // The caller never needs to expose an "open image" workflow.
+    // Captures one high-resolution JPEG and emits captured() for region choice.
+    bool captureImage();
+    // Compatibility entry point; captureAndRecognize() now only captures and
+    // waits for the caller to choose full-image or region recognition.
     bool captureAndRecognize();
+    // Recognizes an existing image. An empty region means the whole image.
+    bool recognizeImage(const QString &imagePath,
+                       const QRectF &normalizedRegion = QRectF(),
+                       QString *errorMessage = 0);
+    QString currentImagePath() const;
     // 可选的最终照片归一化区域；同一画面有多个表格时由产品界面选定一个表格。
     bool setTableRegion(const QRectF &normalizedRegion,
                         QString *errorMessage = 0);
@@ -99,6 +109,8 @@ private:
     int preferredCameraIndex() const;
     QString createRequestDirectory();
     void configureCamera();
+    bool prepareRecognitionImage(const QString &imagePath,
+                                 QString *errorMessage = 0);
     void resetCaptureState();
     void emitFailure(const QString &errorCode,
                      const QString &message,

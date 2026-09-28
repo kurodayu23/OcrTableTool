@@ -25,14 +25,6 @@ public:
     QString backendExecutable() const;
 
     int health();
-    // 摄像头原图或仅做矩形裁剪的图片仍需由后端完成透视矫正。
-    int recognizeCameraPhoto(const QString &imagePath,
-                             const QString &outputDirectory,
-                             bool selectedTableRegion = false);
-    // 仅供已经完成透视矫正的图片使用，不能用于普通摄像头照片。
-    int recognizeRectifiedTable(const QString &imagePath,
-                                const QString &outputDirectory,
-                                bool selectedTableRegion = false);
     int recognize(const QString &imagePath,
                   const QString &outputDirectory,
                   bool inputRectified = false,

@@ -10,8 +10,10 @@
 #include <QCameraInfo>
 #include <QCameraViewfinder>
 #include <QCameraViewfinderSettings>
+#include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QImageEncoderSettings>
 #include <QImage>
@@ -80,6 +82,33 @@ QCameraViewfinderSettings preferredPreviewSettings(
     return preferred;
 }
 
+QString normalizedCapturedFilePath(const QString &fileName)
+{
+    const QFileInfo info(fileName);
+    const QString actualSuffix = info.suffix().toLower();
+    const QString completeBaseName = info.completeBaseName();
+    const QString requestedSuffix = QFileInfo(completeBaseName).suffix().toLower();
+    if (actualSuffix.isEmpty()
+        || (actualSuffix != QStringLiteral("bmp")
+            && actualSuffix != QStringLiteral("jpg")
+            && actualSuffix != QStringLiteral("jpeg")
+            && actualSuffix != QStringLiteral("png"))
+        || (requestedSuffix != QStringLiteral("jpg")
+            && requestedSuffix != QStringLiteral("jpeg"))) {
+        return info.absoluteFilePath();
+    }
+
+    const QString stem = QFileInfo(completeBaseName).completeBaseName();
+    const QString normalizedPath = info.dir().filePath(
+        stem + QLatin1Char('.') + actualSuffix);
+    if (normalizedPath == info.absoluteFilePath()
+        || QFileInfo::exists(normalizedPath)
+        || !QFile::rename(info.absoluteFilePath(), normalizedPath)) {
+        return info.absoluteFilePath();
+    }
+    return normalizedPath;
+}
+
 } // namespace
 
 CameraOcrClient::CameraOcrClient(const QString &backendExecutable,
@@ -126,6 +155,55 @@ QStringList CameraOcrClient::availableCameraDescriptions()
     for (int index = 0; index < cameras.size(); ++index)
         descriptions.append(cameras.at(index).description());
     return descriptions;
+}
+
+QString CameraOcrClient::preferredStillImageCodec(const QStringList &supportedCodecs)
+{
+    for (const QString &codec : supportedCodecs) {
+        if (codec.compare(QStringLiteral("image/jpeg"), Qt::CaseInsensitive) == 0)
+            return codec;
+    }
+    return supportedCodecs.isEmpty() ? QString() : supportedCodecs.first();
+}
+
+bool CameraOcrClient::ensureWritableWorkRoot(const QString &root,
+                                              QString *errorMessage)
+{
+    const QString cleanRoot = QDir::cleanPath(root);
+    if (cleanRoot.isEmpty() || cleanRoot == QStringLiteral(".")) {
+        if (errorMessage)
+            *errorMessage = QString::fromWCharArray(L"拍照工作目录为空。");
+        return false;
+    }
+    if (!QDir().mkpath(cleanRoot)) {
+        if (errorMessage) {
+            *errorMessage = QString::fromWCharArray(
+                L"无法创建拍照工作目录：%1").arg(cleanRoot);
+        }
+        return false;
+    }
+
+    const QString probePath = QDir(cleanRoot).filePath(
+        QStringLiteral(".camera-ocr-write-test-%1.tmp")
+            .arg(QCoreApplication::applicationPid()));
+    QFile probe(probePath);
+    if (!probe.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
+        if (errorMessage) {
+            *errorMessage = QString::fromWCharArray(
+                L"拍照工作目录没有写入权限：%1").arg(cleanRoot);
+        }
+        return false;
+    }
+    const bool wrote = probe.write("camera-ocr") == 10;
+    probe.close();
+    QFile::remove(probePath);
+    if (!wrote) {
+        if (errorMessage)
+            *errorMessage = QString::fromWCharArray(L"无法写入拍照工作目录：%1")
+                .arg(cleanRoot);
+        return false;
+    }
+    return true;
 }
 
 void CameraOcrClient::setViewfinder(QCameraViewfinder *viewfinder)
@@ -215,7 +293,10 @@ void CameraOcrClient::configureCamera()
     m_capture = new QCameraImageCapture(m_camera, this);
     m_capture->setCaptureDestination(QCameraImageCapture::CaptureToFile);
     QImageEncoderSettings encoder;
-    encoder.setCodec(QStringLiteral("image/jpeg"));
+    const QString codec = preferredStillImageCodec(
+        m_capture->supportedImageCodecs());
+    if (!codec.isEmpty())
+        encoder.setCodec(codec);
     encoder.setQuality(QMultimedia::VeryHighQuality);
     const QSize resolution = preferredStillResolution(
         m_capture->supportedResolutions(encoder));
@@ -265,6 +346,9 @@ bool CameraOcrClient::isBusy() const
 
 QString CameraOcrClient::createRequestDirectory()
 {
+    QString errorMessage;
+    if (!ensureWritableWorkRoot(m_workRoot, &errorMessage))
+        return QString();
     const QString stamp = QDateTime::currentDateTime().toString(
         QStringLiteral("yyyyMMdd-hhmmss-zzz"));
     const QString directory = QDir(m_workRoot).filePath(
@@ -272,7 +356,7 @@ QString CameraOcrClient::createRequestDirectory()
     return QDir().mkpath(directory) ? directory : QString();
 }
 
-bool CameraOcrClient::captureAndRecognize()
+bool CameraOcrClient::captureImage()
 {
     if (isBusy()) {
         emitFailure(QStringLiteral("REQUEST_BUSY"),
@@ -291,6 +375,7 @@ bool CameraOcrClient::captureAndRecognize()
     m_ocrRetryPending = false;
     m_regionFallbackAttempted = false;
     m_originalCapturePath.clear();
+    clearTableRegion();
     m_requestDirectory = createRequestDirectory();
     if (m_requestDirectory.isEmpty()) {
         emitFailure(QStringLiteral("WORK_DIRECTORY_CREATE_FAILED"),
@@ -298,7 +383,8 @@ bool CameraOcrClient::captureAndRecognize()
                     false);
         return false;
     }
-    m_capturePath = QDir(m_requestDirectory).filePath(QStringLiteral("camera.jpg"));
+    // 不预设扩展名，避免摄像头驱动实际输出 BMP 时生成 camera.jpg.bmp。
+    m_capturePath = QDir(m_requestDirectory).filePath(QStringLiteral("camera"));
     m_capturePending = true;
     m_captureStarted = false;
     emit stageChanged(QStringLiteral("focusing"),
@@ -312,6 +398,121 @@ bool CameraOcrClient::captureAndRecognize()
     } else {
         QTimer::singleShot(0, this, SLOT(captureAfterFocusLock()));
     }
+    return true;
+}
+
+bool CameraOcrClient::captureAndRecognize()
+{
+    return captureImage();
+}
+
+QString CameraOcrClient::currentImagePath() const
+{
+    return m_originalCapturePath;
+}
+
+bool CameraOcrClient::prepareRecognitionImage(const QString &imagePath,
+                                              QString *errorMessage)
+{
+    const QString absolutePath = QFileInfo(imagePath).absoluteFilePath();
+    m_capturePath = absolutePath;
+    if (!m_tableRegion.isValid())
+        return true;
+
+    QImageReader reader(absolutePath);
+    reader.setAutoTransform(true);
+    const QImage sourceImage = reader.read();
+    if (sourceImage.isNull()) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("无法读取图片，请选择有效的图片文件。");
+        return false;
+    }
+
+    const QRect cropRect = resolvedTableRegion(sourceImage.size())
+        .intersected(sourceImage.rect());
+    if (!cropRect.isValid()) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("识别区域无效，请重新框选表格区域。");
+        return false;
+    }
+
+    const QImage tableImage = sourceImage.copy(cropRect);
+    const QString croppedPath = QDir(m_requestDirectory).filePath(
+        QStringLiteral("camera-table.png"));
+    if (tableImage.isNull() || !tableImage.save(croppedPath, "PNG")) {
+        if (errorMessage)
+            *errorMessage = QStringLiteral("无法保存裁剪后的表格图片，请重新选择区域。");
+        return false;
+    }
+    m_capturePath = croppedPath;
+    emit stageChanged(QStringLiteral("table_region_cropped"),
+                      QString::fromWCharArray(L"已按选定区域提取表格，正在识别。"));
+    return true;
+}
+
+bool CameraOcrClient::recognizeImage(const QString &imagePath,
+                                     const QRectF &normalizedRegion,
+                                     QString *errorMessage)
+{
+    if (isBusy()) {
+        const QString message = QStringLiteral("当前正在拍照或识别，请完成后再试。");
+        if (errorMessage)
+            *errorMessage = message;
+        emitFailure(QStringLiteral("REQUEST_BUSY"), message, true);
+        return false;
+    }
+
+    const QFileInfo imageInfo(imagePath);
+    if (!imageInfo.isFile()) {
+        const QString message = QStringLiteral("图片文件不存在，请重新选择图片。");
+        if (errorMessage)
+            *errorMessage = message;
+        emitFailure(QStringLiteral("IMAGE_NOT_FOUND"), message, false);
+        return false;
+    }
+
+    if (normalizedRegion.isNull()) {
+        clearTableRegion();
+    } else if (!setTableRegion(normalizedRegion, errorMessage)) {
+        const QString message = errorMessage ? *errorMessage
+                                              : QStringLiteral("识别区域无效。");
+        emitFailure(QStringLiteral("TABLE_REGION_INVALID"), message, false);
+        return false;
+    }
+
+    const QString absolutePath = imageInfo.absoluteFilePath();
+    if (m_requestDirectory.isEmpty() || m_originalCapturePath != absolutePath) {
+        m_requestDirectory = createRequestDirectory();
+        if (m_requestDirectory.isEmpty()) {
+            const QString message = QStringLiteral("无法创建本次识别工作目录。");
+            if (errorMessage)
+                *errorMessage = message;
+            emitFailure(QStringLiteral("WORK_DIRECTORY_CREATE_FAILED"),
+                        message, false);
+            return false;
+        }
+    }
+
+    m_lastResponse = QJsonObject();
+    m_ocrRetryCount = 0;
+    m_ocrRetryPending = false;
+    m_regionFallbackAttempted = false;
+    m_originalCapturePath = absolutePath;
+
+    if (!prepareRecognitionImage(absolutePath, errorMessage)) {
+        const QString message = errorMessage && !errorMessage->isEmpty()
+            ? *errorMessage
+            : QStringLiteral("无法准备 OCR 识别图片。");
+        emitFailure(QStringLiteral("IMAGE_PREPARE_FAILED"), message, true);
+        return false;
+    }
+
+    emit stageChanged(QStringLiteral("recognizing"),
+                      QString::fromWCharArray(L"正在识别表格，请稍候。"));
+    m_ocr->recognize(m_capturePath,
+                     m_requestDirectory,
+                     false,
+                     m_tableRegion.isValid());
     return true;
 }
 
@@ -358,10 +559,9 @@ QRect CameraOcrClient::resolvedTableRegion(const QSize &imageSize) const
     const QRect bounded = requested.intersected(QRect(QPoint(0, 0), imageSize));
     if (!bounded.isValid())
         return QRect();
-    const int paddingX = qMax(4, qCeil(bounded.width() * 0.02));
-    const int paddingTop = qMax(8, qCeil(bounded.height() * 0.08));
-    const int paddingBottom = qMax(4, qCeil(bounded.height() * 0.04));
-    return bounded.adjusted(-paddingX, -paddingTop, paddingX, paddingBottom)
+    const int paddingX = qMax(4, qCeil(bounded.width() * 0.015));
+    const int paddingY = qMax(4, qCeil(bounded.height() * 0.025));
+    return bounded.adjusted(-paddingX, -paddingY, paddingX, paddingY)
         .intersected(QRect(QPoint(0, 0), imageSize));
 }
 
@@ -497,7 +697,8 @@ void CameraOcrClient::imageSaved(int, const QString &fileName)
     resetCaptureState();
     if (m_camera)
         m_camera->unlock();
-    QImageReader reader(fileName);
+    const QString capturedFilePath = normalizedCapturedFilePath(fileName);
+    QImageReader reader(capturedFilePath);
     const QSize resolution = reader.size();
     const qint64 pixels = qint64(resolution.width()) * resolution.height();
     if (!resolution.isValid()) {
@@ -512,9 +713,9 @@ void CameraOcrClient::imageSaved(int, const QString &fileName)
             QString::fromWCharArray(L"\u7167\u7247\u5206\u8fa8\u7387\u4e3a %1 \u00d7 %2\uff0c\u5c06\u7ee7\u7eed\u8bc6\u522b\uff0c\u4f4e\u7f6e\u4fe1\u5ea6\u5185\u5bb9\u4f1a\u4fdd\u7559\u98ce\u9669\u72b6\u6001\u3002")
                 .arg(resolution.width()).arg(resolution.height()));
     }
-    m_originalCapturePath = fileName;
+    m_originalCapturePath = capturedFilePath;
     m_regionFallbackAttempted = false;
-    QString recognitionPath = fileName;
+    QString recognitionPath = capturedFilePath;
     if (m_tableRegion.isValid()) {
         reader.setAutoTransform(true);
         const QImage capturedImage = reader.read();
@@ -540,11 +741,9 @@ void CameraOcrClient::imageSaved(int, const QString &fileName)
     }
     m_capturePath = recognitionPath;
     emit captured(recognitionPath);
-    emit stageChanged(QStringLiteral("recognizing"),
-                      QString::fromWCharArray(L"\u62cd\u7167\u5b8c\u6210\uff0c\u6b63\u5728\u8bc6\u522b\u8868\u683c\u3002"));
-    m_ocr->recognizeCameraPhoto(recognitionPath,
-                                m_requestDirectory,
-                                m_tableRegion.isValid());
+    emit stageChanged(
+        QStringLiteral("captured"),
+        QString::fromWCharArray(L"\u62cd\u7167\u5b8c\u6210\uff0c\u8bf7\u9009\u62e9\u8bc6\u522b\u6574\u56fe\u6216\u8bc6\u522b\u9009\u533a\u3002"));
 }
 
 void CameraOcrClient::captureReadyChanged(bool ready)
@@ -573,9 +772,13 @@ void CameraOcrClient::captureError(int,
     resetCaptureState();
     if (m_camera)
         m_camera->unlock();
-    Q_UNUSED(errorString);
+    QString message = QString::fromWCharArray(
+        L"\u62cd\u7167\u4fdd\u5b58\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5\u3002");
+    if (!errorString.trimmed().isEmpty())
+        message += QString::fromWCharArray(L"\n\u9a71\u52a8\u4fe1\u606f：%1")
+            .arg(errorString.trimmed());
     emitFailure(QStringLiteral("CAMERA_CAPTURE_FAILED"),
-                QString::fromWCharArray(L"\u62cd\u7167\u4fdd\u5b58\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5\u3002"),
+                message,
                 true);
 }
 
@@ -610,11 +813,9 @@ void CameraOcrClient::ocrRequestFailed(int,
     if (action != QStringLiteral("recognize"))
         return;
     Q_UNUSED(field);
-    Q_UNUSED(message);
     const bool insufficientMemory = errorCode == QStringLiteral("INSUFFICIENT_MEMORY");
     if (!insufficientMemory
         && retryable
-        && !m_tableRegion.isValid()
         && m_ocrRetryCount < 1
         && QFileInfo::exists(m_capturePath)) {
         ++m_ocrRetryCount;
@@ -626,9 +827,10 @@ void CameraOcrClient::ocrRequestFailed(int,
                 return;
             m_ocrRetryPending = false;
             if (!m_ocr->isBusy())
-                m_ocr->recognizeCameraPhoto(
+                m_ocr->recognize(
                     m_capturePath,
                     m_requestDirectory,
+                    false,
                     m_tableRegion.isValid()
                         && m_capturePath != m_originalCapturePath);
         });
@@ -654,20 +856,17 @@ void CameraOcrClient::ocrRequestFailed(int,
                 QStringLiteral("camera-table-retry.png"));
             if (!expandedTable.isNull() && expandedTable.save(retryPath, "PNG")) {
                 m_regionFallbackAttempted = true;
-                m_ocrRetryCount = 1;
-                m_ocrRetryPending = true;
+                m_ocrRetryCount = 0;
                 m_capturePath = retryPath;
                 emit stageChanged(
                     QStringLiteral("table_region_fallback"),
                     QString::fromWCharArray(L"框选区域首次识别未形成可靠结果，正在扩大少量边缘后重试。"));
                 QTimer::singleShot(300, this, [this]() {
-                    if (!m_ocrRetryPending)
-                        return;
-                    m_ocrRetryPending = false;
                     if (!m_ocr->isBusy())
-                        m_ocr->recognizeCameraPhoto(
+                        m_ocr->recognize(
                             m_capturePath,
                             m_requestDirectory,
+                            false,
                             true);
                 });
                 return;
@@ -681,9 +880,14 @@ void CameraOcrClient::ocrRequestFailed(int,
                     true);
         return;
     }
+    const QString backendMessage = message.trimmed();
+    const QString displayMessage = backendMessage.isEmpty()
+        ? QString::fromWCharArray(L"表格识别失败，请根据错误码 %1 重试或联系维护人员。")
+              .arg(errorCode)
+        : QString::fromWCharArray(L"表格识别失败（%1）：%2")
+              .arg(errorCode, backendMessage);
     emitFailure(errorCode,
-                QString::fromWCharArray(L"\u8868\u683c\u8bc6\u522b\u5931\u8d25\uff0c\u8bf7\u6839\u636e\u9519\u8bef\u7801 %1 \u91cd\u8bd5\u6216\u8054\u7cfb\u7ef4\u62a4\u4eba\u5458\u3002")
-                    .arg(errorCode),
+                displayMessage,
                 retryable);
 }
 

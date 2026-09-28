@@ -1,4 +1,4 @@
-QT += core multimedia multimediawidgets
+QT += core gui multimedia multimediawidgets
 
 # Qt 5.9/MSVC 2015 may batch several large translation units into one cl.exe
 # invocation. Disable that build optimization so the SDK also builds reliably

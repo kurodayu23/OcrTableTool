@@ -33,7 +33,12 @@ CameraOcrClient *ocr =
 connect(ocr, &CameraOcrClient::cameraReadyChanged,
         this, [ocr](bool ready, int, const QString &) {
     if (ready)
-        ocr->captureAndRecognize();
+        ocr->captureImage();
+});
+
+connect(ocr, &CameraOcrClient::captured,
+        this, [ocr](const QString &path) {
+    ocr->recognizeImage(path);
 });
 
 connect(ocr, &CameraOcrClient::tableRecognized,
@@ -53,13 +58,13 @@ ocr->startCamera();
 
 ```cpp
 QString error;
-ocr->setTableRegion(QRectF(0.08, 0.12, 0.84, 0.72), &error);
-ocr->captureAndRecognize();
+ocr->recognizeImage(ocr->currentImagePath(),
+                    QRectF(0.08, 0.12, 0.84, 0.72), &error);
 ```
 
-框选坐标必须是最终照片的归一化坐标，不能直接传屏幕像素坐标。`CameraOcrClient` 会按摄像头照片处理框选图；直接使用底层客户端时，普通照片调用 `recognizeCameraPhoto()`，只有已经完成透视矫正的图片才调用 `recognizeRectifiedTable()`。
+`captureImage()` 拍照后只发出 `captured(path)`，由界面选择整图或框选再调用 `recognizeImage()`；兼容方法 `captureAndRecognize()` 现在也只负责拍照。框选坐标必须是最终照片的归一化坐标，不能直接传屏幕像素坐标。底层 `OcrTableClient::recognize()` 对普通照片使用 `inputRectified=false`。
 
-接口会在高清原图上裁剪，自动保留少量边缘，并使用 PNG 交给 OCR，避免 JPEG 二次压缩。`resolvedTableRegion(imageSize)` 可用于预览最终实际裁剪范围。框选结果若连续运行异常，接口会保留原图并做一次安全回退；成功结果的 `response["table_region_fallback"]` 为 `true`。不需要框选时调用 `clearTableRegion()`。
+接口会在高清原图上裁剪，保留少量边缘，并使用 PNG 交给 OCR，避免 JPEG 二次压缩。`resolvedTableRegion(imageSize)` 可用于预览实际裁剪范围。框选结果首次失败时最多扩边重试一次；不需要框选时传入空 `QRectF()`。
 
 ## 修改和导出
 
