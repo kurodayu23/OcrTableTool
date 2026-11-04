@@ -11,6 +11,7 @@
 #include <QDateTime>
 #include <QDialogButtonBox>
 #include <QDir>
+#include <QFileInfo>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMessageBox>
@@ -161,16 +162,65 @@ CaptureQuality assessCaptureQuality(const QImage &source)
 
 } // namespace
 
+namespace OcrTableToolGui
+{
+
+QString nextCapturePathIn(const QString &baseDirectory, QString *failureReason)
+{
+    if (failureReason)
+        failureReason->clear();
+    if (baseDirectory.isEmpty()) {
+        if (failureReason)
+            *failureReason = QStringLiteral("找不到可写的照片保存位置，请检查系统存储与文件权限。");
+        return QString();
+    }
+    const QString directory = QDir(baseDirectory).filePath(QStringLiteral("OcrTableTool"));
+    // mkpath 返回 false 有两种情况：目录已在（正常）和建不出来（磁盘满 / 无权限 /
+    // 同名文件挡路）。只有"建完它仍然不是目录"才是真失败。
+    if (!QDir().mkpath(directory) && !QFileInfo(directory).isDir()) {
+        if (failureReason) {
+            *failureReason = QStringLiteral("无法创建照片保存目录：%1。请检查磁盘空间与文件权限后重试。")
+                                 .arg(QDir::toNativeSeparators(directory));
+        }
+        return QString();
+    }
+    return QDir(directory).filePath(
+        QStringLiteral("camera_%1.jpg")
+            .arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_hhmmss_zzz"))));
+}
+
+QString nextCapturePath(QString *failureReason)
+{
+    if (failureReason)
+        failureReason->clear();
+    QString baseDirectory = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
+    if (baseDirectory.isEmpty())
+        baseDirectory = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
+    if (baseDirectory.isEmpty()) {
+        if (failureReason) {
+            *failureReason = QStringLiteral("找不到可写的照片保存位置，请检查系统存储与文件权限。");
+        }
+        return QString();
+    }
+    return nextCapturePathIn(baseDirectory, failureReason);
+}
+
+} // namespace OcrTableToolGui
+
 CameraCaptureDialog::CameraCaptureDialog(QWidget *parent)
     : QDialog(parent)
     , m_viewfinder(new QCameraViewfinder(this))
     , m_statusLabel(new QLabel(this))
     , m_captureButton(new QPushButton(QStringLiteral("拍摄"), this))
+    , m_retryButton(new QPushButton(QStringLiteral("重试打开摄像头"), this))
     , m_camera(0)
     , m_capture(0)
     , m_focusTimer(new QTimer(this))
     , m_capturePending(false)
     , m_captureStarted(false)
+    , m_cameraIndex(-1)
+    , m_cameraRetryCount(0)
+    , m_openWatchdog(0)
 {
     setWindowTitle(QStringLiteral("拍照"));
     setModal(true);
@@ -194,18 +244,27 @@ CameraCaptureDialog::CameraCaptureDialog(QWidget *parent)
     m_captureButton->setMinimumWidth(118);
     m_captureButton->setEnabled(false);
     buttons->addButton(m_captureButton, QDialogButtonBox::AcceptRole);
+    // 重试入口：默认隐藏，只在摄像头出错 / 一台都没检测到时出现。
+    m_retryButton->setObjectName(QStringLiteral("SecondaryButton"));
+    m_retryButton->setMinimumHeight(48);
+    m_retryButton->setMinimumWidth(118);
+    m_retryButton->setVisible(false);
+    buttons->addButton(m_retryButton, QDialogButtonBox::ActionRole);
     layout->addWidget(buttons);
 
     const QList<QCameraInfo> cameras = QCameraInfo::availableCameras();
-    const int defaultCameraIndex = cameras.isEmpty() ? 0 : preferredCameraIndex(cameras);
+    const int defaultCameraIndex = cameras.isEmpty() ? -1 : preferredCameraIndex(cameras);
 
     connect(m_captureButton, SIGNAL(clicked()), this, SLOT(captureImage()));
+    connect(m_retryButton, SIGNAL(clicked()), this, SLOT(retryCamera()));
     connect(buttons, SIGNAL(rejected()), this, SLOT(reject()));
     m_focusTimer->setSingleShot(true);
     connect(m_focusTimer, SIGNAL(timeout()), this, SLOT(focusLockFailed()));
 
     if (cameras.isEmpty()) {
         m_statusLabel->setText(QStringLiteral("未检测到可用摄像头，请确认平板摄像头未被其他程序占用。"));
+        // 一台摄像头都没有时也留一个重试入口：用户插上 / 放开占用后不必关掉对话框重开。
+        m_retryButton->setVisible(true);
         return;
     }
 
@@ -226,12 +285,46 @@ QString CameraCaptureDialog::capturedImagePath() const
 void CameraCaptureDialog::startCamera(int index)
 {
     const QList<QCameraInfo> cameras = QCameraInfo::availableCameras();
-    if (index < 0 || index >= cameras.size())
+    if (index < 0 || index >= cameras.size()) {
+        m_cameraIndex = -1;
+        m_captureButton->setEnabled(false);
+        m_retryButton->setVisible(true);
+        m_statusLabel->setText(QStringLiteral("未检测到可用摄像头，请确认平板摄像头未被其他程序占用。"));
         return;
+    }
 
     stopCamera();
+    m_cameraIndex = index;
+    m_retryButton->setVisible(false);
     m_captureButton->setEnabled(false);
     m_statusLabel->setText(QStringLiteral("正在打开摄像头…"));
+
+    // ⚠ 2026-11-02：打开设备是**异步**的，而「设备就绪」（readyForCaptureChanged）
+    //   与「设备报错」（QCamera::error）这两个信号**都不来**的情形是真实存在的
+    //   （驱动静默失败 / 设备被占用 / 权限被拒但没报错）。
+    //   那条路径上 startCamera() 藏起来的重试入口永远不会被恢复
+    //   ⇒ 快门禁用 + 状态停在「正在打开摄像头…」+ 用户没有任何重试途径
+    //   ⇒ 只能关掉整个对话框重开。
+    //   这里加一个兜底定时器：超时（既没就绪也没报错）就把重试入口亮出来。
+    //   8 秒远大于真机上摄像头的冷启动时间（通常 < 2 s），
+    //   正常路径上不会误触发（就绪信号会先到并停掉它）。
+    if (m_openWatchdog) {
+        m_openWatchdog->stop();
+    }
+    m_openWatchdog = new QTimer(this);
+    m_openWatchdog->setSingleShot(true);
+    m_openWatchdog->setInterval(8000);
+    connect(m_openWatchdog, &QTimer::timeout, this, [this]() {
+        // 还没就绪 ⇒ 把重试入口亮出来，别让用户卡死。
+        if (m_capture && m_capture->isReadyForCapture())
+            return;
+        m_retryButton->setVisible(true);
+        m_retryButton->setEnabled(true);
+        if (m_statusLabel->text().contains(QStringLiteral("正在打开摄像头")))
+            m_statusLabel->setText(QStringLiteral(
+                "摄像头迟迟未就绪，请点「重试打开摄像头」后重试。"));
+    });
+    m_openWatchdog->start();
 
     m_camera = new QCamera(cameras.at(index), this);
     m_camera->setCaptureMode(QCamera::CaptureStillImage);
@@ -309,6 +402,11 @@ void CameraCaptureDialog::startCamera(int index)
 
 void CameraCaptureDialog::stopCamera()
 {
+    if (m_openWatchdog) {
+        m_openWatchdog->stop();
+        m_openWatchdog->deleteLater();
+        m_openWatchdog = 0;
+    }
     m_capturePending = false;
     m_captureStarted = false;
     m_focusTimer->stop();
@@ -318,17 +416,6 @@ void CameraCaptureDialog::stopCamera()
     delete m_camera;
     m_capture = 0;
     m_camera = 0;
-}
-
-QString CameraCaptureDialog::nextCapturePath() const
-{
-    QString directory = QStandardPaths::writableLocation(QStandardPaths::PicturesLocation);
-    if (directory.isEmpty())
-        directory = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
-    directory = QDir(directory).filePath(QStringLiteral("OcrTableTool"));
-    QDir().mkpath(directory);
-    return QDir(directory).filePath(
-        QStringLiteral("camera_%1.jpg").arg(QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_hhmmss_zzz"))));
 }
 
 void CameraCaptureDialog::captureImage()
@@ -368,7 +455,22 @@ void CameraCaptureDialog::captureAfterFocusLock()
     }
     m_captureStarted = true;
     m_statusLabel->setText(QStringLiteral("正在保存高清照片…"));
-    m_capture->capture(nextCapturePath());
+    // findings：路径解析失败（目录建不出来）必须当场如实报错，而不是把一张
+    // 指向不存在目录的路径交给 Qt，再让用户看到"照片保存失败，请重试"。
+    QString pathFailure;
+    const QString targetPath = OcrTableToolGui::nextCapturePath(&pathFailure);
+    if (targetPath.isEmpty()) {
+        m_capturePending = false;
+        m_captureStarted = false;
+        m_captureButton->setEnabled(m_capture && m_capture->isReadyForCapture());
+        m_statusLabel->setText(pathFailure.isEmpty()
+            ? QStringLiteral("无法确定照片保存位置，请检查磁盘空间与文件权限后重试。")
+            : pathFailure);
+        if (m_camera)
+            m_camera->unlock();
+        return;
+    }
+    m_capture->capture(targetPath);
 }
 
 void CameraCaptureDialog::focusLockFailed()
@@ -444,7 +546,19 @@ void CameraCaptureDialog::imageSaved(int, const QString &fileName)
 
 void CameraCaptureDialog::captureReadyChanged(bool ready)
 {
+    if (m_openWatchdog) {
+        m_openWatchdog->stop();
+        m_openWatchdog->deleteLater();
+        m_openWatchdog = 0;
+    }
     m_captureButton->setEnabled(ready && !m_capturePending);
+    // ⚠ 2026-11-02：原来只在 ready=true 时才碰重试入口，于是「重试之后设备一直没
+    //   就绪」这条路径上，入口被 startCamera() 藏掉后再也不会出现
+    //   ⇒ 快门禁用 + 状态停在「正在打开摄像头…」+ 没有重试入口
+    //   ⇒ 用户被卡死，只能关掉整个对话框重开。
+    //   现在按「是否就绪」决定入口的可见性：没就绪就把入口亮出来（能再试），
+    //   就绪了才藏起来（此时快门可用，不需要重试）。
+    m_retryButton->setVisible(!ready);
     if (ready && !m_capturePending) {
         const QSize resolution = m_capture ? m_capture->encodingSettings().resolution() : QSize();
         m_statusLabel->setText(resolution.isValid()
@@ -457,8 +571,42 @@ void CameraCaptureDialog::captureReadyChanged(bool ready)
 
 void CameraCaptureDialog::cameraError()
 {
+    if (m_openWatchdog) {
+        m_openWatchdog->stop();
+        m_openWatchdog->deleteLater();
+        m_openWatchdog = 0;
+    }
+    // findings：原来这里只把快门禁用就结束了 —— 之后既没有任何信号能把快门
+    // 重新打开，对话框里也没有重试入口，用户只能关掉整个对话框重开。
+    // 现在错误态：快门仍禁用（摄像头不可用），但保留一个醒目的重试入口。
+    m_capturePending = false;
+    m_captureStarted = false;
+    m_focusTimer->stop();
     m_captureButton->setEnabled(false);
-    m_statusLabel->setText(QStringLiteral("摄像头无法打开，请检查系统相机权限、驱动或是否被其他程序占用。"));
+    m_retryButton->setVisible(true);
+    m_retryButton->setEnabled(true);
+    m_statusLabel->setText(
+        QStringLiteral("摄像头无法打开，请检查系统相机权限、驱动或是否被其他程序占用；处理后点「重试打开摄像头」。"));
+}
+
+void CameraCaptureDialog::retryCamera()
+{
+    ++m_cameraRetryCount;
+    if (m_cameraIndex < 0) {
+        const QList<QCameraInfo> cameras = QCameraInfo::availableCameras();
+        if (cameras.isEmpty()) {
+            m_captureButton->setEnabled(false);
+            m_retryButton->setVisible(true);
+            m_retryButton->setEnabled(true);
+            m_statusLabel->setText(
+                QStringLiteral("仍未检测到可用摄像头，请连接或启用摄像头后再次重试。"));
+            return;
+        }
+        m_cameraIndex = preferredCameraIndex(cameras);
+    }
+    // 重开设备：走与首次启动完全相同的链路，就绪后由 captureReadyChanged
+    // 把快门重新打开。
+    startCamera(m_cameraIndex);
 }
 
 void CameraCaptureDialog::captureError()
@@ -470,7 +618,9 @@ void CameraCaptureDialog::captureError()
         m_camera->unlock();
     const bool ready = m_capture && m_capture->isReadyForCapture();
     m_captureButton->setEnabled(ready);
+    // 摄像头没回到就绪态时同样给重试入口，别让快门禁用变成死路。
+    m_retryButton->setVisible(!ready);
     m_statusLabel->setText(ready
         ? QStringLiteral("拍照保存失败，请重新拍摄。")
-        : QStringLiteral("拍照失败，摄像头暂未就绪，请稍候后重试。"));
+        : QStringLiteral("拍照失败，摄像头暂未就绪，请点「重试打开摄像头」后重拍。"));
 }

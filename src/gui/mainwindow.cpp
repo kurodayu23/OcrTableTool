@@ -59,8 +59,50 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
+namespace OcrTableToolGui {
+
+// 后端返回的矫正图路径必须先过这道校验。
+// 界面自己的输出目录永远是本机的（AppLocalDataLocation，临时目录兜底），
+// 后端却可能给出任意路径：
+//   - UNC 路径（\\host\share\x.png）会让进程去认证网络共享，凭据可能外泄；
+//   - 带 ".." 的路径会读到输出目录之外的文件；
+//   - 空路径说明这份响应不完整。
+// 自由函数（外部链接）：单元测试 tests/tst_gui.cpp 直接声明并调用它，
+// 绕开 MSVC 把访问级别编进符号名的问题（私有成员函数无法从测试 TU 调用）。
+bool isSafeLocalImagePath(const QString &path)
+{
+    const QString trimmed = path.trimmed();
+    if (trimmed.isEmpty())
+        return false;
+    // UNC：\\host\share 或 //host/share
+    if (trimmed.startsWith(QLatin1String("\\\\")) || trimmed.startsWith(QLatin1String("//")))
+        return false;
+    // 逐段检查，任何 ".." 段都拒绝。
+    // 这里不用 QDir::cleanPath：它会把 ".." 直接消掉，越界反而看不出来。
+    QString normalized = trimmed;
+    normalized.replace(QLatin1Char('\\'), QLatin1Char('/'));
+    const QStringList segments = normalized.split(QLatin1Char('/'));
+    for (int index = 0; index < segments.size(); ++index) {
+        if (segments.at(index) == QLatin1String(".."))
+            return false;
+    }
+    return true;
+}
+
+} // namespace OcrTableToolGui
+
 namespace
 {
+// 一次识别的墙钟预算（毫秒）。这是**界面侧**的镜像口径，对外契约
+// 「单次识别 60 秒墙钟」不变：首次请求仍然不传 deadline（不额外收紧）。
+// 它的唯一用途是给自动重试划一条总时长上限（findings B1）。
+const int kRecognitionWallBudgetMilliseconds = 60000;
+// 自动重试与首轮之间留出的空档（原值 350 ms，这里原样保留）。
+const int kRetryDelayMilliseconds = 350;
+// 后端把 deadline_seconds 收口到至少 5 秒；剩余预算比它还小时重试没有意义，
+// 直接按失败呈现，避免"重试必然超时"的假重试。
+const int kMinimumRetryBudgetSeconds = 5;
+
 const QIcon &reviewMarkerIcon()
 {
     static const QIcon icon = []() {
@@ -104,6 +146,31 @@ QString canonicalDisplayedResultHash(const TableData &table,
 
 QString localizedBackendError(const QString &message)
 {
+    // 2026-10-24 修正（findings/104）：后端这几类失败的文案都带「图片」或「模型」二字，
+    // 而下面 model/模型 分支与 image/图片 分支会把它们一律说成
+    // 「识别模型文件缺失或损坏」或「无法读取图片」—— 于是「60 秒没跑完」
+    // 「结构过于复杂」「内部错误」「联网被拦截」这些失败在界面上被说成了别的问题。
+    // 这几条关键词很具体，放在函数最前面，命中即返回，不再往下走。
+    // ⚠ 签名与调用点**保持不变**：UI 契约测试（test_ui_contract.py:254）锚定了
+    //   localizedBackendError 的**单参数**调用形态，本次改动不动它。
+    if (message.contains(QStringLiteral("逐格复核超过"))
+        || message.contains(QStringLiteral("判定表格结构过于复杂"))) {
+        return QStringLiteral("本次识别未能在 60 秒内完成：这张图的表格结构过于复杂，已中止以免长时间无响应。请用「框选区域」只框住表格本体（去掉桌面背景、条纹或其他网格），或裁剪掉干扰内容后重新识别。");
+    }
+    if (message.contains(QStringLiteral("复核图片量已超上限"))) {
+        return QStringLiteral("本次识别已中止：这张图的网格切分异常，同一批单元格被反复复核，复核图片量已超上限。请用「框选区域」只框住表格本体（去掉桌面背景、条纹或其他网格），或裁剪掉干扰内容后重新识别。");
+    }
+    if (message.contains(QStringLiteral("发生内部错误"))) {
+        return QStringLiteral("识别过程中发生内部错误，请重试；若反复出现，请更换图片或联系技术支持。");
+    }
+    if (message.contains(QStringLiteral("禁止联网"))) {
+        return QStringLiteral("本产品不会进行任何网络访问，请检查本地识别组件后重试。");
+    }
+    // 2026-10-28（findings/61 F3）：进程退出码非 0 而响应是 ok 时，这份结果
+    // 不被采用。文案只陈述事实与可行动作，不承诺"结果一定完整"。
+    if (message.contains(QStringLiteral("本次结果未采用"))) {
+        return QStringLiteral("识别组件在交出结果后没能正常结束，本次结果未被采用。请重新识别；若反复出现，请重启软件。");
+    }
     if (message.contains(QStringLiteral("严重模糊")))
         return QStringLiteral("照片严重模糊，文字笔画已经丢失，请保持设备稳定、重新对焦后拍摄。");
     if (message.contains(QStringLiteral("边缘贴近照片边界")))
@@ -149,8 +216,7 @@ QString localizedBackendError(const QString &message)
         || message.contains(QStringLiteral("无法向识别组件发送任务"))
         || message.contains(QStringLiteral("没有返回有效结果"))
         || message.contains(QStringLiteral("识别组件意外退出"))
-        || message.contains(QStringLiteral("crash"), Qt::CaseInsensitive)
-        || message.contains(QStringLiteral("process"), Qt::CaseInsensitive)) {
+        || message.contains(QStringLiteral("crash"), Qt::CaseInsensitive)) {
         return QStringLiteral("识别组件本次运行异常。请再次点击开始识别；若仍失败，请关闭其他正在运行的版本后重启软件。");
     }
     if (message.contains(QStringLiteral("无法可靠"))
@@ -168,7 +234,82 @@ QString localizedBackendError(const QString &message)
         || message.contains(QStringLiteral("图片"))) {
         return QStringLiteral("无法读取图片，请检查图片格式或文件是否损坏。");
     }
+    // 2026-10-22 修正：通用英文关键词 "process" 原来排在 "image" **之前**，
+    // 于是缺图消息形如 "image does not exist: D:\...\process\xxx.png" 时，
+    // 路径里的 process 子串先命中，提示成"识别组件本次运行异常…请重启软件"，
+    // 而不是"无法读取图片"。通用关键词放到最后判断。
+    if (message.contains(QStringLiteral("process"), Qt::CaseInsensitive)) {
+        return QStringLiteral("识别组件本次运行异常。请再次点击开始识别；若仍失败，请关闭其他正在运行的版本后重启软件。");
+    }
     return QStringLiteral("识别失败，已保留原始错误信息。请展开“详细信息”查看后重试。");
+}
+
+QString localizedExportError(const QString &errorCode, const QString &message)
+{
+    // 2026-10-22 修正：原来导出失败和识别失败共用一个提示函数，导出错误
+    // 落到兜底文案"识别未完成，请重新识别" —— 用户点"Excel"失败却被告知去
+    // 重新识别，会白跑一次几十秒的识别，真实原因（路径被占用 / 权限 /
+    // 网格不规整）只藏在 tooltip 里。这里按后端 error_code 分支。
+    if (errorCode == QStringLiteral("EXPORT_PATH_REQUIRED"))
+        return QStringLiteral("没有指定导出文件路径。");
+    if (errorCode == QStringLiteral("EXPORT_GRID_INVALID"))
+        return QStringLiteral("导出内容不是规整的矩形表格，无法写入 Excel。");
+    if (errorCode == QStringLiteral("EXPORT_SPAN_INVALID"))
+        return QStringLiteral("合并单元格信息无效，无法写入 Excel。");
+    if (errorCode == QStringLiteral("EXPORT_WRITE_FAILED"))
+        return QStringLiteral("无法写入导出文件。请关闭正在占用该文件的程序（例如 Excel），或换一个保存位置后重试。");
+    if (errorCode == QStringLiteral("INTERNAL_ERROR"))
+        return QStringLiteral("导出时发生内部错误，请重试。");
+    // 2026-10-23 修正（findings/68 F1）：导出阶段还会走到下面这些后端级错误码，
+    // 原先它们不在上面 5 个分支里、message 也不含下面的关键词，于是全部落到
+    // 最终兜底 —— 界面一律显示"请关闭正在占用该文件的程序"，与真实原因无关
+    // （协议不兼容 / 组件无响应 / 内存不足 / 模型损坏 / 请求非法都会被说成"被占用"）。
+    if (errorCode == QStringLiteral("UNSUPPORTED_PROTOCOL"))
+        return QStringLiteral("识别组件与当前程序版本不兼容，请更新或重新安装后再试。");
+    if (errorCode == QStringLiteral("EMPTY_RESPONSE"))
+        return QStringLiteral("识别组件没有返回有效结果，请重试。");
+    if (errorCode == QStringLiteral("INSUFFICIENT_MEMORY"))
+        return QStringLiteral("可用内存不足，未能完成导出。请关闭占用内存的程序后重试。");
+    if (errorCode == QStringLiteral("INVALID_REQUEST"))
+        return QStringLiteral("导出请求无效，请重新识别后再导出。");
+    if (errorCode == QStringLiteral("INVALID_OPTION"))
+        return QStringLiteral("导出选项无效，请在设置里重新选择后再导出。");
+    if (errorCode == QStringLiteral("MODEL_MISSING"))
+        return QStringLiteral("识别模型缺失或损坏，请重新安装后再试。");
+    if (errorCode == QStringLiteral("OUTPUT_WRITE_FAILED"))
+        return QStringLiteral("无法写入导出文件，请检查输出路径是否可写。");
+    if (errorCode == QStringLiteral("NETWORK_ACCESS_DENIED"))
+        return QStringLiteral("本产品不会进行任何网络访问，请检查本地识别组件后重试。");
+    // 2026-10-23 第 50 轮修正（findings/109 M3）：上面这些是**后端协议层**的码，
+    // 但导出还会先撞上**传输层**的失败（backendrunner.cpp 的 requestFailed）——
+    // 这几个码后端从来不会返回，原先全部落进最终兜底，导出超时尤其看不出是超时。
+    if (errorCode == QStringLiteral("BACKEND_BUSY"))
+        return QStringLiteral("识别组件正在处理上一个任务，请稍后重试。");
+    if (errorCode == QStringLiteral("BACKEND_NOT_CONFIGURED"))
+        return QStringLiteral("识别组件未配置就绪，请检查安装目录是否完整后重试。");
+    if (errorCode == QStringLiteral("BACKEND_START_FAILED"))
+        return QStringLiteral("识别组件启动失败，请关闭其他正在运行的版本后重试。");
+    if (errorCode == QStringLiteral("BACKEND_CRASHED"))
+        return QStringLiteral("识别组件异常退出，导出未完成。请重试；若反复出现请重启软件。");
+    // 超时与取消走的是**空错误码**（backendrunner.cpp:244），导出超时必须单独认出来。
+    if (errorCode.isEmpty() && message.contains(QStringLiteral("超时")))
+        return QStringLiteral("操作超时，导出未完成。请稍后重试。");
+    // 没有结构化错误码时按后端原文兜底判断。
+    if (message.contains(QStringLiteral("output_path is required"), Qt::CaseInsensitive))
+        return QStringLiteral("没有指定导出文件路径。");
+    if (message.contains(QStringLiteral("cells must"), Qt::CaseInsensitive))
+        return QStringLiteral("导出内容不是规整的矩形表格，无法写入 Excel。");
+    if (message.contains(QStringLiteral("invalid XLSX"), Qt::CaseInsensitive))
+        return QStringLiteral("合并单元格信息无效，无法写入 Excel。");
+    if (message.contains(QStringLiteral("permission"), Qt::CaseInsensitive)
+        || message.contains(QStringLiteral("denied"), Qt::CaseInsensitive))
+        return QStringLiteral("没有写入权限。请换一个保存位置后重试。");
+    // 最终兜底：不要再断言"被占用"（2026-10-23 修正，见 findings/68 F1）。
+    // 真实原因可能与文件占用无关。
+    // 2026-10-23 第 50 轮修正（findings/109 M2）：**不要承诺「展开详细信息」**——
+    // localizedBackendDetail()（本文件下方）只在原文纯中文时把原文放进 tooltip，
+    // 多数情况下 tooltip 与状态栏逐字相同 ⇒ 那个提示是假承诺，会把用户引到空处。
+    return QStringLiteral("导出失败。请重试；若仍失败，请重新识别后再导出。");
 }
 
 QString localizedBackendDetail(const QString &technicalMessage,
@@ -268,6 +409,25 @@ bool validateSpans(const QJsonValue &value,
 }
 }
 
+namespace OcrTableToolGui {
+
+int remainingRecognitionBudgetSeconds(qint64 usedMilliseconds)
+{
+    // findings B1：自动重试用剩余预算，不允许再开一轮完整时长。
+    // 已用时长里已经包含了第一次请求的进程冷启与模型构建，所以这里算出来的
+    // 秒数就是「这一次自动重试最多还能跑多久」；重试间隔先扣掉，
+    // 保证 已用 + 间隔 + 重试预算 ≤ 一次识别预算。
+    const qint64 remainingMilliseconds =
+        qint64(kRecognitionWallBudgetMilliseconds)
+        - qMax<qint64>(0, usedMilliseconds)
+        - qint64(kRetryDelayMilliseconds);
+    if (remainingMilliseconds <= 0)
+        return 0;
+    return int(remainingMilliseconds / 1000);
+}
+
+} // namespace OcrTableToolGui
+
 MainWindow::MainWindow(QWidget *parent)
     : QMainWindow(parent)
     , m_backend(new BackendRunner(this))
@@ -278,6 +438,7 @@ MainWindow::MainWindow(QWidget *parent)
     , m_recognitionActive(false)
     , m_restartRecognitionAfterCancel(false)
     , m_recognitionRetryCount(0)
+    , m_startRequestedWhileStopping(false)
     , m_publicationBlocked(false)
 {
     clearStaleRectifiedImages();
@@ -291,6 +452,16 @@ MainWindow::MainWindow(QWidget *parent)
 
 MainWindow::~MainWindow()
 {
+    // 2026-10-23：必须**先**停掉后端进程再让成员析构。
+    // MainWindow 是栈对象，析构时值成员先于子对象被销毁；而 BackendRunner 是
+    // 本窗口的子 QObject，它析构里的 kill()+waitForFinished() 会同步触发
+    // finished() -> processFinished() -> emit requestSucceeded()，
+    // MainWindow::backendSucceeded() 随后写 m_pendingRecognitionResponse ——
+    // 那个成员此时已经析构，use-after-free，Windows 报 0xC0000374 堆损坏，
+    // 表现为"识别过一次之后点 X 关闭必崩"（4/4 复现）。
+    // 在这里显式调用 shutdown()，把时点提到成员析构之前。
+    if (m_backend)
+        m_backend->shutdown();
     clearOwnedRectifiedImage();
     clearOwnedCroppedImage();
 }
@@ -708,6 +879,12 @@ bool MainWindow::loadImage(const QString &path)
     }
     m_sourceImagePath = QFileInfo(path).absoluteFilePath();
     m_imagePath = m_sourceImagePath;
+    // 2026-10-30（lead 复查）：只记住**用户选的**那张图；框选后重新 loadImage 传进来的是
+    // 我们自己生成的 crop-*.png（AppData 临时文件），不能拿它当导出默认名。
+    if (m_ownedCroppedImagePath.isEmpty()
+        || m_sourceImagePath != m_ownedCroppedImagePath) {
+        m_userVisibleImagePath = m_sourceImagePath;
+    }
     if (!m_ownedCroppedImagePath.isEmpty()
         && m_ownedCroppedImagePath != m_sourceImagePath) {
         clearOwnedCroppedImage();
@@ -732,11 +909,13 @@ bool MainWindow::loadImage(const QString &path)
     m_table->setRowCount(0);
     m_table->setColumnCount(0);
     m_spans = QJsonArray();
+    m_structureCertificate = QJsonObject();
     m_pendingRecognitionResponse = QJsonObject();
     m_pendingRecognitionError.clear();
     m_recognitionDisplayRequested = false;
     m_recognitionActive = false;
     m_recognitionRetryCount = 0;
+    m_startRequestedWhileStopping = false;
     m_publicationBlocked = false;
     m_resultSummaryLabel->setText(QStringLiteral("等待开始识别"));
     m_reviewNotice->hide();
@@ -821,8 +1000,12 @@ bool MainWindow::eventFilter(QObject *watched, QEvent *event)
 
 void MainWindow::recognizeImage()
 {
-    if (m_sourceImagePath.isEmpty())
+    if (m_sourceImagePath.isEmpty()) {
+        // 按钮在没有图片时是禁用的，正常点不到；留一条可读提示
+        // 以免自动触发路径（测试钩子 / 拖放）里出现"点了什么都没发生"。
+        m_statusLabel->setText(QStringLiteral("请先打开一张表格图片，再开始识别。"));
         return;
+    }
 
     m_recognitionDisplayRequested = true;
     if (!m_pendingRecognitionResponse.isEmpty()) {
@@ -839,9 +1022,27 @@ void MainWindow::recognizeImage()
         return;
     }
     if (m_backend->isRunning()) {
+        // findings/61 F5：这里过去只有"正在识别"一种状态有反馈，另外两种状态
+        // 会把用户的点击**静默吞掉**（用户点了没反应，或者更糟：停止完成后
+        // 状态栏改写成"识别已取消"，等于告诉用户"你取消了"）。
+        // 现在按状态分开提示，并且不丢点击意图：
+        if (m_backend->isStopping()) {
+            // 停止窗口：进程还在回收。记住意图，等停止完成（backendFailed 收到
+            // 取消/超时上报时）立刻补跑，而不是让用户再点一次。
+            m_startRequestedWhileStopping = true;
+            m_statusLabel->setText(
+                QStringLiteral("识别组件正在结束上一个任务，稍后会自动开始识别…"));
+            m_readyStateLabel->setText(QStringLiteral("正在处理"));
+            updateActions();
+            return;
+        }
         if (m_recognitionActive) {
             setBusy(true, QStringLiteral("正在精确识别，请稍等…"));
+            return;
         }
+        // 识别组件被其它任务占用（例如导出 XLSX）。
+        m_statusLabel->setText(
+            QStringLiteral("识别组件正在处理另一项任务，请等它完成后再点开始识别。"));
         return;
     }
     m_recognitionRetryCount = 0;
@@ -857,10 +1058,22 @@ void MainWindow::startBackgroundRecognition()
     startRecognitionRequest();
 }
 
-void MainWindow::startRecognitionRequest()
+void MainWindow::startRecognitionRequest(int budgetSeconds)
 {
-    if (m_sourceImagePath.isEmpty() || m_backend->isRunning())
+    if (m_sourceImagePath.isEmpty()) {
+        m_statusLabel->setText(QStringLiteral("请先打开一张表格图片，再开始识别。"));
         return;
+    }
+    if (m_backend->isRunning()) {
+        // 同样不允许静默返回：走到这里说明点击被"组件忙"挡住了（findings/61 F5）。
+        m_statusLabel->setText(
+            m_backend->isStopping()
+                ? QStringLiteral("识别组件正在结束上一个任务，稍后会自动开始识别…")
+                : QStringLiteral("识别组件正在处理另一项任务，请等它完成后再点开始识别。"));
+        if (m_backend->isStopping())
+            m_startRequestedWhileStopping = true;
+        return;
+    }
     clearPublishedResult(
         m_recognitionDisplayRequested
             ? QStringLiteral("正在重新识别，本次结果生成前不可导出")
@@ -872,6 +1085,11 @@ void MainWindow::startRecognitionRequest()
     m_pendingRecognitionResponse = QJsonObject();
     m_pendingRecognitionError.clear();
     m_recognitionActive = true;
+    m_startRequestedWhileStopping = false;
+    // 一次识别的预算从**首个**请求发出时开始计；自动重试沿用同一个计时器，
+    // 所以只有全新一轮（重试计数为 0）才重置（findings B1）。
+    if (m_recognitionRetryCount == 0)
+        m_recognitionBudgetTimer.start();
     QJsonObject requestTrace;
     requestTrace.insert(QStringLiteral("file_name"),
                         QFileInfo(m_sourceImagePath).fileName());
@@ -879,6 +1097,8 @@ void MainWindow::startRecognitionRequest()
                         m_recognitionDisplayRequested);
     requestTrace.insert(QStringLiteral("input_rectified"),
                         m_recognitionSourceIsRectified);
+    requestTrace.insert(QStringLiteral("budget_seconds"), budgetSeconds);
+    requestTrace.insert(QStringLiteral("attempt"), m_recognitionRetryCount + 1);
     const bool selectedTableRegion = !m_ownedCroppedImagePath.isEmpty()
         && QFileInfo(m_ownedCroppedImagePath).absoluteFilePath()
             == QFileInfo(m_sourceImagePath).absoluteFilePath();
@@ -889,7 +1109,8 @@ void MainWindow::startRecognitionRequest()
                          outputDirectory,
                          QStringLiteral("auto"),
                          m_recognitionSourceIsRectified,
-                         selectedTableRegion);
+                         selectedTableRegion,
+                         budgetSeconds);
 }
 
 TableData MainWindow::currentTable() const
@@ -902,7 +1123,8 @@ TableData MainWindow::currentTable() const
                           column,
                           item ? item->text() : QString(),
                           item ? item->data(Qt::UserRole).toDouble() : 1.0,
-                          item ? item->data(Qt::UserRole + 1).toBool() : false);
+                          item ? item->data(Qt::UserRole + 1).toBool() : false,
+                          item ? item->data(Qt::UserRole + 3).toBool() : false);
         }
     }
     return table;
@@ -910,7 +1132,17 @@ TableData MainWindow::currentTable() const
 
 QString MainWindow::suggestedOutputPath(const QString &suffix) const
 {
-    const QFileInfo source(m_sourceImagePath.isEmpty() ? m_imagePath : m_sourceImagePath);
+    // 2026-10-30（lead 复查）：优先用**用户可见的原图路径**。框选/拍照后
+    // m_sourceImagePath 会变成 AppData 里的 crop-<uuid>.png，用它拼默认名会让
+    // 客户在「文档/图片」里找不到导出文件（实测默认落到
+    // C:\Users\…\AppData\Local\AP\OcrTableTool\crop-<uuid>.xlsx）。
+    const QString visible = !m_userVisibleImagePath.isEmpty()
+                                ? m_userVisibleImagePath
+                                : (m_sourceImagePath.isEmpty() ? m_imagePath
+                                                               : m_sourceImagePath);
+    const QFileInfo source(visible);
+    if (source.fileName().isEmpty())
+        return QStringLiteral("识别结果") + suffix;
     return source.dir().filePath(source.completeBaseName() + suffix);
 }
 
@@ -944,8 +1176,10 @@ void MainWindow::exportXlsx()
         QStringLiteral("导出 XLSX"),
         suggestedOutputPath(QStringLiteral(".xlsx")),
         QStringLiteral("Excel 工作簿 (*.xlsx)"));
+    // findings/61 F6：把识别阶段严格校验通过的结构证书一起交给后端，
+    // 后端 write_xlsx 才能用它校准列宽与物理边界（GUI 不裁剪、不覆盖该字段）。
     if (!path.isEmpty())
-        m_backend->exportXlsx(path, currentTable(), m_spans);
+        m_backend->exportXlsx(path, currentTable(), m_spans, m_structureCertificate);
 }
 
 void MainWindow::editTableCell(int row, int column)
@@ -1004,6 +1238,9 @@ void MainWindow::clearSpansAfterStructureEdit()
 {
     m_table->clearSpans();
     m_spans = QJsonArray();
+    // 行列结构被人工改过之后，原证书的边界与当前网格不再对应，
+    // 继续带到导出会被后端判为非法边界（findings/61 F6 的"宁可不发"）。
+    m_structureCertificate = QJsonObject();
     m_resultSummaryLabel->setText(QStringLiteral("%1 行 × %2 列 · 已调整结构")
                                       .arg(m_table->rowCount())
                                       .arg(m_table->columnCount()));
@@ -1095,13 +1332,15 @@ void MainWindow::publishRecognitionResult(const QJsonObject &response)
     QString error;
     const TableData table = TableData::fromBackendJson(response, &error);
     if (!error.isEmpty()) {
-        backendFailed(QStringLiteral("recognize"), error);
+        backendFailed(QStringLiteral("recognize"), error,
+                      QStringLiteral("INVALID_RESPONSE"), false);
         return;
     }
     const QJsonValue publicationBlockedValue = response.value(QStringLiteral("publication_blocked"));
     if (!publicationBlockedValue.isBool()) {
         backendFailed(QStringLiteral("recognize"),
-                      QStringLiteral("识别结果缺少风险发布状态。"));
+                      QStringLiteral("识别结果缺少风险发布状态。"),
+                      QStringLiteral("INVALID_RESPONSE"), false);
         return;
     }
     const QJsonValue recognitionStateValue = response.value(QStringLiteral("recognition_state"));
@@ -1113,7 +1352,8 @@ void MainWindow::publishRecognitionResult(const QJsonObject &response)
             && recognitionState != QStringLiteral("blocked"))
         || (recognitionState == QStringLiteral("blocked")) != publicationBlocked) {
         backendFailed(QStringLiteral("recognize"),
-                      QStringLiteral("识别结果的风险状态前后不一致。"));
+                      QStringLiteral("识别结果的风险状态前后不一致。"),
+                      QStringLiteral("INVALID_RESPONSE"), false);
         return;
     }
     const QJsonValue structureVerifiedValue = response.value(QStringLiteral("structure_verified"));
@@ -1122,7 +1362,8 @@ void MainWindow::publishRecognitionResult(const QJsonObject &response)
         && !structureCertificateValue.isNull();
     if (!structureVerifiedValue.isBool()) {
         backendFailed(QStringLiteral("recognize"),
-                      QStringLiteral("识别结果缺少表格结构状态。"));
+                      QStringLiteral("识别结果缺少表格结构状态。"),
+                      QStringLiteral("INVALID_RESPONSE"), false);
         return;
     }
     const bool structureVerified = structureVerifiedValue.toBool();
@@ -1133,7 +1374,8 @@ void MainWindow::publishRecognitionResult(const QJsonObject &response)
                        &validatedSpans,
                        &error)) {
         if (structureVerified) {
-            backendFailed(QStringLiteral("recognize"), error);
+            backendFailed(QStringLiteral("recognize"), error,
+                      QStringLiteral("INVALID_RESPONSE"), false);
             return;
         }
         validatedSpans = QJsonArray();
@@ -1158,13 +1400,15 @@ void MainWindow::publishRecognitionResult(const QJsonObject &response)
     if (!structureVerified) {
         if (hasStructureCertificate || !publicationBlocked) {
             backendFailed(QStringLiteral("recognize"),
-                          QStringLiteral("结构未确认的结果包含不安全的合并关系或发布状态。"));
+                          QStringLiteral("结构未确认的结果包含不安全的合并关系或发布状态。"),
+                          QStringLiteral("INVALID_RESPONSE"), false);
             return;
         }
     } else {
         if (!structureCertificateValue.isObject()) {
             backendFailed(QStringLiteral("recognize"),
-                          QStringLiteral("已确认的表格结构缺少校验证书。"));
+                          QStringLiteral("已确认的表格结构缺少校验证书。"),
+                          QStringLiteral("INVALID_RESPONSE"), false);
             return;
         }
         const QJsonObject certificate = structureCertificateValue.toObject();
@@ -1186,7 +1430,8 @@ void MainWindow::publishRecognitionResult(const QJsonObject &response)
             || certificate.value(QStringLiteral("geometry_hash")).toString().isEmpty()
             || certificate.value(QStringLiteral("structure_hash")).toString().isEmpty()) {
             backendFailed(QStringLiteral("recognize"),
-                          QStringLiteral("表格结构校验证书与识别结果不一致。"));
+                          QStringLiteral("表格结构校验证书与识别结果不一致。"),
+                          QStringLiteral("INVALID_RESPONSE"), false);
             return;
         }
     }
@@ -1195,12 +1440,18 @@ void MainWindow::publishRecognitionResult(const QJsonObject &response)
             for (int column = 0; column < table.columnCount(); ++column) {
                 if (table.needsReview(row, column)) {
                     backendFailed(QStringLiteral("recognize"),
-                                  QStringLiteral("已确认结果中仍存在待核对单元格。"));
+                                  QStringLiteral("已确认结果中仍存在待核对单元格。"),
+                                  QStringLiteral("INVALID_RESPONSE"), false);
                     return;
                 }
             }
         }
     }
+    // findings/61 F6：校验通过的证书必须留到导出。原先它只被校验、不留存，
+    // 导出请求里没有它 ⇒ 后端 write_xlsx 的证书分支（列宽/边界校准）永远跳过。
+    // 未认证（结构未确认）的结果一律清空，避免把上一张表的证书带出去。
+    m_structureCertificate = structureVerified ? structureCertificateValue.toObject()
+                                               : QJsonObject();
     m_publicationBlocked = publicationBlocked;
     m_spans = validatedSpans;
     showTable(table, m_spans);
@@ -1209,7 +1460,13 @@ void MainWindow::publishRecognitionResult(const QJsonObject &response)
     publishedTrace.insert(QStringLiteral("columns"), table.columnCount());
     publishedTrace.insert(QStringLiteral("span_count"), m_spans.size());
     publishedTrace.insert(QStringLiteral("publication_blocked"), m_publicationBlocked);
+    // review_cell_count 是界面自己的待确认格数（UserRole+1 或 UserRole+2），
+    // 与后端同名字段口径不同（后端只认 needs_review）。两个口径各写一个
+    // 名字，避免验收时把 GUI 的数当成后端的数读。
     publishedTrace.insert(QStringLiteral("review_cell_count"), pendingReviewCount());
+    publishedTrace.insert(QStringLiteral("ui_pending_count"), pendingReviewCount());
+    publishedTrace.insert(QStringLiteral("backend_review_cell_count"),
+                          response.value(QStringLiteral("review_cell_count")).toInt());
     publishedTrace.insert(QStringLiteral("canonical_result_hash"),
                           canonicalDisplayedResultHash(table,
                                                        m_spans,
@@ -1219,8 +1476,19 @@ void MainWindow::publishRecognitionResult(const QJsonObject &response)
     GuiTrace::write(QStringLiteral("result_published"), publishedTrace);
     m_recognitionRetryCount = 0;
     m_recognizeButton->setText(QStringLiteral("重新识别"));
-    const double elapsedSeconds = response.value(QStringLiteral("worker_wall_seconds"))
-                                      .toDouble(response.value(QStringLiteral("elapsed_seconds")).toDouble());
+    // findings F4：状态栏「用时」过去取 worker_wall_seconds —— 那是 worker 从进程
+    // 启动到退出（含解释器启动、模型卸载、进程回收）的全生命周期，比识别组件自己
+    // 计时的 elapsed_seconds 大，和"单次识别 60 秒墙钟"这条契约**不能相减**，
+    // 显示的秒数也系统性偏大。现在优先显示 elapsed_seconds（后端口径），
+    // 退出开销单独在 tooltip 里点明；识别组件没上报自身计时（桩后端 / 老版本）时，
+    // 退回「worker 全生命周期 − 响应到退出那段」的估算。
+    const double workerWallSeconds = response.value(QStringLiteral("worker_wall_seconds")).toDouble(-1.0);
+    const double responseExitSeconds = qMax(0.0, response.value(QStringLiteral("response_exit_seconds")).toDouble(0.0));
+    const QJsonValue elapsedSecondsValue = response.value(QStringLiteral("elapsed_seconds"));
+    const bool elapsedFromWorker = !elapsedSecondsValue.isDouble();
+    const double elapsedSeconds = elapsedFromWorker
+        ? qMax(0.0, workerWallSeconds >= 0.0 ? workerWallSeconds - responseExitSeconds : 0.0)
+        : response.value(QStringLiteral("elapsed_seconds")).toDouble();
     const int withheldNumbers = response.value(QStringLiteral("withheld_numeric_segments")).toInt();
     QString statusText;
     if (m_publicationBlocked) {
@@ -1272,18 +1540,42 @@ void MainWindow::publishRecognitionResult(const QJsonObject &response)
     structureWarningTexts.removeDuplicates();
     if (publicationBlockReasonTexts.isEmpty() && !structureWarningTexts.isEmpty())
         detailTexts.append(QStringLiteral("结构待核对：%1").arg(structureWarningTexts.join(QStringLiteral("；"))));
+    // 用时口径（findings F4）：状态栏上的数字是识别组件自身计时，可与单次识别
+    // 60 秒上限直接比较；进程启动 / 退出与模型卸载的开销单独在这里交代，
+    // 免得验收时把两个不同口径的秒数拿去相减。
+    if (elapsedFromWorker) {
+        detailTexts.append(
+            QStringLiteral("用时口径：识别组件未上报自身计时，显示的 %1 秒是识别进程全生命周期减去退出开销后的估算。")
+                .arg(elapsedSeconds, 0, 'f', 1));
+    } else if (responseExitSeconds > 0.0) {
+        detailTexts.append(
+            QStringLiteral("用时口径：%1 秒为识别组件自身计时，可与单次识别 60 秒上限直接比较；另有 %2 秒用于进程启动与退出、模型卸载。")
+                .arg(elapsedSeconds, 0, 'f', 1)
+                .arg(responseExitSeconds, 0, 'f', 1));
+    }
     const QString detailText = detailTexts.join(QStringLiteral("\n"));
     m_statusLabel->setText(statusText);
     m_statusLabel->setToolTip(detailText.isEmpty() ? statusText : detailText);
     m_reviewNotice->setToolTip(detailText);
     m_resultStack->setCurrentWidget(m_table);
     const QString rectifiedPath = response.value(QStringLiteral("rectified_image")).toString();
-    const QImage rectified(rectifiedPath);
-    if (!rectified.isNull()) {
-        clearOwnedRectifiedImage();
-        m_ownedRectifiedImagePath = QFileInfo(rectifiedPath).absoluteFilePath();
-        m_rectifiedPreview->setImage(rectified);
-        m_previewTabs->setCurrentIndex(1);
+    if (!OcrTableToolGui::isSafeLocalImagePath(rectifiedPath)) {
+        // 路径不可信（UNC、上级目录或为空）：不打开它，只在状态栏说明。
+        const QString warning = rectifiedPath.trimmed().isEmpty()
+            ? QStringLiteral("识别组件没有返回矫正图，已跳过矫正图预览。")
+            : QStringLiteral("识别组件返回的矫正图路径不是本地安全路径，已忽略该图片。");
+        m_statusLabel->setText(statusText + QStringLiteral(" · ") + warning);
+        m_statusLabel->setToolTip(detailText.isEmpty()
+                                      ? warning
+                                      : detailText + QStringLiteral("\n") + warning);
+    } else {
+        const QImage rectified(rectifiedPath);
+        if (!rectified.isNull()) {
+            clearOwnedRectifiedImage();
+            m_ownedRectifiedImagePath = QFileInfo(rectifiedPath).absoluteFilePath();
+            m_rectifiedPreview->setImage(rectified);
+            m_previewTabs->setCurrentIndex(1);
+        }
     }
 }
 
@@ -1350,11 +1642,14 @@ void MainWindow::clearStaleRectifiedImages()
     }
 }
 
-void MainWindow::backendFailed(const QString &action, const QString &message)
+void MainWindow::backendFailed(const QString &action, const QString &message,
+                               const QString &errorCode, bool retryable)
 {
     QJsonObject failureTrace;
     failureTrace.insert(QStringLiteral("action"), action);
     failureTrace.insert(QStringLiteral("message"), message.left(1000));
+    failureTrace.insert(QStringLiteral("error_code"), errorCode);
+    failureTrace.insert(QStringLiteral("retryable"), retryable);
     failureTrace.insert(QStringLiteral("display_requested"),
                         m_recognitionDisplayRequested);
     GuiTrace::write(QStringLiteral("backend_failed"), failureTrace);
@@ -1368,6 +1663,28 @@ void MainWindow::backendFailed(const QString &action, const QString &message)
     }
     if (action == QStringLiteral("recognize")) {
         m_recognitionActive = false;
+        // findings/61 F5：用户在"正在停止"窗口里点的「开始识别」不能被吞掉。
+        // 停止完成时后端上报的是"操作已取消"/"操作超时"，而这一刻 m_stopping
+        // 已复位（isRunning() == false）—— 正是补跑时机。顺带避免状态栏把
+        // 用户的"重新开始"改写成"识别已取消"。
+        if (m_startRequestedWhileStopping && !m_backend->isRunning()) {
+            m_startRequestedWhileStopping = false;
+            m_restartRecognitionAfterCancel = false;
+            m_pendingRecognitionResponse = QJsonObject();
+            m_pendingRecognitionError.clear();
+            // 这是用户新发起的一轮，预算重新从 0 计（重试计数归零）。
+            m_recognitionRetryCount = 0;
+            setBusy(false);
+            m_statusLabel->setText(
+                QStringLiteral("识别组件已就绪，正在按刚才的点击重新识别…"));
+            GuiTrace::write(QStringLiteral("recognition_resumed_after_stop"));
+            const QString resumeSource = m_sourceImagePath;
+            QTimer::singleShot(0, this, [this, resumeSource]() {
+                if (m_sourceImagePath == resumeSource && !m_backend->isRunning())
+                    startRecognitionRequest();
+            });
+            return;
+        }
         if (message == QStringLiteral("操作已取消")) {
             m_pendingRecognitionResponse = QJsonObject();
             m_pendingRecognitionError.clear();
@@ -1386,20 +1703,70 @@ void MainWindow::backendFailed(const QString &action, const QString &message)
             m_statusLabel->setText(QStringLiteral("识别已取消"));
             return;
         }
-        const bool insufficientMemory = message.startsWith(
-            QStringLiteral("可用内存不足"));
+        // 2026-10-23 第 50 轮修正（findings/109 M1）：原判定只看 message 是否以
+        // 「可用内存不足」开头，但后端**只对原生 OOM** 改写 message
+        // （ocr_backend.py:62602-62608）；Python 的 MemoryError 支（:62545-62546）
+        // 透的是空串/原文 ⇒ 那一支落通用兜底，用户看不到内存不足提示。
+        // 改为**优先按 error_code 精确匹配**（公开 SDK 的 cameraocrclient.cpp:820 同款做法），
+        // 前缀判断保留为兼容（后端文案变化时不至于失效）。
+        const bool insufficientMemory =
+            errorCode == QStringLiteral("INSUFFICIENT_MEMORY")
+            || message.startsWith(QStringLiteral("可用内存不足"));
+        // 2026-10-22 修正：原来**任何**失败都会自动重试一次，包括"识别模型
+        // 文件缺失或损坏"、协议不兼容这类必然再失败的错误 —— 用户要白等两轮
+        // 完整失败（每轮重载数 GB OpenVINO 工作集）才看到提示，平板上多耗
+        // 一分钟以上。现在只有后端明确标记 retryable（或没有结构化错误码，
+        // 例如进程崩溃、传输层失败）时才重试。
+        const bool retryAllowed = errorCode.isEmpty() || retryable;
+        // 2026-10-28 修正（findings B1）：自动重试**不允许**再开一轮完整时长。
+        // 原先每轮都冷启进程、各跑满一次预算 ⇒ 一次识别实际最长 ~120 秒，
+        // 与对外"单次识别 60 秒墙钟"的口径不符。这里按首个请求发出后的
+        // 墙钟已用时长算剩余预算：够用才重试，且只把**剩余秒数**传给后端与
+        // 父进程计时器（backendrunner.cpp 的 recognize/timeout）。
+        // 口径：预算常量是界面侧镜像，不改后端契约、不改首次请求（仍传 0）。
+        const qint64 usedMilliseconds = m_recognitionBudgetTimer.isValid()
+            ? m_recognitionBudgetTimer.elapsed()
+            : qint64(kRecognitionWallBudgetMilliseconds);
+        const int remainingBudgetSeconds =
+            OcrTableToolGui::remainingRecognitionBudgetSeconds(usedMilliseconds);
+        const bool retryBudgetExhausted =
+            remainingBudgetSeconds < kMinimumRetryBudgetSeconds;
+        // 「本该重试、但预算不允许」——只有这种情形才需要在提示里说明没重试。
+        const bool retrySkippedByBudget = retryAllowed
+            && !insufficientMemory
+            && m_recognitionRetryCount < 1
+            && retryBudgetExhausted
+            && !m_sourceImagePath.isEmpty();
+        if (retrySkippedByBudget) {
+            QJsonObject budgetTrace;
+            budgetTrace.insert(QStringLiteral("action"), action);
+            budgetTrace.insert(QStringLiteral("used_milliseconds"),
+                               static_cast<double>(usedMilliseconds));
+            budgetTrace.insert(QStringLiteral("remaining_seconds"), remainingBudgetSeconds);
+            budgetTrace.insert(QStringLiteral("skipped_reason"),
+                               QStringLiteral("budget_exhausted"));
+            GuiTrace::write(QStringLiteral("recognition_retry_skipped"), budgetTrace);
+        }
         if (!insufficientMemory
             && m_recognitionRetryCount < 1
-            && !m_sourceImagePath.isEmpty()) {
+            && retryAllowed
+            && !m_sourceImagePath.isEmpty()
+            && !retryBudgetExhausted) {
             ++m_recognitionRetryCount;
             m_pendingRecognitionResponse = QJsonObject();
             m_pendingRecognitionError.clear();
             setBusy(false);
             const QString retrySource = m_sourceImagePath;
             m_statusLabel->setText(QStringLiteral("首次识别未完成，正在自动恢复并重试…"));
-            QTimer::singleShot(350, this, [this, retrySource]() {
+            QJsonObject retryTrace;
+            retryTrace.insert(QStringLiteral("budget_seconds"), remainingBudgetSeconds);
+            retryTrace.insert(QStringLiteral("used_milliseconds"),
+                              static_cast<double>(usedMilliseconds));
+            GuiTrace::write(QStringLiteral("recognition_retry_scheduled"), retryTrace);
+            QTimer::singleShot(kRetryDelayMilliseconds, this,
+                               [this, retrySource, remainingBudgetSeconds]() {
                 if (m_sourceImagePath == retrySource && !m_backend->isRunning())
-                    startRecognitionRequest();
+                    startRecognitionRequest(remainingBudgetSeconds);
             });
             return;
         }
@@ -1414,9 +1781,18 @@ void MainWindow::backendFailed(const QString &action, const QString &message)
         }
         clearPublishedResult(QStringLiteral("本次识别未生成可导出结果"));
         setBusy(false);
-        const QString displayMessage = localizedBackendError(message);
+        // 2026-10-23 修正（findings/68 F2）：前台路径原先对"可用内存不足"也走
+        // localizedBackendError()，该函数没有内存不足分支 ⇒ 落到通用兜底
+        // "识别失败，已保留原始错误信息"，后端那条可操作建议（关闭占内存程序 /
+        // 用框选区域减少识别量）只落在 tooltip 里。前台与后台（:1524）保持一致。
+        const QString displayMessage = insufficientMemory
+            ? QStringLiteral("可用内存不足，已中止识别；释放内存后点击开始识别重试")
+            : localizedBackendError(message);
         m_statusLabel->setText(QStringLiteral("识别未完成：%1 可重新识别或重新框选表格。")
-                                   .arg(displayMessage));
+                                   .arg(displayMessage)
+                               + (retrySkippedByBudget
+                                      ? QStringLiteral("（本次识别已用完 60 秒等待预算，未再自动重试。）")
+                                      : QString()));
         m_statusLabel->setToolTip(localizedBackendDetail(message, displayMessage));
         return;
     }
@@ -1424,6 +1800,13 @@ void MainWindow::backendFailed(const QString &action, const QString &message)
     const QString displayMessage = localizedBackendError(message);
     if (action == QStringLiteral("warmup")) {
         m_statusLabel->setText(QStringLiteral("识别组件准备失败：%1").arg(displayMessage));
+        return;
+    }
+    if (action == QStringLiteral("export_xlsx")) {
+        // 导出失败要单独提示，不能说成"识别未完成"（2026-10-22 修正）。
+        const QString exportMessage = localizedExportError(errorCode, message);
+        m_statusLabel->setText(QStringLiteral("导出失败：%1").arg(exportMessage));
+        m_statusLabel->setToolTip(localizedBackendDetail(message, exportMessage));
         return;
     }
     m_statusLabel->setText(QStringLiteral("操作失败：%1").arg(displayMessage));
@@ -1438,6 +1821,7 @@ void MainWindow::clearPublishedResult(const QString &summary)
     m_table->setColumnCount(0);
     m_spans = QJsonArray();
     m_publicationBlocked = false;
+    m_structureCertificate = QJsonObject();
     m_resultStack->setCurrentIndex(0);
     m_reviewNotice->hide();
     if (!summary.isEmpty())
@@ -1468,18 +1852,40 @@ void MainWindow::showTable(const TableData &table, const QJsonArray &spans)
             QTableWidgetItem *item = new QTableWidgetItem(table.cell(row, column));
             const double confidence = table.confidence(row, column);
             const bool needsReview = table.needsReview(row, column);
+            // 0.77 / 0.86 是各识别路径硬写的类别哨兵，不是实测置信度。
+            // 后端用可选字段 confidence_sentinel 显式表达这件事，界面只消费
+            // 这个字段，不再自己拿 0.78 去和哨兵比大小。
+            const bool confidenceSentinel = table.confidenceSentinel(row, column);
+            const bool requiresAttention = table.requiresAttention(row, column);
             item->setData(Qt::UserRole, confidence);
             item->setData(Qt::UserRole + 1, needsReview);
+            // Qt::UserRole + 3：单元格是不是类别哨兵。只读不改显示语义，
+            // 导出时还要把它带回后端，否则导出会重新按裸 confidence 猜复核。
+            item->setData(Qt::UserRole + 3, confidenceSentinel);
+            // Qt::UserRole + 2：界面自己的"低置信待确认"标记。
+            // 2026-10-22 修正：低置信格（confidence < 0.78 且非空）原来只刷
+            // 标记、只加局部 reviewCount，却**不写任何计数位**，于是
+            // pendingReviewCount() 数不到它 —— 两处口径不一致：提示条说
+            // "N 项待确认"，状态栏却说"人工核对完成，可以正式导出"，而且
+            // 用户手工改一格后提示条忽隐忽现。
+            // 这里单独用 +2 承载界面标记，UserRole+1 仍然是后端的 needs_review
+            // 语义（导出文件的复核标记由它决定，不能混）。
+            item->setData(Qt::UserRole + 2, false);
             if (needsReview) {
                 item->setToolTip(QStringLiteral("待确认：请对照原图核对文字、数字、符号和位置"));
                 item->setIcon(reviewMarkerIcon());
                 ++reviewCount;
+            } else if (confidenceSentinel) {
+                // 哨兵值不是置信度：不能显示成百分比，也不能算待确认。
+                item->setToolTip(QStringLiteral("置信度未知（未取得双模型一致确认）"));
             } else {
                 item->setToolTip(QStringLiteral("OCR 置信度：%1%").arg(qRound(confidence * 100.0)));
             }
-            if (!needsReview && confidence < 0.78 && !item->text().isEmpty()) {
+            // 只有实测置信度真的偏低才补黄格；哨兵格不补。
+            if (requiresAttention && !needsReview) {
                 item->setToolTip(QStringLiteral("待确认：请对照原图核对文字、数字、符号和位置"));
                 item->setIcon(reviewMarkerIcon());
+                item->setData(Qt::UserRole + 2, true);
                 ++reviewCount;
             }
             m_table->setItem(row, column, item);
@@ -1612,7 +2018,15 @@ void MainWindow::tableItemChanged(QTableWidgetItem *item)
         const QSignalBlocker blocker(m_table);
         item->setData(Qt::UserRole, 1.0);
         item->setData(Qt::UserRole + 1, false);
+        item->setData(Qt::UserRole + 2, false);
+        // 人工改过的单元格置信度按 1.0 计，不再是类别哨兵。
+        item->setData(Qt::UserRole + 3, false);
         item->setBackground(QBrush());
+        // 2026-10-30（lead 复查）：原来只清了背景与 tooltip，没清**图标**。
+        // showTable() 会给待核对格 setIcon(reviewMarkerIcon())，于是人工改完后
+        // 黄点还留着，摘要却已变成「0 项待确认 / 人工核对完成，可以正式导出」——
+        // 界面自相矛盾。
+        item->setIcon(QIcon());
         item->setToolTip(QStringLiteral("已人工修改"));
         const int pending = pendingReviewCount();
         m_resultSummaryLabel->setText(QStringLiteral("%1 行 × %2 列 · %3 项待确认")
@@ -1633,7 +2047,8 @@ int MainWindow::pendingReviewCount() const
     for (int row = 0; row < m_table->rowCount(); ++row) {
         for (int column = 0; column < m_table->columnCount(); ++column) {
             const QTableWidgetItem *item = m_table->item(row, column);
-            if (item && item->data(Qt::UserRole + 1).toBool())
+            if (item && (item->data(Qt::UserRole + 1).toBool()
+                          || item->data(Qt::UserRole + 2).toBool()))
                 ++count;
         }
     }
@@ -1699,4 +2114,9 @@ void MainWindow::updateActions()
         : QString();
     m_csvButton->setToolTip(exportTip);
     m_xlsxButton->setToolTip(exportTip);
+    // findings/61 F5：组件忙时按钮被禁用，此时点击根本无法到达槽函数，
+    // 用户同样"点了没反应"。用提示说明原因，避免把"按钮灰了"读成软件卡死。
+    m_recognizeButton->setToolTip(busy && !hiddenRecognition
+        ? QStringLiteral("识别组件正在处理另一项任务，完成前不能开始新的识别")
+        : QString());
 }

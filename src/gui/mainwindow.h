@@ -3,6 +3,7 @@
 
 #include <QJsonArray>
 #include <QJsonObject>
+#include <QElapsedTimer>
 #include <QMainWindow>
 #include <QPoint>
 #include <QRect>
@@ -20,6 +21,16 @@ class QTableWidget;
 class QTableWidgetItem;
 class QTabWidget;
 class TableData;
+
+namespace OcrTableToolGui {
+
+// 自动重试可用的剩余预算（秒）。用首个请求发出后的墙钟已用毫秒数算：
+//   剩余秒 = floor((60000 - 已用毫秒 - 重试间隔) / 1000)，不足 0 记 0。
+// 抽成自由函数（外部链接）是为了让 tests/tst_gui.cpp 能穷举断言
+// 「已用 + 间隔 + 重试预算 ≤ 一次识别预算」这条不变量（findings B1）。
+int remainingRecognitionBudgetSeconds(qint64 usedMilliseconds);
+
+} // namespace OcrTableToolGui
 
 class MainWindow : public QMainWindow
 {
@@ -51,7 +62,8 @@ private slots:
     void removeColumn();
     void backendStarted(const QString &action);
     void backendSucceeded(const QString &action, const QJsonObject &response);
-    void backendFailed(const QString &action, const QString &message);
+    void backendFailed(const QString &action, const QString &message,
+                       const QString &errorCode, bool retryable);
     void tableItemChanged(QTableWidgetItem *item);
     void showOriginalImage();
     void showRectifiedImage();
@@ -60,7 +72,9 @@ private:
     void buildInterface();
     bool loadImage(const QString &path);
     void startBackgroundRecognition();
-    void startRecognitionRequest();
+    // budgetSeconds：0 = 完整预算（与改动前一致）；
+    //               >0 = 只用剩余预算（自动重试专用，见 backendFailed 的预算检查）。
+    void startRecognitionRequest(int budgetSeconds = 0);
     void publishRecognitionResult(const QJsonObject &response);
     void clearPublishedResult(const QString &summary = QString());
     QPushButton *createButton(const QString &text, const QString &objectName = QString());
@@ -80,6 +94,11 @@ private:
     BackendRunner *m_backend;
     QString m_imagePath;
     QString m_sourceImagePath;
+    // 2026-10-30（lead 复查）：用户**真正选的那张图**的路径。
+    // 框选/拍照后再 loadImage() 会把 m_sourceImagePath 换成 AppData 里的
+    // crop-<uuid>.png，导致「导出」的默认文件名落到临时目录的随机名上。
+    // 这一份只记录用户可见的原图，供 suggestedOutputPath 使用。
+    QString m_userVisibleImagePath;
     QString m_ownedRectifiedImagePath;
     QString m_ownedCroppedImagePath;
     // 后端生成的 rectified-*.png 再次导入时禁止重复自动裁剪。
@@ -97,6 +116,15 @@ private:
     bool m_recognitionActive;
     bool m_restartRecognitionAfterCancel;
     int m_recognitionRetryCount;
+    // findings/61 F5：停止窗口内点的「开始识别」原先被静默丢弃（还会被改写
+    // 成"识别已取消"）。这里记住用户的点击意图，等停止真正完成后补跑一次。
+    bool m_startRequestedWhileStopping;
+    // findings B1：一次识别的墙钟预算从首个请求发出时开始计，自动重试只能用**剩余**
+    // 预算，不允许再开一轮完整时长（原先两轮冷启 ⇒ ~120 秒）。
+    QElapsedTimer m_recognitionBudgetTimer;
+    // findings/61 F6：识别时严格校验过的表格结构证书。校验通过后必须留到导出，
+    // 否则后端 write_xlsx 的列宽/边界校准分支永远拿不到它。
+    QJsonObject m_structureCertificate;
     // 该状态独立于单元格 needsReview，用于记录后端给出的整表级安全结论，
     // 并在导出确认阶段持续提示风险。
     bool m_publicationBlocked;

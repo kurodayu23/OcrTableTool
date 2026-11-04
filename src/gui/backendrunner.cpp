@@ -24,6 +24,7 @@ BackendRunner::BackendRunner(QObject *parent)
     , m_stopping(false)
     , m_nextRequestId(1)
     , m_activeRequestId(0)
+    , m_shuttingDown(false)
 {
     m_requestTimer->setSingleShot(true);
     m_process->setProcessChannelMode(QProcess::SeparateChannels);
@@ -36,8 +37,32 @@ BackendRunner::BackendRunner(QObject *parent)
 
 BackendRunner::~BackendRunner()
 {
+    shutdown();
+}
+
+void BackendRunner::shutdown()
+{
+    // 2026-10-23：关闭时点 X 必崩（0xC0000374 堆损坏）的修复点。
+    //
+    // 析构顺序问题：MainWindow 是栈对象，析构时**值成员先于子对象被销毁**。
+    // 本对象是 MainWindow 的子 QObject，于是析构期里 kill() + waitForFinished()
+    // 会同步触发 finished() -> processFinished() -> emit requestSucceeded()，
+    // 而 MainWindow::backendSucceeded() 会去写 m_pendingRecognitionResponse ——
+    // 那个值成员早已析构，写它就是 use-after-free，Windows 直接报堆损坏。
+    //
+    // 做法：先断开自身所有出向信号（上层槽函数不会再被调用），
+    // 再置位 m_shuttingDown 让本对象自己的槽函数也直接返回，最后才停进程。
+    if (m_shuttingDown)
+        return;
+    m_shuttingDown = true;
+    disconnect(this, nullptr, nullptr, nullptr);
     if (m_process->state() != QProcess::NotRunning) {
         m_process->kill();
+        // kill() 在 Windows 上是 TerminateProcess，子进程立刻死；这里只需要等
+        // 进程管理器把状态通知上来。等待时间**保持 1000 ms** —— UI 契约测试
+        // （tests/test_ui_contract.py）明文禁止在这个文件里出现三秒档的
+        // waitForFinished，那是"不要在界面线程上阻塞 3 秒"的约定，
+        // 这里不能为了多等一会儿就破坏它。
         m_process->waitForFinished(1000);
     }
 }
@@ -45,6 +70,11 @@ BackendRunner::~BackendRunner()
 bool BackendRunner::isRunning() const
 {
     return m_requestActive || m_stopping;
+}
+
+bool BackendRunner::isStopping() const
+{
+    return m_stopping;
 }
 
 bool BackendRunner::isConfigured() const
@@ -120,14 +150,23 @@ QString BackendRunner::findPython(const QString &backendScript) const
                                        .filePath(QStringLiteral("runtime/python/python.exe"));
     if (QFileInfo::exists(packagedPython))
         return QFileInfo(packagedPython).absoluteFilePath();
-    return QStringLiteral("python");
+
+    // findings：兜底过去硬编码裸名 python。麒麟 / 其它 Linux 发行版上解释器
+    // 常常只叫 python3（甚至没有 python 这个别名），于是"找不到 venv"直接变成
+    // 起不来的进程。改成按平台候选名逐个探测 PATH，探测不到才退化成候选名本身
+    // （由 QProcess 按 PATH 解析，仍是本平台的第一个候选，而不是写死的 python）。
+    const QString systemInterpreter = BackendLocator::findSystemInterpreter();
+    if (!systemInterpreter.isEmpty())
+        return systemInterpreter;
+    return BackendLocator::interpreterFileNames().first();
 }
 
 void BackendRunner::recognize(const QString &imagePath,
                               const QString &outputDirectory,
                               const QString &cropMode,
                               bool inputRectified,
-                              bool selectedTableRegion)
+                              bool selectedTableRegion,
+                              int budgetSeconds)
 {
     QJsonObject request;
     request.insert(QStringLiteral("protocol"), 1);
@@ -136,19 +175,49 @@ void BackendRunner::recognize(const QString &imagePath,
     request.insert(QStringLiteral("output_directory"), outputDirectory);
     QJsonObject options;
     options.insert(QStringLiteral("crop_mode"), cropMode);
-    options.insert(QStringLiteral("deadline_seconds"), 0);
+    // 首次识别仍然传 0（不额外收紧，对外「单次识别 60 秒墙钟」口径不变）。
+    // 只有自动重试才传剩余预算：后端把 deadline_seconds 解析成
+    // 「不传（<=0）⇒ 不额外收紧」「传更小的值 ⇒ 收紧到该值」，
+    // 因此重试不会被放大成又一轮完整时长（findings B1：
+    // 原先两轮冷启各跑满，总时长 ~120 秒）。
+    if (budgetSeconds > 0)
+        options.insert(QStringLiteral("deadline_seconds"), budgetSeconds);
+    else
+        options.insert(QStringLiteral("deadline_seconds"), 0);
     options.insert(QStringLiteral("accuracy_mode"), QStringLiteral("maximum"));
     if (inputRectified)
         options.insert(QStringLiteral("input_rectified"), true);
     if (selectedTableRegion)
         options.insert(QStringLiteral("selected_table_region"), true);
     request.insert(QStringLiteral("options"), options);
-    startRequest(QStringLiteral("recognize"), request, 0);
+    // 重试时同时给出父进程侧的墙钟上限：后端预算只从 worker 内部计时点起算，
+    // 不含进程冷启与模型构建，两层都用剩余预算才能保证「总时长不超过一次识别预算」。
+    const int timeoutMilliseconds = budgetSeconds > 0 ? budgetSeconds * 1000 : 0;
+    if (timeoutMilliseconds > 0)
+        startRequest(QStringLiteral("recognize"), request, timeoutMilliseconds);
+    else
+        startRequest(QStringLiteral("recognize"), request, 0);
 }
 
 void BackendRunner::exportXlsx(const QString &outputPath,
                                const TableData &table,
-                               const QJsonArray &spans)
+                               const QJsonArray &spans,
+                               const QJsonObject &structureCertificate)
+{
+    startRequest(QStringLiteral("export_xlsx"),
+                 OcrTableToolGui::buildExportRequest(outputPath,
+                                                     table,
+                                                     spans,
+                                                     structureCertificate),
+                 30000);
+}
+
+namespace OcrTableToolGui {
+
+QJsonObject buildExportRequest(const QString &outputPath,
+                               const TableData &table,
+                               const QJsonArray &spans,
+                               const QJsonObject &structureCertificate)
 {
     // 导出时保留核对元数据。它属于后端数据契约，不只是界面装饰；
     // XLSX 需要用它保存不确定内容的标记。
@@ -160,6 +229,10 @@ void BackendRunner::exportXlsx(const QString &outputPath,
             cell.insert(QStringLiteral("text"), table.cell(row, column));
             cell.insert(QStringLiteral("confidence"), table.confidence(row, column));
             cell.insert(QStringLiteral("needs_review"), table.needsReview(row, column));
+            // 导出也要带上哨兵标记：后端 write_xlsx 靠它区分「实测置信度低」
+            // 和「类别哨兵值」，否则会给逐格全对的表打上一整片假的复核批注。
+            cell.insert(QStringLiteral("confidence_sentinel"),
+                        table.confidenceSentinel(row, column));
             columns.append(cell);
         }
         rows.append(columns);
@@ -170,8 +243,66 @@ void BackendRunner::exportXlsx(const QString &outputPath,
     request.insert(QStringLiteral("output_path"), outputPath);
     request.insert(QStringLiteral("cells"), rows);
     request.insert(QStringLiteral("spans"), spans);
-    startRequest(QStringLiteral("export_xlsx"), request, 30000);
+    // findings/61 F6：识别时严格校验过的结构证书必须带到导出侧，
+    // 否则后端 write_xlsx 的证书分支（列宽/边界校准）永远跳过。
+    // 只在满足后端导出契约时才带，见 isXlsxCompatibleStructureCertificate()。
+    if (isXlsxCompatibleStructureCertificate(structureCertificate,
+                                             table.rowCount(),
+                                             table.columnCount()))
+        request.insert(QStringLiteral("structure_certificate"), structureCertificate);
+    return request;
 }
+
+bool isXlsxCompatibleStructureCertificate(const QJsonObject &structureCertificate,
+                                          int rowCount,
+                                          int columnCount)
+{
+    // 与 backend/table_pipeline.py write_xlsx() 的前置校验逐条对齐：
+    // 非字典 / verified 不是 True / 边界数组长度不是 行数+1、列数+1 /
+    // 元素不是数字 / 不是严格递增 —— 任一不满足，后端都会抛
+    // ValueError("invalid XLSX structure certificate boundaries") 让整次导出失败。
+    if (structureCertificate.isEmpty())
+        return false;
+    if (structureCertificate.value(QStringLiteral("verified")).toBool() != true)
+        return false;
+    if (rowCount <= 0 || columnCount <= 0)
+        return false;
+    const QJsonValue columnBoundariesValue = structureCertificate.value(QStringLiteral("column_boundaries"));
+    const QJsonValue rowBoundariesValue = structureCertificate.value(QStringLiteral("row_boundaries"));
+    if (!columnBoundariesValue.isArray() || !rowBoundariesValue.isArray())
+        return false;
+    const QJsonArray columnBoundaries = columnBoundariesValue.toArray();
+    const QJsonArray rowBoundaries = rowBoundariesValue.toArray();
+    if (columnBoundaries.size() != columnCount + 1 || rowBoundaries.size() != rowCount + 1)
+        return false;
+    double previous = 0.0;
+    for (int index = 0; index < columnBoundaries.size(); ++index) {
+        const QJsonValue value = columnBoundaries.at(index);
+        if (!value.isDouble())
+            return false;
+        const double boundary = value.toDouble();
+        // 后端还要求全部是有限值（NaN / inf 会让它抛同一个异常）。
+        if (!qIsFinite(boundary))
+            return false;
+        if (index > 0 && boundary <= previous)
+            return false;
+        previous = boundary;
+    }
+    for (int index = 0; index < rowBoundaries.size(); ++index) {
+        const QJsonValue value = rowBoundaries.at(index);
+        if (!value.isDouble())
+            return false;
+        const double boundary = value.toDouble();
+        if (!qIsFinite(boundary))
+            return false;
+        if (index > 0 && boundary <= previous)
+            return false;
+        previous = boundary;
+    }
+    return true;
+}
+
+} // namespace OcrTableToolGui
 
 void BackendRunner::cancel()
 {
@@ -203,6 +334,8 @@ void BackendRunner::beginStopping(const QString &action, const QString &message)
 
 void BackendRunner::finishStopping()
 {
+    if (m_shuttingDown)
+        return;
     if (!m_stopping)
         return;
     const QString action = m_stoppingAction;
@@ -210,7 +343,7 @@ void BackendRunner::finishStopping()
     m_stopping = false;
     m_stoppingAction.clear();
     m_stoppingMessage.clear();
-    emit requestFailed(action, message);
+    emit requestFailed(action, message, QString(), false);
 }
 
 bool BackendRunner::startBackend(QString *errorMessage)
@@ -238,8 +371,23 @@ bool BackendRunner::startBackend(QString *errorMessage)
     }
     m_process->start();
     if (!m_process->waitForStarted(3000)) {
+        // 2026-10-30（lead 复查 P1）：超时失败时原来既不 kill 也不关写通道。
+        // 慢冷启（首次解压 _internal、杀软扫描）下进程可能仍处于 Starting/Running
+        // 且卡在阻塞读 stdin；于是下一次 startBackend() 会被上面那条
+        // `state() != NotRunning` 挡成「识别组件正在释放资源，请稍候重试」，
+        // 而且永远不会恢复 —— 用户只能重启应用。这里必须把半启动的进程收干净。
+        const QString failureDetail = m_process->errorString();
+        if (m_process->state() != QProcess::NotRunning) {
+            m_process->kill();
+            if (!m_process->waitForFinished(500)) {
+                // 连 kill 都不返回：至少别让它继续占着「正在释放资源」的状态，
+                // 交给下一次 startBackend 重新判定（terminate 是最后手段）。
+                m_process->terminate();
+                m_process->waitForFinished(2000);
+            }
+        }
         if (errorMessage)
-            *errorMessage = QStringLiteral("无法启动识别组件：%1").arg(m_process->errorString());
+            *errorMessage = QStringLiteral("无法启动识别组件：%1").arg(failureDetail);
         return false;
     }
     return true;
@@ -251,11 +399,13 @@ void BackendRunner::startRequest(const QString &action,
 {
     // 后端循环为同步执行，Runner 也只有一个响应缓冲区；并发写入会导致请求归属不明确。
     if (m_requestActive) {
-        emit requestFailed(action, QStringLiteral("另一个任务正在运行"));
+        emit requestFailed(action, QStringLiteral("另一个任务正在运行"),
+                           QStringLiteral("BACKEND_BUSY"), true);
         return;
     }
     if (!isConfigured()) {
-        emit requestFailed(action, configurationSummary());
+        emit requestFailed(action, configurationSummary(),
+                           QStringLiteral("BACKEND_NOT_CONFIGURED"), false);
         return;
     }
     m_requestWallTimer.restart();
@@ -263,7 +413,8 @@ void BackendRunner::startRequest(const QString &action,
     QString startError;
     if (!startBackend(&startError)) {
         m_requestWallTimer.invalidate();
-        emit requestFailed(action, startError);
+        emit requestFailed(action, startError,
+                           QStringLiteral("BACKEND_START_FAILED"), true);
         return;
     }
     QJsonObject identifiedRequest = request;
@@ -296,24 +447,55 @@ void BackendRunner::startRequest(const QString &action,
     emit requestStarted(action);
 }
 
-QJsonObject BackendRunner::parseResponse(const QByteArray &output, QString *errorMessage) const
+namespace OcrTableToolGui {
+
+// 后端的标准输出是一行一个 JSON。解析结果必须区分两种失败：
+//   - 这一行根本不是 JSON（后端打印了日志、崩溃栈等杂音）；
+//   - 这一行是合法 JSON，但内容是空对象 "{}"（后端一个字段都没给）。
+// 两者过去都会让界面拿到一条**空的**提示，界面没法告诉用户到底出了什么。
+// 这里把两种情况分开，并且任何失败路径都给出非空提示，
+// 保证界面永远收不到空日志。
+//
+// 自由函数（外部链接）：单元测试 tests/tst_gui.cpp 直接声明并调用它，
+// 绕开 MSVC 把访问级别编进符号名的问题（私有成员函数无法从测试 TU 调用）。
+QJsonObject parseBackendResponse(const QByteArray &output, QString *errorMessage)
 {
     // stderr 承载诊断信息，stdout 仍可能夹杂附带输出；从后向前查找，
     // 以最近一个完整 JSON 对象为准。
     const QList<QByteArray> lines = output.trimmed().split('\n');
+    bool sawEmptyObject = false;
     for (int index = lines.size() - 1; index >= 0; --index) {
         QJsonParseError parseError;
         const QJsonDocument document = QJsonDocument::fromJson(lines.at(index).trimmed(), &parseError);
-        if (parseError.error == QJsonParseError::NoError && document.isObject())
-            return document.object();
+        if (parseError.error != QJsonParseError::NoError || !document.isObject())
+            continue;
+        const QJsonObject candidate = document.object();
+        if (!candidate.isEmpty())
+            return candidate;
+        // 空对象也是合法 JSON，但它没有任何结果字段。记住它，
+        // 提示语与「这一行根本不是 JSON」区分开。
+        sawEmptyObject = true;
+        break;
     }
-    if (errorMessage)
-        *errorMessage = QStringLiteral("识别组件没有返回有效结果");
+    if (errorMessage) {
+        *errorMessage = sawEmptyObject
+            ? QStringLiteral("识别组件返回了空结果，请重新识别")
+            : QStringLiteral("识别组件没有返回有效结果");
+    }
     return QJsonObject();
+}
+
+} // namespace OcrTableToolGui
+
+QJsonObject BackendRunner::parseResponse(const QByteArray &output, QString *errorMessage) const
+{
+    return OcrTableToolGui::parseBackendResponse(output, errorMessage);
 }
 
 void BackendRunner::processFinished(int exitCode)
 {
+    if (m_shuttingDown)
+        return;
     readStandardOutput();
     readStandardError();
     // 取消或超时导致的进程退出属于停止状态；finishStopping() 只上报一次已保存的用户提示。
@@ -358,16 +540,39 @@ void BackendRunner::processFinished(int exitCode)
         const QString message = technicalDetails.isEmpty()
             ? QStringLiteral("识别组件没有返回有效结果")
             : QStringLiteral("识别组件没有返回有效结果\n%1").arg(technicalDetails);
-        emit requestFailed(action, message);
+        emit requestFailed(action, message, QStringLiteral("EMPTY_RESPONSE"), true);
         return;
     }
     const QJsonValue protocolValue = response.value(QStringLiteral("protocol"));
     if (!protocolValue.isDouble() || protocolValue.toDouble() != 1.0) {
-        emit requestFailed(action, QStringLiteral("识别组件协议版本不兼容"));
+        emit requestFailed(action, QStringLiteral("识别组件协议版本不兼容"),
+                           QStringLiteral("UNSUPPORTED_PROTOCOL"), false);
     } else if (response.value(QStringLiteral("status")).toString() != QStringLiteral("ok")) {
+        // 2026-10-22 修正：后端一直返回结构化的 error_code / retryable / field，
+        // 前端却**整个丢掉**，只取 message，然后靠中文子串猜错误类型 ——
+        // 后端消息措辞一改就掉进兜底文案。这里把错误码和可重试标志透出去。
         emit requestFailed(action,
                            response.value(QStringLiteral("message"))
-                               .toString(QStringLiteral("识别执行失败")));
+                               .toString(QStringLiteral("识别执行失败")),
+                           response.value(QStringLiteral("error_code")).toString(),
+                           response.value(QStringLiteral("retryable")).toBool());
+    } else if (exitCode != 0) {
+        // 2026-10-28 修正（findings/61 F3）：退出码原先只写进 trace，不参与判定，
+        // 于是"响应 status=ok、进程随后以非 0 退出"被判成成功。响应只证明
+        // 结果被打印出来了，不证明 worker 正常收尾；收尾阶段的崩溃（解释器
+        // 析构时 OpenCV/OpenVINO teardown）会留下完整 ok 响应 + 非 0 退出码。
+        // 中继口径：这份结果不采用，按可重试的传输层失败上报。
+        QJsonObject mismatchTrace;
+        mismatchTrace.insert(QStringLiteral("action"), action);
+        mismatchTrace.insert(QStringLiteral("exit_code"), exitCode);
+        mismatchTrace.insert(QStringLiteral("status"),
+                             response.value(QStringLiteral("status")));
+        GuiTrace::write(QStringLiteral("backend_exit_code_mismatch"), mismatchTrace);
+        emit requestFailed(action,
+                           QStringLiteral("识别组件返回结果后异常退出（退出码 %1），本次结果未采用。")
+                               .arg(exitCode),
+                           QStringLiteral("BACKEND_CRASHED"),
+                           true);
     } else {
         emit requestSucceeded(action, response);
     }
@@ -375,6 +580,8 @@ void BackendRunner::processFinished(int exitCode)
 
 void BackendRunner::processError()
 {
+    if (m_shuttingDown)
+        return;
     if (m_stopping && m_process->state() == QProcess::NotRunning) {
         finishStopping();
         return;
@@ -397,12 +604,14 @@ void BackendRunner::processError()
         const QString message = technicalDetails.isEmpty()
             ? m_process->errorString()
             : QStringLiteral("%1\n%2").arg(m_process->errorString(), technicalDetails);
-        emit requestFailed(action, message);
+        emit requestFailed(action, message, QStringLiteral("BACKEND_CRASHED"), true);
     }
 }
 
 void BackendRunner::readStandardOutput()
 {
+    if (m_shuttingDown)
+        return;
     m_standardOutput += m_process->readAllStandardOutput();
     // 最后一段数据若不完整则继续缓存，等换行到达后再作为独立 JSONL 记录处理。
     int newline = m_standardOutput.indexOf('\n');
@@ -416,7 +625,9 @@ void BackendRunner::readStandardOutput()
         QString parseError;
         const QJsonObject response = parseResponse(line, &parseError);
         if (response.isEmpty()) {
-            emit logMessage(parseError);
+            // 空提示对用户毫无意义，日志里也不该出现空行。
+            if (!parseError.isEmpty())
+                emit logMessage(parseError);
             continue;
         }
         if (!m_requestActive)
@@ -456,6 +667,8 @@ void BackendRunner::readStandardOutput()
 
 void BackendRunner::requestTimedOut()
 {
+    if (m_shuttingDown)
+        return;
     if (!m_requestActive)
         return;
     const QString action = m_action;
@@ -469,6 +682,8 @@ void BackendRunner::requestTimedOut()
 
 void BackendRunner::readStandardError()
 {
+    if (m_shuttingDown)
+        return;
     const QByteArray output = m_process->readAllStandardError();
     m_standardError += output;
     if (m_standardError.size() > 16000)

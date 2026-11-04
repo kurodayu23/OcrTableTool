@@ -23,16 +23,106 @@ _ruled_grid_request_cache: dict[
     tuple[tuple[int, ...], str, bool, bytes],
     tuple[tuple[int, ...], tuple[int, ...], np.ndarray] | None,
 ] | None = None
+_grid_maps_request_cache: dict[tuple, tuple[np.ndarray, np.ndarray, np.ndarray]] | None = None
+_physical_rule_maps_request_cache: dict[tuple, tuple[np.ndarray, np.ndarray]] | None = None
+_rectify_request_cache: dict[tuple, tuple[np.ndarray, dict[str, Any]]] | None = None
+
+# 哨兵置信度：0.77 / 0.86 是各识别路径硬写的**类别哨兵**，不是实测置信度
+# （0.77 = 没取得双模型一致确认 / 被截断的上限，0.86 = 取得了双模型一致确认）。
+# 拿它们跟 0.78 比大小等于把"没做独立复核"读成"复核失败"：FC-00005 这张逐格
+# 102/102 全对的表因此在导出里被标成 102 条「待人工复核」批注。
+#
+# 同一份判定在 backend/ocr_backend.py 里另有一份拷贝 —— 本模块不能反向 import
+# 那个模块（它一被导入就会装上离线审计钩子），两处必须同步修改。
+_SENTINEL_CONFIDENCE_VALUES = (0.77, 0.86)
+
+
+def _is_sentinel_confidence(value: Any) -> bool:
+    """这个置信度是类别哨兵（0.77 / 0.86），而不是实测置信度吗？"""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    return any(abs(v - sentinel) < 1e-9 for sentinel in _SENTINEL_CONFIDENCE_VALUES)
+
+
+def _cell_confidence_is_sentinel(value: dict[str, Any]) -> bool:
+    """这一格的 confidence 是不是类别哨兵。
+
+    优先用后端显式写下的 `confidence_sentinel` 字段；老 payload 没有这个字段时
+    按值判定（0.77 / 0.86 就是哨兵字面量），这样老客户端传过来的数据也不会把
+    哨兵误当成"实测低置信"。
+    """
+    flag = value.get("confidence_sentinel")
+    if flag is not None:
+        return bool(flag)
+    return _is_sentinel_confidence(value.get("confidence"))
+
+
+def _cell_confidence(value: dict[str, Any], fallback: float = 1.0) -> float:
+    """读取一格的 confidence，**非数值时按导出输入非法处理**。
+
+    2026-10-30（lead 复查）：write_xlsx 原来直接 `float(value.get("confidence", 1.0))`，
+    客户端传 `"high"` 这种非数值时抛裸 ValueError，被归成 INTERNAL_ERROR（旧版更糟：
+    INVALID_REQUEST "请求无效"），客户完全看不出是"cells 里的 confidence 不是数字"。
+    这里统一抛带 `cells must` 前缀的错误，_classify_error 会映射成 EXPORT_GRID_INVALID。
+    非有限值（nan/inf）不当错误处理——只影响"要不要加复核批注"，按无复核处理更安全。
+    """
+    if not isinstance(value, dict):
+        return fallback
+    raw = value.get("confidence", fallback)
+    if isinstance(raw, bool):
+        # bool 是 int 子类，但 JSON 里的 true/false 不是"置信度"，按缺失处理
+        return fallback
+    try:
+        result = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "cells must contain a numeric confidence value (got %r)" % (raw,)
+        ) from None
+    if not math.isfinite(result):
+        return fallback
+    return result
+
+# 预算探针。60 秒墙钟是**产品契约**，由 ocr_backend 拥有；而真正吃时间的
+# 图像重活全在这里（网格重提取、屏幕网格检测、透视矫正、图像预处理）。
+# 2026-10-22 实测 FC-00016：一次请求里 extract_ruled_grid 被调 39 次、
+# extract_screen_grid 36 次，单次各约 1.1 秒 / 0.5 秒，合计占 88 秒里的
+# 59 秒。ocr_backend 里逐个调用点插检查点既漏又难维护（当时就漏了
+# "fast_photo_rectification_end → edge_recovery_start" 之间那 23 秒），
+# 改成由 pipeline 在**每个重活入口**回调一次探针，新加的调用点自动受管。
+_budget_probe: Any = None
+
+
+def set_budget_probe(probe: Any) -> None:
+    """注册（或清除）在每个重活入口被调用的预算探针。"""
+    global _budget_probe
+    _budget_probe = probe
+
+
+def _probe_budget(stage: str) -> None:
+    probe = _budget_probe
+    if probe is None:
+        return
+    probe(stage)
 
 
 def begin_ruled_grid_request_cache() -> None:
-    global _ruled_grid_request_cache
+    global _ruled_grid_request_cache, _grid_maps_request_cache, _physical_rule_maps_request_cache
+    global _rectify_request_cache
     _ruled_grid_request_cache = {}
+    _grid_maps_request_cache = {}
+    _physical_rule_maps_request_cache = {}
+    _rectify_request_cache = {}
 
 
 def end_ruled_grid_request_cache() -> None:
-    global _ruled_grid_request_cache
+    global _ruled_grid_request_cache, _grid_maps_request_cache, _physical_rule_maps_request_cache
+    global _rectify_request_cache
     _ruled_grid_request_cache = None
+    _grid_maps_request_cache = None
+    _physical_rule_maps_request_cache = None
+    _rectify_request_cache = None
 
 
 def _display_width(value: str) -> int:
@@ -44,15 +134,50 @@ def _display_width(value: str) -> int:
 
 
 def _ordered_corners(points: np.ndarray) -> np.ndarray:
+    """把四个角点排成 左上/右上/右下/左下。
+
+    2026-10-30（lead 复查 P1）：`argmin/argmax` 在**平局**时都取第一个索引。
+    45° 菱形（[[200,0],[400,200],[200,400],[0,200]]）的 sum 与 diff 双双平局，
+    于是同一个点被塞进两个槽位（实测 ordered[0]==ordered[1]）⇒ 单应矩阵奇异
+    （末行 (0,0,0)）⇒ `warpPerspective` 输出**全白图**，而 metadata 仍报
+    detected=True，管线在白图上继续跑，用户看到"已矫正"的白图然后识别失败。
+    这里改成按 (值, 索引) 稳定排序并**去重**：四个角必须是互不相同的点。
+    """
     points = np.asarray(points, dtype=np.float32).reshape(4, 2)
-    ordered = np.zeros((4, 2), dtype=np.float32)
     coordinate_sum = points.sum(axis=1)
     coordinate_difference = np.diff(points, axis=1).reshape(-1)
-    ordered[0] = points[np.argmin(coordinate_sum)]
-    ordered[2] = points[np.argmax(coordinate_sum)]
-    ordered[1] = points[np.argmin(coordinate_difference)]
-    ordered[3] = points[np.argmax(coordinate_difference)]
-    return ordered
+
+    def _pick(values: np.ndarray, *, largest: bool) -> int:
+        # 平局时按索引稳定取，避免同一索引被多个槽位重复选中
+        order = sorted(range(len(values)), key=lambda index: (float(values[index]), index),
+                       reverse=largest)
+        return order[0]
+
+    chosen: list[int] = []
+
+    def _next_index(values: np.ndarray, *, largest: bool) -> int:
+        order = sorted(
+            range(len(values)),
+            key=lambda index: (float(values[index]), index),
+            reverse=largest,
+        )
+        for index in order:
+            if index not in chosen:
+                return index
+        return order[0]
+
+    top_left = _pick(coordinate_sum, largest=False)
+    chosen.append(top_left)
+    bottom_right = _next_index(coordinate_sum, largest=True)
+    chosen.append(bottom_right)
+    top_right = _next_index(coordinate_difference, largest=False)
+    chosen.append(top_right)
+    bottom_left = _next_index(coordinate_difference, largest=True)
+
+    return np.asarray(
+        [points[top_left], points[top_right], points[bottom_right], points[bottom_left]],
+        dtype=np.float32,
+    )
 
 
 def _refine_vertical_table_sides(image: np.ndarray, corners: np.ndarray) -> np.ndarray:
@@ -91,7 +216,7 @@ def _refine_vertical_table_sides(image: np.ndarray, corners: np.ndarray) -> np.n
     center_x = width / 2.0
     top_span = abs(float(corners[1, 0] - corners[0, 0]))
     bottom_span = abs(float(corners[2, 0] - corners[3, 0]))
-    maximum_inward_shift = max(8.0, min(top_span, bottom_span) * 0.020)
+    maximum_inward_shift = max(3.0, min(top_span, bottom_span) * 0.002)
     left_lines = [line for line in side_lines if (line[0] + line[1]) / 2.0 < center_x]
     right_lines = [line for line in side_lines if (line[0] + line[1]) / 2.0 >= center_x]
     if left_lines:
@@ -109,8 +234,28 @@ def _refine_vertical_table_sides(image: np.ndarray, corners: np.ndarray) -> np.n
     return refined
 
 
+def _horizontal_rule_has_dark_ridge(
+    gray: np.ndarray, x1: float, y1: float, x2: float, y2: float,
+) -> bool:
+    """表格细线比两侧都暗；纸张边缘只有单侧明暗变化。"""
+    if abs(x2 - x1) < 12:
+        return False
+    xs = np.linspace(x1 + (x2 - x1) * 0.05, x2 - (x2 - x1) * 0.05, 48).astype(int)
+    ys = np.rint(y1 + (xs - x1) * (y2 - y1) / (x2 - x1)).astype(int)
+    valid = (xs >= 0) & (xs < gray.shape[1]) & (ys >= 6) & (ys < gray.shape[0] - 6)
+    if int(np.count_nonzero(valid)) < 24:
+        return True
+    xs, ys = xs[valid], ys[valid]
+    center = np.min(np.asarray([gray[ys + offset, xs] for offset in range(-3, 4)]), axis=0).astype(float)
+    above = np.mean(np.asarray([gray[ys + offset, xs] for offset in (-6, -5, -4)]), axis=0)
+    below = np.mean(np.asarray([gray[ys + offset, xs] for offset in (4, 5, 6)]), axis=0)
+    return float(np.median(np.minimum(above, below) - center)) >= 8.0
+
+
 def _cluster_low_contrast_horizontal_rules(
     image: np.ndarray,
+    *,
+    edge_margin_ratio: float = 0.08,
 ) -> list[list[dict[str, float]]]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     height, width = gray.shape[:2]
@@ -146,7 +291,14 @@ def _cluster_low_contrast_horizontal_rules(
         slope = (float(y2) - float(y1)) / max(1.0, float(x2) - float(x1))
         angle = math.degrees(math.atan(slope))
         center_y = float(y1) + (width * 0.5 - float(x1)) * slope
-        if abs(angle) > 6.0 or not height * 0.08 <= center_y <= height * 0.92:
+        if (
+            abs(angle) > 6.0
+            or not height * edge_margin_ratio
+            <= center_y
+            <= height * (1.0 - edge_margin_ratio)
+        ):
+            continue
+        if not _horizontal_rule_has_dark_ridge(gray, x1, y1, x2, y2):
             continue
         segments.append(
             {
@@ -183,7 +335,9 @@ def _cluster_low_contrast_horizontal_rules(
         dtype=float,
     )
     gaps = np.diff(centers)
-    ordinary = gaps[(gaps >= 12.0) & (gaps <= 70.0)]
+    ordinary = gaps[
+        (gaps >= 12.0) & (gaps <= max(70.0, height * 0.08))
+    ]
     if ordinary.size < 6:
         return []
     typical = float(np.median(ordinary))
@@ -263,8 +417,49 @@ def _low_contrast_vertical_side(
     return min(candidates, key=lambda item: item["score"]) if candidates else None
 
 
-def _detect_low_contrast_ruled_quad(image: np.ndarray) -> np.ndarray | None:
-    groups = _cluster_low_contrast_horizontal_rules(image)
+def _detect_low_contrast_ruled_quad(
+    image: np.ndarray,
+    *,
+    edge_margin_ratio: float = 0.08,
+) -> np.ndarray | None:
+    groups = _cluster_low_contrast_horizontal_rules(
+        image,
+        edge_margin_ratio=edge_margin_ratio,
+    )
+    if groups and edge_margin_ratio < 0.08:
+        centers = np.asarray(
+            [np.median([item["center_y"] for item in group]) for group in groups],
+            dtype=float,
+        )
+        gaps = np.diff(centers)
+        typical = float(np.median(gaps)) if gaps.size else 0.0
+        if typical > 0.0 and float(np.max(gaps)) > typical * 2.40:
+            height = image.shape[0]
+            inset_groups = [
+                group
+                for group in groups
+                if height * 0.08
+                <= float(np.median([item["center_y"] for item in group]))
+                <= height * 0.92
+            ]
+            if len(inset_groups) >= 8:
+                inset_centers = np.asarray(
+                    [
+                        np.median([item["center_y"] for item in group])
+                        for group in inset_groups
+                    ],
+                    dtype=float,
+                )
+                inset_gaps = np.diff(inset_centers)
+                inset_typical = float(np.median(inset_gaps))
+                inset_regularity = float(
+                    np.mean(
+                        (inset_gaps >= inset_typical * 0.62)
+                        & (inset_gaps <= inset_typical * 1.42)
+                    )
+                )
+                if inset_regularity >= 0.80:
+                    groups = inset_groups
     if not groups:
         return None
     left = _low_contrast_vertical_side(image, groups, right=False)
@@ -533,7 +728,8 @@ def _warp_perspective_table(
     horizontal, vertical, grid = _grid_maps(image)
     height, width = image.shape[:2]
     image_area = float(height * width)
-    contours, _ = cv2.findContours(grid, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    contours, _ = cv2.findContours(grid, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
     best_corners: np.ndarray | None = None
     best_score = 0.0
     for contour in contours:
@@ -545,6 +741,15 @@ def _warp_perspective_table(
         corners = _ordered_corners(approximation.reshape(4, 2))
         area = abs(float(cv2.contourArea(corners)))
         if area < image_area * 0.025:
+            continue
+        if not (
+            _horizontal_rule_has_dark_ridge(
+                gray, *corners[0], *corners[1],
+            )
+            or _horizontal_rule_has_dark_ridge(
+                gray, *corners[3], *corners[2],
+            )
+        ):
             continue
         x, y, candidate_width, candidate_height = cv2.boundingRect(corners.astype(np.int32))
         aspect = max(candidate_width, candidate_height) / max(1.0, min(candidate_width, candidate_height))
@@ -560,7 +765,10 @@ def _warp_perspective_table(
             best_corners = corners
 
     document_corners = _detect_light_document_corners(image) if expand_to_document else None
-    low_contrast_table = _detect_low_contrast_ruled_quad(image)
+    low_contrast_table = _detect_low_contrast_ruled_quad(
+        image,
+        edge_margin_ratio=0.0,
+    )
     enclosing_grid_outline = False
     if best_corners is not None and low_contrast_table is not None:
         best_area = abs(float(cv2.contourArea(best_corners)))
@@ -600,7 +808,13 @@ def _warp_perspective_table(
             and maximum_corner_delta
             <= max(10.0, min(height, width) * 0.012)
         )
-    if low_contrast_table is not None and (
+    low_contrast_discards_ruled_grid = bool(
+        best_corners is not None
+        and low_contrast_table is not None
+        and _quad_has_dense_ruled_extent(image, best_corners)
+        and not _quad_has_dense_ruled_extent(image, low_contrast_table)
+    )
+    if low_contrast_table is not None and not low_contrast_discards_ruled_grid and (
         best_corners is None
         or (
             not enclosing_grid_outline
@@ -754,6 +968,15 @@ def _warp_perspective_table(
         dtype=np.float32,
     )
     transform = cv2.getPerspectiveTransform(best_corners, destination)
+    # 2026-10-30（lead 复查 P1）：退化四边形（三点共线/两点重合）会得到**奇异**
+    # 单应矩阵，`warpPerspective` 静默输出**纯白图**，但调用方仍按 detected=True
+    # 继续跑，用户看到"已矫正"的白图后识别失败。这里做两道硬校验：
+    #   ① 变换矩阵必须可逆（|det| 有下界）；
+    #   ② 矫正结果不能是纯色（否则等同一张空图）。
+    if transform is None or not np.all(np.isfinite(transform)):
+        return image, None, None, False
+    if abs(float(np.linalg.det(transform))) < 1e-12:
+        return image, None, None, False
     warped = cv2.warpPerspective(
         image,
         transform,
@@ -761,6 +984,11 @@ def _warp_perspective_table(
         flags=cv2.INTER_CUBIC,
         borderValue=(255, 255, 255),
     )
+    if warped is None or warped.size == 0:
+        return image, None, None, False
+    if int(warped.max()) - int(warped.min()) < 8:
+        # 全白/全黑/纯色：这不是一张能用的矫正图。
+        return image, None, None, False
     return warped, transform, best_corners, used_document_corners
 
 
@@ -777,6 +1005,11 @@ def _detect_light_document_corners(image: np.ndarray) -> np.ndarray | None:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     _, mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    raw_mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
+    )
     close_size = max(21, min(height, width) // 24)
     if close_size % 2 == 0:
         close_size += 1
@@ -792,7 +1025,7 @@ def _detect_light_document_corners(image: np.ndarray) -> np.ndarray | None:
         cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7)),
         iterations=1,
     )
-    document_masks = [mask]
+    document_masks = [mask, raw_mask]
     if image.ndim == 3:
         hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
         saturation = hsv[:, :, 1]
@@ -1029,6 +1262,25 @@ def _table_candidate_score(area: float, aspect: float, horizontal_density: float
 
 
 def _grid_maps(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    cache = _grid_maps_request_cache
+    if cache is None:
+        return _grid_maps_uncached(image)
+    contiguous = image if image.flags.c_contiguous else np.ascontiguousarray(image)
+    key = (image.shape, str(image.dtype), hashlib.blake2b(
+        memoryview(contiguous).cast("B"), digest_size=16
+    ).digest())
+    if key in cache:
+        value = cache.pop(key)
+        cache[key] = value
+        return tuple(mask.copy() for mask in value)
+    value = _grid_maps_uncached(image)
+    if len(cache) >= 2:
+        cache.pop(next(iter(cache)))
+    cache[key] = tuple(mask.copy() for mask in value)
+    return value
+
+
+def _grid_maps_uncached(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     height, width = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
     gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
@@ -1052,6 +1304,51 @@ def _grid_maps(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
         iterations=2,
     )
     return horizontal, vertical, grid
+
+
+def _physical_rule_maps(image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """校验已知边界时同时检查深色线和深底上的浅色线。"""
+    cache = _physical_rule_maps_request_cache
+    if cache is None:
+        return _physical_rule_maps_uncached(image)
+    contiguous = image if image.flags.c_contiguous else np.ascontiguousarray(image)
+    key = (image.shape, str(image.dtype), hashlib.blake2b(
+        memoryview(contiguous).cast("B"), digest_size=16
+    ).digest())
+    if key in cache:
+        value = cache.pop(key)
+        cache[key] = value
+        return tuple(mask.copy() for mask in value)
+    value = _physical_rule_maps_uncached(image)
+    if len(cache) >= 2:
+        cache.pop(next(iter(cache)))
+    cache[key] = tuple(mask.copy() for mask in value)
+    return value
+
+
+def _physical_rule_maps_uncached(image: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    horizontal, vertical, _ = _grid_maps(image)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    dark_background = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
+    dark = np.uint8(cv2.subtract(dark_background, gray) > 12) * 255
+    # 已知单元格边界需要局部细线证据；全页长线核会漏掉彩色表头和浅底细线。
+    horizontal = cv2.bitwise_or(horizontal, cv2.morphologyEx(
+        dark, cv2.MORPH_OPEN, np.ones((1, 18), np.uint8),
+    ))
+    vertical = cv2.bitwise_or(vertical, cv2.morphologyEx(
+        dark, cv2.MORPH_OPEN, np.ones((8, 1), np.uint8),
+    ))
+    background = cv2.morphologyEx(gray, cv2.MORPH_OPEN, np.ones((9, 9), np.uint8))
+    light = np.uint8(cv2.subtract(gray, background) > 18) * 255
+    horizontal = cv2.bitwise_or(horizontal, cv2.morphologyEx(
+        light, cv2.MORPH_OPEN,
+        np.ones((1, max(18, image.shape[1] // 30)), np.uint8),
+    ))
+    vertical = cv2.bitwise_or(vertical, cv2.morphologyEx(
+        light, cv2.MORPH_OPEN,
+        np.ones((8, 1), np.uint8),
+    ))
+    return horizontal, vertical
 
 
 def _line_centers(projection: np.ndarray, minimum_length: int) -> list[int]:
@@ -1290,8 +1587,8 @@ def _filter_transition_columns_by_vertical_support(
     supported = [
         column
         for column in transition_columns
-        if column <= image_width * 0.04
-        or column >= image_width * 0.96
+        if (column == transition_columns[0] and column <= image_width * 0.04)
+        or (column == transition_columns[-1] and column >= image_width * 0.96)
         or int(
             vertical_projection[
                 max(0, column - 3) : min(image_width, column + 4)
@@ -1338,27 +1635,6 @@ def _remove_false_transition_rows(
         if strongest < image_width * 0.5 or weakest > strongest * 0.25:
             break
         recovered.pop(candidate_index if left_support < right_support else candidate_index + 1)
-    return recovered
-
-
-def _recover_merged_header_rows(rows: list[int]) -> list[int]:
-    if not 8 <= len(rows) <= 20:
-        return rows
-    gaps = np.diff(rows)
-    typical = float(np.median(gaps))
-    recovered = list(rows)
-    largest_index = int(np.argmax(gaps))
-    largest_gap = float(gaps[largest_index])
-    other_gaps = np.delete(gaps, largest_index)
-    second_largest = float(other_gaps.max()) if other_gaps.size else 0.0
-    if (
-        typical * 2.2 < largest_gap < typical * 3.2
-        and largest_gap > second_largest * 1.35
-    ):
-        recovered.insert(
-            largest_index + 1,
-            int(round((rows[largest_index] + rows[largest_index + 1]) / 2.0)),
-        )
     return recovered
 
 
@@ -2010,7 +2286,15 @@ def _recover_visible_double_row_boundary(
     peak_coverage = float(search[peak_offset])
     if peak_coverage < 0.12:
         return recovered
-    recovered.insert(candidate_index + 1, search_left + peak_offset + 1)
+    candidate = search_left + peak_offset + 1
+    horizontal, _, _ = _grid_maps(image)
+    rule_support = np.any(
+        horizontal[max(0, candidate - 2):candidate + 3, left:right] > 0, axis=0,
+    )
+    # 文字基线也会产生宽灰度跳变，补行还必须看到连续的横向分隔线。
+    if float(np.mean(rule_support)) < 0.20:
+        return recovered
+    recovered.insert(candidate_index + 1, candidate)
     return recovered
 
 
@@ -2173,6 +2457,24 @@ def _dominant_supported_span(mask: np.ndarray, maximum_hole: int) -> tuple[int, 
     ]
     group = max(groups, key=lambda item: (int(item[-1] - item[0]), int(item.size)))
     return int(group[0]), int(group[-1])
+
+
+def _filter_columns_by_cell_rule_continuity(
+    columns: list[int], rows: list[int], vertical: np.ndarray,
+) -> list[int]:
+    """列线至少贯穿一个行间隔；重复字形的短竖笔画不能凭累积长度成列。"""
+    if len(columns) < 3 or len(rows) < 3:
+        return columns
+    supported = []
+    for column in columns:
+        band = np.any(vertical[:, max(0, column - 2):column + 3] > 0, axis=1)
+        if any(
+            float(np.mean(band[top + 3:bottom - 3])) >= 0.85
+            for top, bottom in zip(rows, rows[1:]) if bottom - top >= 12
+        ):
+            supported.append(column)
+    # 合并表头允许分隔线只出现在部分行；证据不足时保留原候选继续核验。
+    return supported if len(supported) >= 3 else columns
 
 
 def _recover_sparse_low_contrast_grid(
@@ -2716,7 +3018,7 @@ def _recover_outer_columns_from_horizontal_endpoints(
     rows: list[int],
 ) -> list[int]:
     """Restore an outer column proved by repeated row-line endpoints."""
-    if len(columns) < 4 or len(rows) < 6 or horizontal.size == 0:
+    if len(columns) < 3 or len(rows) < 5 or horizontal.size == 0:
         return columns
     height, width = image.shape[:2]
     endpoints: list[tuple[int, int]] = []
@@ -2755,16 +3057,86 @@ def _recover_outer_columns_from_horizontal_endpoints(
     evidence_tolerance = max(10, int(round(width * 0.03)))
     minimum_support = max(5, int(math.ceil(len(endpoints) * 0.60)))
 
+    # 裁剪会抹掉外框，重复字符可被误选为外侧列线；用多条横线共同的端点校正。
+    vertical = _grid_maps(image)[1]
+    for index, endpoint, support in ((0, left, left_support), (-1, right, right_support)):
+        boundary = recovered[index]
+        gap = abs(boundary - endpoint)
+        band = vertical[
+            max(0, rows[0]):min(height, rows[-1] + 1),
+            max(0, boundary - 2):min(width, boundary + 3),
+        ]
+        rule_support = float(np.mean(np.any(band > 0, axis=1))) if band.size else 0.0
+        at_crop_edge = endpoint <= endpoint_tolerance if index == 0 else endpoint >= width - 1 - endpoint_tolerance
+        outward = endpoint < boundary if index == 0 else endpoint > boundary
+        if (at_crop_edge and outward and 3 < gap <= typical * 0.30
+                and support >= minimum_support and rule_support < 0.35):
+            recovered[index] = endpoint
+
+    def gap_band_content(low: int, high: int) -> int:
+        """端点与现有外侧列线之间的条带里，有多少个行带真正有内容。
+
+        端点落在裁剪边缘时外框已被裁掉、拿不到竖线证据，只能靠内容判断这条带子
+        是"被裁掉的真列"还是"纸张留白"。宽度不能当主判据——「序号」「工号」这类
+        首列天生比中列窄得多（实测 35px vs 96px），用典型列宽去卡会把真列当留白
+        丢掉，导致整列内容连同后续列左移。改成数行带：有 ≥2 行有墨迹才算一列。
+        """
+        if high - low < 12 or high <= low:
+            return 0
+        top = max(0, rows[0])
+        bottom = min(height, rows[-1] + 1)
+        strip = image[top:bottom, max(0, low + 2):min(width, high - 2)]
+        if strip.size == 0 or min(strip.shape[:2]) < 6:
+            return 0
+        gray_strip = cv2.cvtColor(strip, cv2.COLOR_BGR2GRAY) if strip.ndim == 3 else strip
+        size = max(9, int(round(min(gray_strip.shape) * 0.70)) | 1)
+        background = cv2.morphologyEx(
+            gray_strip,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size)),
+        )
+        foreground = np.uint8(cv2.subtract(background, gray_strip) > 18) * 255
+        foreground = cv2.morphologyEx(
+            foreground,
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (1, 3)),
+        )
+        profile = np.count_nonzero(foreground, axis=1)
+        if profile.size == 0:
+            return 0
+        busy = profile >= max(2, int(round(float(np.percentile(profile, 99)) * 0.25)))
+        bands = 0
+        previous = False
+        for value in busy:
+            if value and not previous:
+                bands += 1
+            previous = bool(value)
+        return bands
+
+    left_at_edge = left <= endpoint_tolerance
+    right_at_edge = right >= width - 1 - endpoint_tolerance
+    # 端点在裁剪边缘时，外侧那条列线本身就不在画面里（或被降采样抹掉），宽度
+    # 只能作为"至少要能放下一列"的下限，真正的证据是内容行数。
+    left_gap_requirement = typical * (0.18 if left_at_edge else 1.20)
+    right_gap_requirement = typical * (0.18 if right_at_edge else 1.20)
     if (
-        recovered[0] - left >= typical * 1.20
+        recovered[0] - left >= left_gap_requirement
         and left_support >= minimum_support
-        and any(abs(candidate - left) <= evidence_tolerance for candidate in consistent)
+        and (
+            left_at_edge
+            or any(abs(candidate - left) <= evidence_tolerance for candidate in consistent)
+        )
+        and (not left_at_edge or gap_band_content(left, recovered[0]) >= 2)
     ):
         recovered.insert(0, left)
     if (
-        right - recovered[-1] >= typical * 1.20
+        right - recovered[-1] >= right_gap_requirement
         and right_support >= minimum_support
-        and any(abs(candidate - right) <= evidence_tolerance for candidate in consistent)
+        and (
+            right_at_edge
+            or any(abs(candidate - right) <= evidence_tolerance for candidate in consistent)
+        )
+        and (not right_at_edge or gap_band_content(recovered[-1], right) >= 2)
     ):
         recovered.append(right)
     return _merge_nearby_centers(recovered, maximum_gap=5)
@@ -2859,7 +3231,7 @@ def _recover_clipped_frame_boundaries(
                 output_columns.append(width - 1)
     if (
         len(output_columns) >= 4
-        and len(output_rows) >= 8
+        and len(output_rows) >= 5
         and width - 1 - output_columns[-1] > 3
     ):
         gaps = np.diff(output_columns).astype(float)
@@ -2881,6 +3253,41 @@ def _recover_clipped_frame_boundaries(
     return output_columns, output_rows
 
 
+def _collapse_fragmented_outer_intervals(
+    boundaries: list[int], extent: int,
+) -> list[int]:
+    """Collapse text-stroke fragments inside one otherwise regular edge cell."""
+    ordered = sorted(set(int(value) for value in boundaries))
+    if len(ordered) < 9 or extent <= 0:
+        return ordered
+    gaps = np.diff(ordered).astype(float)
+    ordinary = gaps[gaps >= max(12.0, extent * 0.025)]
+    if ordinary.size < 6:
+        return ordered
+    typical = float(np.median(ordinary))
+    regularity = float(
+        np.mean(np.abs(ordinary - typical) <= max(3.0, typical * 0.20))
+    )
+    if typical < 12.0 or regularity < 0.75:
+        return ordered
+
+    leading_candidates = [
+        index for index in range(2, min(len(ordered), 8))
+        if typical * 0.75 <= ordered[index] - ordered[0] <= typical * 1.25
+    ]
+    leading_stop = leading_candidates[-1] if leading_candidates else None
+    if leading_stop is not None:
+        ordered = [ordered[0], *ordered[leading_stop:]]
+
+    trailing_start = next((
+        index for index in range(max(0, len(ordered) - 8), len(ordered) - 2)
+        if typical * 0.75 <= ordered[-1] - ordered[index] <= typical * 1.25
+    ), None)
+    if trailing_start is not None:
+        ordered = [*ordered[:trailing_start + 1], ordered[-1]]
+    return ordered
+
+
 def _trim_proven_empty_crop_edge_column(
     image: np.ndarray,
     horizontal: np.ndarray,
@@ -2895,7 +3302,7 @@ def _trim_proven_empty_crop_edge_column(
         return columns
     gaps = np.diff(columns).astype(float)
     typical = float(np.median(gaps[:-1])) if gaps.size > 1 else 0.0
-    if typical < 12.0 or gaps[-1] > typical * 0.42:
+    if typical < 12.0:
         return columns
     endpoints: list[int] = []
     for row in rows:
@@ -2910,6 +3317,20 @@ def _trim_proven_empty_crop_edge_column(
         return columns
     tolerance = max(6, int(round(width * 0.02)))
     support = sum(abs(endpoint - columns[-2]) <= tolerance for endpoint in endpoints)
+    if gaps[-1] > typical * 0.42:
+        interior = image[
+            rows[1] + 4 : rows[-1] - 4,
+            columns[-2] + 4 : columns[-1] - 4,
+        ]
+        if interior.size == 0:
+            return columns
+        gray = cv2.cvtColor(interior, cv2.COLOR_BGR2GRAY) if interior.ndim == 3 else interior
+        if (
+            support < math.ceil(len(endpoints) * 0.70)
+            or any(abs(endpoint - columns[-1]) <= tolerance for endpoint in endpoints)
+            or float(np.mean(gray < 120)) >= 0.025
+        ):
+            return columns
     return columns[:-1] if support >= math.ceil(len(endpoints) * 0.60) else columns
 
 
@@ -3402,6 +3823,57 @@ def _trim_decorative_screen_top_frame(
     gaps = np.diff(rows).astype(float)
     body_gaps = gaps[1:]
     typical = float(np.median(body_gaps)) if body_gaps.size else 0.0
+
+    # 屏幕截图的深色标题带有时会被识别成连续两个窄行，真正表头紧随
+    # 其后。只有在主体行距稳定、前两段明显偏短且第三段变亮时才移除。
+    if len(gaps) >= 6:
+        tail_gaps = gaps[2:]
+        tail_typical = float(np.median(tail_gaps[1:])) if tail_gaps.size > 1 else 0.0
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+        left = max(0, columns[0] + int(round((columns[-1] - columns[0]) * 0.01)))
+        right = min(width, columns[-1] - int(round((columns[-1] - columns[0]) * 0.01)))
+
+        def band_dark_ratio(top: int, bottom: int) -> float:
+            vertical_padding = max(2, int(round((bottom - top) * 0.15)))
+            region = gray[
+                top + vertical_padding : bottom - vertical_padding,
+                left:right,
+            ]
+            return float(np.mean(region < 150)) if region.size else 0.0
+
+        def band_edge_ratio(top: int, bottom: int) -> float:
+            vertical_padding = max(2, int(round((bottom - top) * 0.15)))
+            region = gray[
+                top + vertical_padding : bottom - vertical_padding,
+                left:right,
+            ]
+            return float(np.mean(cv2.Canny(region, 50, 120) > 0)) if region.size else 0.0
+
+        tail_regular = bool(
+            tail_typical >= 8.0
+            and np.mean(
+                np.abs(tail_gaps[1:] - tail_typical)
+                <= max(5.0, tail_typical * 0.25)
+            )
+            >= 0.50
+        )
+        if (
+            rows[0] <= height * 0.015
+            and tail_regular
+            and gaps[0] <= tail_typical * 0.75
+            and gaps[1] <= tail_typical * 0.75
+            and gaps[2] >= tail_typical * 1.15
+            and band_dark_ratio(rows[0], rows[1]) >= 0.45
+            and band_dark_ratio(rows[1], rows[2]) >= 0.45
+            and band_dark_ratio(rows[2], rows[3]) <= 0.25
+        ):
+            if (
+                band_edge_ratio(rows[2], rows[3]) <= 0.02
+                and band_edge_ratio(rows[3], rows[4]) >= 0.04
+            ):
+                return rows[3:]
+            return rows[2:]
+
     tolerance = max(4.0, typical * 0.18)
     regular_ratio = float(
         np.mean(np.abs(body_gaps - typical) <= tolerance)
@@ -3495,6 +3967,10 @@ def _trim_sparse_page_edge_columns(
     )
 
     def is_sparse_page_band(index: int) -> bool:
+        # 稀疏真实列仍有贯通横线；仅凭墨迹少不能把整列裁成纸边。
+        if (horizontal_densities and typical_horizontal_density > 0
+                and horizontal_densities[index] >= typical_horizontal_density * 0.60):
+            return False
         gray_sparse = densities[index] < sparse_limit
         grid_sparse = bool(
             horizontal_densities
@@ -3572,6 +4048,7 @@ def _trim_sparse_trailing_page_row(
     image: np.ndarray,
     rows: list[int],
     vertical: np.ndarray | None = None,
+    horizontal: np.ndarray | None = None,
 ) -> list[int]:
     """Remove a blank paper margin below a photographed table."""
     if len(rows) < 5:
@@ -3610,6 +4087,12 @@ def _trim_sparse_trailing_page_row(
             vertical,
         )
     )
+    if narrow_trailing_frame:
+        physical_horizontal, _ = _physical_rule_maps(image)
+        last = ordered[-1]
+        band = physical_horizontal[max(0, last - 2):min(height, last + 3)]
+        if band.size and float(np.mean(np.any(band > 0, axis=0))) >= .75:
+            narrow_trailing_frame = False
     grid_sparse = False
     if vertical is not None and vertical.shape[:2] == gray.shape[:2]:
         vertical_densities: list[float] = []
@@ -3627,6 +4110,10 @@ def _trim_sparse_trailing_page_row(
         typical_vertical_density = (
             float(np.median(vertical_body)) if vertical_body else 0.0
         )
+        vertical_continues_through_edge = bool(
+            typical_vertical_density > 0
+            and vertical_densities[-1] >= typical_vertical_density * 0.60
+        )
         grid_sparse = bool(
             typical_vertical_density > 0
             and vertical_densities[-1] < typical_vertical_density * 0.30
@@ -3641,11 +4128,43 @@ def _trim_sparse_trailing_page_row(
         )
     else:
         line_proven_page_margin = False
+        vertical_continues_through_edge = False
+    regular_blank_edge_margin = False
     if (
-        (near_image_edge and densities[-1] < min(0.035, typical_density * 0.30))
+        horizontal is not None
+        and horizontal.shape[:2] == gray.shape[:2]
+        and gaps.size
+        and typical_gap >= 8.0
+        and typical_gap * 0.65 <= gaps[-1] <= typical_gap * 1.35
+        and not _leading_interval_has_text_components(
+            image, ordered[-2], ordered[-1], horizontal, vertical
+        )
+    ):
+        def boundary_support(value: int) -> float:
+            band = horizontal[
+                max(0, int(value) - 3):min(horizontal.shape[0], int(value) + 4)
+            ]
+            return (
+                float(np.mean(np.any(band > 0, axis=0)))
+                if band.size else 0.0
+            )
+
+        regular_blank_edge_margin = bool(
+            near_image_edge
+            and boundary_support(ordered[-2]) >= 0.50
+            and boundary_support(ordered[-1]) < 0.10
+            and not vertical_continues_through_edge
+        )
+    if (
+        (
+            near_image_edge
+            and not vertical_continues_through_edge
+            and densities[-1] < min(0.035, typical_density * 0.30)
+        )
         or narrow_trailing_frame
         or grid_sparse
         or line_proven_page_margin
+        or regular_blank_edge_margin
     ):
         ordered.pop()
     return ordered
@@ -3814,6 +4333,70 @@ def _trim_sparse_leading_page_row(
     return ordered
 
 
+def _shift_false_leading_crop_edge_to_trailing_rule(
+    image: np.ndarray,
+    columns: list[int],
+    rows: list[int],
+    vertical: np.ndarray,
+) -> list[int]:
+    """Replace a synthetic top crop edge with the visible final table rule."""
+    if len(columns) < 3 or len(rows) < 8 or vertical.shape[:2] != image.shape[:2]:
+        return rows
+    height, width = image.shape[:2]
+    ordered = sorted(set(int(value) for value in rows))
+    gaps = np.diff(ordered).astype(float)
+    ordinary = gaps[1:] if gaps.size > 1 else gaps
+    typical = float(np.median(ordinary)) if ordinary.size else 0.0
+    trailing = float((height - 1) - ordered[-1])
+    if not (
+        typical >= 8.0
+        and ordered[0] <= max(2, int(round(height * 0.004)))
+        and typical * 0.70 <= gaps[0] <= typical * 1.35
+        and typical * 1.45 <= trailing <= typical * 2.60
+    ):
+        return ordered
+    def vertical_density(top: int, bottom: int) -> float:
+        margin = max(2, min(5, (bottom - top) // 12))
+        band = vertical[top + margin : bottom - margin, :]
+        return 1.0 if band.size == 0 else float(np.mean(band > 0))
+
+    densities = [
+        vertical_density(top, bottom)
+        for top, bottom in zip(ordered[:-1], ordered[1:])
+    ]
+    body = densities[2:-1] or densities[1:]
+    typical_density = float(np.median(body)) if body else 0.0
+    if typical_density <= 0 or densities[0] >= typical_density * 0.30:
+        return ordered
+
+    predicted = int(round(ordered[-1] + typical))
+    radius = max(4, int(round(typical * 0.45)))
+    search_top = max(2, predicted - radius)
+    search_bottom = min(height - 2, predicted + radius)
+    left = max(0, int(columns[0]))
+    right = min(width, int(columns[-1]) + 1)
+    if search_bottom <= search_top or right - left < 40:
+        return ordered
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    transitions = np.mean(
+        np.abs(
+            gray[search_top + 1 : search_bottom + 2, left:right].astype(np.int16)
+            - gray[search_top - 1 : search_bottom, left:right].astype(np.int16)
+        )
+        > 8,
+        axis=1,
+    )
+    if transitions.size == 0:
+        return ordered
+    offset = int(np.argmax(transitions))
+    if float(transitions[offset]) < 0.18:
+        return ordered
+    candidate = search_top + offset
+    if not typical * 0.60 <= candidate - ordered[-1] <= typical * 1.45:
+        return ordered
+    return ordered[1:] + [candidate]
+
+
 def _trim_thin_leading_frame_row(
     image: np.ndarray,
     rows: list[int],
@@ -3879,12 +4462,14 @@ def extract_embedded_spreadsheet_grid(
 
     best_rows: list[int] = []
     best_typical_gap = 0.0
-    candidate_gaps = [
+    candidate_gaps = list(dict.fromkeys(
         right_row - left_row
         for left_row, right_row in zip(row_candidates, row_candidates[1:])
         if 8 <= right_row - left_row <= 80
-    ]
+    ))
     for start in range(len(row_candidates) - 7):
+        if len(row_candidates) - start <= len(best_rows):
+            break
         for seed_gap in candidate_gaps:
             run = [row_candidates[start]]
             typical_gap = float(seed_gap)
@@ -3952,14 +4537,14 @@ def extract_screen_grid(
     ]
     | None = None,
 ) -> tuple[list[int], list[int], np.ndarray] | None:
+    _probe_budget("extract_screen_grid")
     height, width = image.shape[:2]
-    if width < 800 or height < 250:
+    if width < 800 or height < 120:
         return None
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
     transition_rows = _repeated_transition_centers(gray, rows=True)
     transition_columns = _repeated_transition_centers(gray, rows=False)
-    transition_rows = _recover_merged_header_rows(transition_rows)
 
     background = float(np.percentile(gray, 90))
     threshold = int(max(180, min(245, background - 20)))
@@ -3977,6 +4562,9 @@ def extract_screen_grid(
 
     adaptive_horizontal, adaptive_vertical, _ = _grid_maps(image)
     transition_rows = _remove_false_transition_rows(transition_rows, adaptive_horizontal, width)
+    transition_rows = _recover_partial_header_row_boundaries(
+        transition_rows, adaptive_horizontal, width, image
+    )
     vertical_projection = np.maximum(
         np.count_nonzero(vertical, axis=0),
         np.count_nonzero(adaptive_vertical, axis=0),
@@ -4075,7 +4663,9 @@ def extract_screen_grid(
         combined = _merge_nearby_centers(combined)
         if len(combined) >= 3:
             columns = [0] + combined + [width - 1]
-            rows = _recover_merged_header_rows(rows)
+            rows = _recover_partial_header_row_boundaries(
+                rows, adaptive_horizontal, width, image
+            )
             recovered_body_grid = True
 
     if not recovered_body_grid:
@@ -4126,6 +4716,8 @@ def extract_screen_grid(
         image,
     )
     rows = _trim_decorative_screen_top_frame(image, columns, rows)
+    columns = _collapse_degenerate_screen_boundaries(columns, width)
+    rows = _collapse_degenerate_screen_boundaries(rows, height)
 
     mask = np.zeros((height, width), dtype=np.uint8)
     for row in rows:
@@ -4136,6 +4728,23 @@ def extract_screen_grid(
     cleaned = _enhance_for_ocr(image)
     cleaned[mask > 0] = 255
     return columns, rows, cleaned
+
+
+def _collapse_degenerate_screen_boundaries(
+    boundaries: list[int], extent: int
+) -> list[int]:
+    """合并彼此相贴的屏幕网格边界。
+
+    竖线形态学在真实工作表规则两侧常同时点亮，得到相距 1~3 像素的重复边界。
+    这种退化列会把一格劈成"宽 / 极窄 / 宽"三段，令后续裁剪把两格文字并进同一格，
+    整表向左错位一列且末列被判为物理缺失。这里按中心平均合并，宽度不足 1/480 画面的
+    边界不可能承载可读单元格。
+    """
+    if len(boundaries) < 3:
+        return list(boundaries)
+    minimum_gap = max(3, int(round(extent / 480.0)))
+    merged = _merge_nearby_centers(sorted(boundaries), minimum_gap)
+    return merged if len(merged) >= 3 else list(boundaries)
 
 
 def _low_contrast_grid_supersedes_screen_grid(
@@ -4204,13 +4813,57 @@ def _extract_ruled_grid_uncached(
     height, width = image.shape[:2]
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image.copy()
     vertical_edge_statistics = (
-        _vertical_edge_statistics(gray) if width >= 800 and height >= 250 else None
+        _vertical_edge_statistics(gray) if width >= 800 and height >= 120 else None
     )
     screen_grid = extract_screen_grid(
         image,
         vertical_statistics=vertical_edge_statistics,
     )
     if screen_grid is not None and not prefer_adaptive:
+        screen_columns, screen_rows, screen_cleaned = screen_grid
+        if len(screen_columns) - 1 >= 12:
+            adaptive_candidate = _extract_ruled_grid_uncached(
+                image, prefer_adaptive=True
+            )
+            if (
+                adaptive_candidate is not None
+                and _low_contrast_grid_supersedes_screen_grid(
+                    adaptive_candidate[0],
+                    adaptive_candidate[1],
+                    screen_columns,
+                    screen_rows,
+                    width=image.shape[1],
+                )
+            ):
+                return adaptive_candidate
+        if len(screen_rows) - 1 <= 6:
+            adaptive_candidate = _extract_ruled_grid_uncached(
+                image, prefer_adaptive=True
+            )
+            if adaptive_candidate is not None:
+                adaptive_columns, adaptive_rows, adaptive_cleaned = adaptive_candidate
+                _, adaptive_vertical, _ = _grid_maps(image)
+                if (
+                    len(adaptive_rows) >= len(screen_rows) + 2
+                    and abs(len(adaptive_columns) - len(screen_columns)) <= 1
+                    and _edge_rule_continuation(
+                        adaptive_vertical,
+                        [int(value) for value in screen_columns],
+                        int(adaptive_rows[0]) + 2,
+                        int(adaptive_rows[-1]) - 2,
+                        horizontal=False,
+                    ) >= 0.70
+                ):
+                    return list(screen_columns), list(adaptive_rows), adaptive_cleaned
+        screen_horizontal, _, _ = _grid_maps(image)
+        recovered_screen_columns = _recover_outer_columns_from_horizontal_endpoints(
+            image,
+            screen_horizontal,
+            list(screen_columns),
+            list(screen_rows),
+        )
+        if len(recovered_screen_columns) > len(screen_columns):
+            return recovered_screen_columns, list(screen_rows), screen_cleaned
         return screen_grid
     horizontal, vertical, _ = _grid_maps(image)
     columns = _line_centers(np.count_nonzero(vertical, axis=0), height)
@@ -4403,13 +5056,24 @@ def _extract_ruled_grid_uncached(
                 max(0, table_span[0] - 12),
                 min(height - 1, table_span[1] + 12),
             )
+    # 补列线需跨过正常单元格高度，避免不等宽列中的重复文字竖笔画被当作缺线。
+    recovery_vertical = cv2.morphologyEx(
+        vertical,
+        cv2.MORPH_OPEN,
+        cv2.getStructuringElement(
+            cv2.MORPH_RECT,
+            (1, max(18, int(round(float(np.median(np.diff(rows))) * 0.80))))
+            if len(rows) >= 2 else (1, 18),
+        ),
+    )
     columns = _recover_regular_missing_boundaries(
         columns,
-        np.count_nonzero(vertical, axis=0),
+        np.count_nonzero(recovery_vertical, axis=0),
         height,
     )
     body_columns = _body_band_consensus_columns(vertical, horizontal, rows)
     columns = _prefer_body_consensus_columns(columns, body_columns)
+    columns = _filter_columns_by_cell_rule_continuity(columns, rows, vertical)
     columns = _remove_weak_split_columns(columns, vertical)
     if not low_contrast_grid_selected:
         columns = _recover_supported_irregular_boundaries(
@@ -4443,7 +5107,9 @@ def _extract_ruled_grid_uncached(
     rows = _collapse_double_row_boundaries(rows, horizontal)
     rows = _trim_thin_leading_frame_row(image, rows, horizontal, vertical)
     rows = _trim_sparse_leading_page_row(image, rows, horizontal, vertical)
-    rows = _trim_sparse_trailing_page_row(image, rows, vertical)
+    rows = _trim_sparse_trailing_page_row(
+        image, rows, vertical, horizontal=horizontal
+    )
     columns, rows = _recover_clipped_frame_boundaries(
         image,
         horizontal,
@@ -4474,7 +5140,17 @@ def _extract_ruled_grid_uncached(
     )
     rows = _collapse_double_row_boundaries(rows, horizontal)
     rows = _trim_sparse_leading_page_row(image, rows, horizontal, vertical)
-    rows = _trim_sparse_trailing_page_row(image, rows, vertical)
+    rows = _trim_sparse_trailing_page_row(
+        image, rows, vertical, horizontal=horizontal
+    )
+    rows = _shift_false_leading_crop_edge_to_trailing_rule(
+        image,
+        columns,
+        rows,
+        vertical,
+    )
+    columns = _collapse_fragmented_outer_intervals(columns, width)
+    rows = _collapse_fragmented_outer_intervals(rows, height)
     spreadsheet_grid = _recover_spreadsheet_ruler_grid(
         gray,
         columns,
@@ -4495,26 +5171,168 @@ def _extract_ruled_grid_uncached(
     return columns, rows, cleaned
 
 
+def _fit_repeated_supported_columns(
+    columns: list[int], rows: list[int], vertical: np.ndarray, width: int,
+) -> list[int] | None:
+    """超宽规则表中剔除文字竖笔，缺列必须由整高物理竖线证实。"""
+    maximum_columns = 32
+    if (len(columns) <= maximum_columns + 1 or width < 4000
+            or not 6 <= len(rows) <= 32):
+        return None
+    span = columns[-1] - columns[0]
+    if span < width * .80:
+        return None
+    gaps = np.diff(columns)
+    large = gaps[gaps > span / (maximum_columns * 2)]
+    if len(large) < maximum_columns // 2:
+        return None
+    pitch = float(np.median(large))
+    count = int(round(span / pitch))
+    if not 12 <= count <= maximum_columns or abs(span / count - pitch) > pitch * .08:
+        return None
+    predicted = [int(round(columns[0] + span * index / count))
+                 for index in range(count + 1)]
+    tolerance = max(4, int(round(pitch * .025)))
+    matched = sum(any(abs(actual - value) <= tolerance for actual in columns)
+                  for value in predicted)
+    if matched < len(predicted) * .90:
+        return None
+    top, bottom = rows[0] + 3, rows[-1] - 3
+    for value in predicted:
+        band = vertical[top:bottom, max(0, value - tolerance):value + tolerance + 1]
+        if not band.size or float(np.mean(np.any(band > 0, axis=1))) < .85:
+            return None
+    return predicted
+
+
 def extract_ruled_grid(
     image: np.ndarray,
     *,
     prefer_adaptive: bool = False,
 ) -> tuple[list[int], list[int], np.ndarray] | None:
     """Extract a ruled grid, reusing exact duplicate work within one request."""
+    _probe_budget("extract_ruled_grid")
+
+    def normalized(result):
+        if result is None:
+            return None
+        columns, rows, cleaned = result
+        normalized_columns = _collapse_fragmented_outer_intervals(columns, image.shape[1])
+        normalized_rows = _collapse_fragmented_outer_intervals(rows, image.shape[0])
+        if len(normalized_rows) >= 8 and len(normalized_columns) >= 3:
+            horizontal, _ = _physical_rule_maps(image)
+            left, right = int(normalized_columns[0]), int(normalized_columns[-1])
+            supports = []
+            for row in normalized_rows[1:-1]:
+                band = horizontal[max(0, row - 2):min(image.shape[0], row + 3), left:right]
+                supports.append(float(np.mean(np.any(band > 0, axis=0))) if band.size else 0.0)
+            if supports and float(np.mean(np.asarray(supports) >= 0.75)) >= 0.75:
+                retained = [normalized_rows[0]]
+                for row, support in zip(normalized_rows[1:-1], supports):
+                    if support < 0.06:
+                        top = max(1, row - 3)
+                        bottom = min(image.shape[0] - 2, row + 4)
+                        delta = np.abs(
+                            image[top + 1:bottom + 1].astype(np.int16)
+                            - image[top - 1:bottom - 1].astype(np.int16)
+                        )
+                        if delta.ndim == 3:
+                            delta = np.max(delta, axis=2)
+                        color_step = (
+                            float(np.max(np.median(delta[:, left:right], axis=1)))
+                            if delta.size else 0.0
+                        )
+                        if color_step < 24:
+                            continue
+                    retained.append(row)
+                retained.append(normalized_rows[-1])
+                if len(retained) < len(normalized_rows):
+                    if cleaned.shape[:2] == image.shape[:2]:
+                        enhanced = _enhance_for_ocr(image)
+                        cleaned = cleaned.copy()
+                        for row in set(normalized_rows) - set(retained):
+                            top, bottom = max(0, row - 4), min(image.shape[0], row + 5)
+                            cleaned[top:bottom] = enhanced[top:bottom]
+                    normalized_rows = retained
+        if len(normalized_rows) >= 8:
+            typical = float(np.median(np.diff(normalized_rows)))
+            if typical >= 8 and normalized_rows[1] - normalized_rows[0] > typical * 2.4:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+                for row in _repeated_transition_centers(gray, rows=True):
+                    if not (normalized_rows[0] + typical * 0.55 < row
+                            < normalized_rows[1] - typical * 0.55):
+                        continue
+                    delta = np.abs(
+                        image[row + 1, normalized_columns[0]:normalized_columns[-1]].astype(np.int16)
+                        - image[row - 1, normalized_columns[0]:normalized_columns[-1]].astype(np.int16)
+                    )
+                    if delta.ndim == 2:
+                        delta = np.max(delta, axis=1)
+                    if float(np.mean(delta >= 24)) >= 0.85 and float(np.median(delta)) >= 20:
+                        normalized_rows.insert(1, row)
+                        break
+        if len(normalized_columns) > 33 and image.shape[1] >= 4000:
+            _, vertical, _ = _grid_maps(image)
+            fitted = _fit_repeated_supported_columns(
+                normalized_columns, normalized_rows, vertical, image.shape[1]
+            )
+            if fitted is not None:
+                normalized_columns = fitted
+        if len(normalized_rows) >= 8 and len(normalized_columns) >= 5:
+            gaps = np.diff(normalized_columns)
+            typical = float(np.median(gaps))
+            if typical >= 12 and max(gaps, default=0) > typical * 1.75:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+                top, bottom = normalized_rows[1], normalized_rows[-1]
+                delta = np.abs(
+                    gray[top:bottom, 2:].astype(np.int16)
+                    - gray[top:bottom, :-2].astype(np.int16)
+                )
+                coverage = np.mean(delta >= 8, axis=0) if delta.size else np.array([])
+                recovered = list(normalized_columns)
+                for left, right in zip(normalized_columns, normalized_columns[1:]):
+                    if right - left <= typical * 1.75:
+                        continue
+                    margin = max(12, int(round(typical * 0.30)))
+                    start, stop = left + margin, right - margin
+                    if stop <= start or stop > len(coverage) + 1:
+                        continue
+                    supported = np.flatnonzero(coverage[start - 1:stop - 1] >= 0.90)
+                    for group in np.split(supported, np.flatnonzero(np.diff(supported) > 1) + 1):
+                        if not group.size:
+                            continue
+                        column = start + int(round(float(group.mean())))
+                        if all(abs(column - existing) >= margin for existing in recovered):
+                            recovered.append(column)
+                if len(recovered) > len(normalized_columns):
+                    normalized_columns = sorted(recovered)
+        if normalized_columns != columns and len(normalized_columns) >= 4:
+            _, vertical, _ = _grid_maps(image)
+            profile = np.mean(vertical[normalized_rows[0]:normalized_rows[-1]] > 0, axis=0)
+            pitch = float(np.median(np.diff(normalized_columns)))
+            for index in (0, len(normalized_columns) - 1):
+                boundary = normalized_columns[index]
+                low = max(0, int(boundary - pitch * 0.15))
+                high = min(len(profile), int(boundary + pitch * 0.15) + 1)
+                supported = np.flatnonzero(profile[low:high] >= 0.70) + low
+                if supported.size:
+                    normalized_columns[index] = int(supported[np.argmin(abs(supported - boundary))])
+        return normalized_columns, normalized_rows, cleaned
+
     cache = _ruled_grid_request_cache
     if cache is None:
-        return _extract_ruled_grid_uncached(
+        return normalized(_extract_ruled_grid_uncached(
             image,
             prefer_adaptive=prefer_adaptive,
-        )
+        ))
     contiguous = image if image.flags.c_contiguous else np.ascontiguousarray(image)
     digest = hashlib.blake2b(memoryview(contiguous).cast("B"), digest_size=16).digest()
     key = (tuple(image.shape), str(image.dtype), bool(prefer_adaptive), digest)
     if key not in cache:
-        result = _extract_ruled_grid_uncached(
+        result = normalized(_extract_ruled_grid_uncached(
             image,
             prefer_adaptive=prefer_adaptive,
-        )
+        ))
         cache[key] = (
             None
             if result is None
@@ -4528,6 +5346,29 @@ def extract_ruled_grid(
     return list(columns), list(rows), cleaned.copy()
 
 
+def _normalize_axis_boundaries(values: Any) -> list[int]:
+    """把列/行边界规范成**严格递增**的整数列表（2026-10-30 lead 复查 P1）。
+
+    `assign_ocr_to_grid` 原来对 rows/columns 契约零校验，实测三种崩法：
+      · `columns=[]`      → `float(columns[-1])` 抛 IndexError，整页识别失败；
+      · `rows=[0,100,100,200]` → 零高行，`searchsorted(side="right")` 永不落入
+        该行 ⇒ 输出里凭空多一行恒空、行数与结构证书错位；
+      · 非升序边界        → box 中心被判到 -1 列，**静默丢值**。
+    这里先转 int、丢弃重复与逆序边界（它们只会产生零宽列/零高行），
+    返回空列表表示这条轴不可用，由调用方按"没有可用网格"处理。
+    """
+    try:
+        numbers = [int(round(float(value))) for value in (values or [])]
+    except (TypeError, ValueError):
+        return []
+    normalized: list[int] = []
+    for number in numbers:
+        if normalized and number <= normalized[-1]:
+            continue
+        normalized.append(number)
+    return normalized
+
+
 def assign_ocr_to_grid(
     columns: list[int],
     rows: list[int],
@@ -4537,15 +5378,27 @@ def assign_ocr_to_grid(
     *,
     preserve_geometry: bool = False,
 ) -> tuple[list[list[str]], list[list[float]]]:
+    columns = _normalize_axis_boundaries(columns)
+    rows = _normalize_axis_boundaries(rows)
     row_count = max(0, len(rows) - 1)
     column_count = max(0, len(columns) - 1)
+    if row_count == 0 or column_count == 0:
+        # 轴不可用（空 / 全重复 / 非数值）：没有可用网格，交给上层报"未检测到表格"。
+        return [], []
     entries: list[list[list[tuple[float, float, str, float]]]] = [
         [[] for _ in range(column_count)] for _ in range(row_count)
     ]
     if boxes is not None and texts is not None:
         score_values = list(scores or [])
         for index, (box, text) in enumerate(zip(boxes, texts)):
-            points = np.asarray(box, dtype=float).reshape(-1, 2)
+            try:
+                points = np.asarray(box, dtype=float).reshape(-1, 2)
+            except (TypeError, ValueError):
+                # 2026-10-30（lead 复查 P2）：单个畸形 box（奇数坐标数 / 变长多边形 /
+                # 非数值）原来会让整个 `reshape` 抛错、整页识别失败。坏 box 跳过即可。
+                continue
+            if points.size == 0 or not np.all(np.isfinite(points)):
+                continue
             center_x = float(points[:, 0].mean())
             center_y = float(points[:, 1].mean())
             row = int(np.searchsorted(rows, center_y, side="right") - 1)
@@ -4923,7 +5776,7 @@ def _full_frame_perspective_grid(
     column_count = len(columns) - 1
     if not (
         8 <= row_count <= 120
-        and 6 <= column_count <= 26
+        and 2 <= column_count <= 26
         and row_count * column_count <= 1280
     ):
         return None
@@ -4950,10 +5803,14 @@ def _full_frame_perspective_grid(
         or typical_row_gap < max(6.0, height * 0.006)
         or float(column_gaps.min()) < typical_column_gap * 0.35
         or float(row_gaps.min()) < typical_row_gap * 0.35
-        or float(column_gaps.max()) > typical_column_gap * 2.75
         or float(row_gaps.max()) > typical_row_gap * 2.75
     ):
         return None
+    _, vertical = _physical_rule_maps(image)
+    for x in columns:
+        band = vertical[rows[0]:rows[-1] + 1, max(0, x - 3):min(width, x + 4)]
+        if not band.size or float(np.mean(np.any(band > 0, axis=1))) < 0.60:
+            return None
     return list(columns), list(rows), image
 
 
@@ -4962,8 +5819,40 @@ def rectify_table_image(
     *,
     expand_to_document: bool = True,
 ) -> tuple[np.ndarray, dict[str, Any]]:
+    _probe_budget("rectify_table_image")
     if image is None or image.size == 0:
         raise ValueError("image is empty")
+
+    cache = _rectify_request_cache
+    key: tuple | None = None
+    if cache is not None:
+        contiguous = image if image.flags.c_contiguous else np.ascontiguousarray(image)
+        key = (
+            image.shape,
+            str(image.dtype),
+            bool(expand_to_document),
+            hashlib.blake2b(
+                memoryview(contiguous).cast("B"), digest_size=16
+            ).digest(),
+        )
+        if key in cache:
+            value = cache.pop(key)
+            cache[key] = value
+            return value[0].copy(), dict(value[1])
+
+    result = _rectify_table_image_uncached(image, expand_to_document=expand_to_document)
+    if cache is not None and key is not None:
+        if len(cache) >= 8:
+            cache.pop(next(iter(cache)))
+        cache[key] = (result[0].copy(), dict(result[1]))
+    return result
+
+
+def _rectify_table_image_uncached(
+    image: np.ndarray,
+    *,
+    expand_to_document: bool = True,
+) -> tuple[np.ndarray, dict[str, Any]]:
 
     height, width = image.shape[:2]
     perspective_image, perspective_transform, perspective_corners, used_document_corners = _warp_perspective_table(
@@ -5065,17 +5954,22 @@ def rectify_table_image(
             np.linalg.inv(perspective_transform),
         )
     original_corners = original_corners[0]
+    warp_corners = original_corners.copy()
     original_corners[:, 0] = np.clip(original_corners[:, 0], 0, width - 1)
     original_corners[:, 1] = np.clip(original_corners[:, 1], 0, height - 1)
     return _enhance_for_ocr(rectified), {
         "detected": True,
         "corners": [[round(float(px), 2), round(float(py), 2)] for px, py in original_corners],
+        "warp_corners": [
+            [round(float(px), 2), round(float(py), 2)] for px, py in warp_corners
+        ],
         "deskew_angle": round(angle, 3),
         "dense_near_square": dense_near_square,
     }
 
 
 def prepare_image(image: np.ndarray, crop_mode: str = "auto") -> tuple[np.ndarray, dict[str, Any]]:
+    _probe_budget("prepare_image")
     if crop_mode == "full":
         return _enhance_for_ocr(image), {"detected": False, "corners": [], "mode": "full"}
     prepared, metadata = rectify_table_image(
@@ -5087,6 +5981,10 @@ def prepare_image(image: np.ndarray, crop_mode: str = "auto") -> tuple[np.ndarra
 
 
 class _TableParser(HTMLParser):
+    # 单个单元格允许的最大行/列跨度。真实表格没有这么宽的合并格（1200 例语料
+    # 实测最大整表 42 行 × 11 列），限幅只为挡住畸形输入把网格撑爆。
+    _MAX_TABLE_SPAN = 1024
+
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.rows: list[list[tuple[str, int, int]]] = []
@@ -5095,14 +5993,35 @@ class _TableParser(HTMLParser):
         self._row_span = 1
         self._column_span = 1
 
+    @classmethod
+    def _safe_span(cls, raw: object) -> int:
+        """把 rowspan/colspan 解析成 [1, _MAX_TABLE_SPAN] 内的整数；非法值当 1。"""
+        if raw is None:
+            return 1
+        try:
+            value = int(str(raw).strip())
+        except (TypeError, ValueError):
+            return 1
+        if value < 1:
+            return 1
+        return min(value, cls._MAX_TABLE_SPAN)
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
         if tag == "tr":
             self._row = []
         elif tag in {"td", "th"} and self._row is not None:
             values = dict(attrs)
-            self._row_span = max(1, int(values.get("rowspan") or 1))
-            self._column_span = max(1, int(values.get("colspan") or 1))
+            # 2026-10-30（lead 复查 P2）：rowspan/colspan 原来只 `max(1, int(...))`，
+            # 既不校验类型也不限幅 —— OCR 引擎若在这两个属性上吐一个异常值
+            # （`rowspan="100000"`、非数字、超大整数），下面 _apply 会
+            # `while len(grid) < required_rows: grid.append([])` 且 `extend([""]*N)`
+            # 直接撑出十万行/列的空网格（内存炸弹 + 下游逐格遍历卡死），而这条路径
+            # 在识别管线内、没有预算检查点。
+            # 这里按"合法性优先"处理：非法值一律当 1（不报错，别让畸形 HTML 阻断
+            # 整张表识别）；合法但离谱的值限幅到 _MAX_TABLE_SPAN（远超任何真实表格）。
+            self._row_span = self._safe_span(values.get("rowspan"))
+            self._column_span = self._safe_span(values.get("colspan"))
             self._cell_text = []
         elif tag == "br" and self._cell_text is not None:
             self._cell_text.append("\n")
@@ -5136,15 +6055,26 @@ def parse_html_table(html: str) -> tuple[list[list[str]], list[dict[str, int]]]:
     occupied: set[tuple[int, int]] = set()
     spans: list[dict[str, int]] = []
 
+    # 2026-10-30（lead 复查 P2）：单个 span 已限幅，但**总网格**还缺上限 ——
+    # 一张表里很多单元格各带大跨度同样能把网格撑到十万级（本函数在识别管线内，
+    # 没有预算检查点，撑爆了就是内存/耗时炸弹）。真实语料最大 42 行 × 11 列，
+    # 这里给一个远超真实规模、但仍可控的硬上限：超限就截断，不再继续扩张。
+    max_rows = _TableParser._MAX_TABLE_SPAN
+    max_columns = _TableParser._MAX_TABLE_SPAN
+
     for row_index, source_row in enumerate(parser.rows):
+        if row_index >= max_rows:
+            break
         while len(grid) <= row_index:
             grid.append([])
         column = 0
         for text, row_span, column_span in source_row:
             while (row_index, column) in occupied:
                 column += 1
-            required_rows = row_index + row_span
-            required_columns = column + column_span
+            if column >= max_columns:
+                break
+            required_rows = min(row_index + row_span, max_rows)
+            required_columns = min(column + column_span, max_columns)
             while len(grid) < required_rows:
                 grid.append([])
             for target_row in range(required_rows):
@@ -5160,8 +6090,8 @@ def parse_html_table(html: str) -> tuple[list[list[str]], list[dict[str, int]]]:
                     {
                         "row": row_index,
                         "column": column,
-                        "row_span": row_span,
-                        "column_span": column_span,
+                        "row_span": min(row_span, max_rows - row_index),
+                        "column_span": min(column_span, max_columns - column),
                     }
                 )
             column += column_span
@@ -5208,8 +6138,26 @@ def validate_request(request: dict[str, Any]) -> dict[str, Any]:
             deadline_seconds, (int, float)
         ):
             raise ValueError("deadline_seconds must be a non-negative number")
-        if deadline_seconds < 0:
-            raise ValueError("deadline_seconds must be a non-negative number")
+        # 2026-10-28：NaN / ±Infinity 必须在这里拒掉。
+        #   * NaN：`NaN < 0` 恒为 False，"非负"检查形同虚设 —— 非标准字面量
+        #     `NaN` 能被 json.loads 收下，一路走到识别预算里；
+        #   * Infinity：同样能被 json.loads 直接收下（标准写法 `1e400` 也解析成
+        #     inf），下游只会把它 clamp 成 120 秒硬上限，等于把"非法的时限"
+        #     静默变成"最长的时限"；
+        #   * 超大整数（如 400 位）：float() 抛 OverflowError，那是 ArithmeticError，
+        #     不在 _classify_error 的 ValueError 分支里 → 会被归成
+        #     INTERNAL_ERROR / retryable=true，客户端于是自动重试一轮同样非法的请求。
+        # 三者都不是契约 §4 意义上的"非负数值"，按 INVALID_OPTION 拒绝。
+        # `_recognize` 内部那份 NaN/inf 兜底**保持不变**（它还要兜住绕过协议层
+        # 直接调用的场景）；这里是协议边界的早退，只收不放。
+        try:
+            deadline_value = float(deadline_seconds)
+        except (OverflowError, ValueError, TypeError):
+            raise ValueError(
+                "deadline_seconds must be a finite non-negative number"
+            ) from None
+        if not math.isfinite(deadline_value) or deadline_value < 0:
+            raise ValueError("deadline_seconds must be a finite non-negative number")
         for boolean_option in ("input_rectified", "selected_table_region"):
             if boolean_option in options and not isinstance(
                 options[boolean_option], bool
@@ -5253,8 +6201,24 @@ def build_result(
             # A yellow low-confidence value must have the same export and
             # summary meaning as an explicit disagreement; otherwise the UI
             # can visibly warn about a cell while reporting zero pending items.
+            #
+            # 0.77 / 0.86 是类别哨兵（没取得 / 取得了双模型一致确认），不是实测
+            # 置信度。**有内容的格子**不再因为它们被判成待复核：FC-00005 逐格
+            # 102/102 全对的表因此被 GUI 标成「102 项待确认」、导出多出 102 条
+            # 复核批注、公开 SDK 判成「非法响应」。真·实测低置信（不是哨兵字面量）
+            # 照旧算。
+            #
+            # 空格子带非零置信度是另一回事：那里确实检出过内容却读不出文字，
+            # 属于真·不确定（"explicit uncertain blank"），照旧待复核 —— 这一条
+            # 由 tests/test_backend.py 的
+            # test_build_result_marks_explicit_uncertain_blank_for_manual_review
+            # 守着。注意界面、导出和公开 SDK 三条路径都以"格子有文字"为前提才会
+            # 看 confidence，所以这条区分对下游没有任何可见差异。
+            blank_cell = not str(value).strip()
             needs_review = raw_cell_score < 0.0 or (
-                raw_cell_score != 0.0 and raw_cell_score < 0.78
+                raw_cell_score != 0.0
+                and raw_cell_score < 0.78
+                and (blank_cell or not _is_sentinel_confidence(raw_cell_score))
             )
             cell_score = max(0.0, min(1.0, raw_cell_score))
             cell_row.append(
@@ -5262,6 +6226,7 @@ def build_result(
                     "text": value,
                     "confidence": cell_score,
                     "needs_review": needs_review,
+                    "confidence_sentinel": _is_sentinel_confidence(cell_score),
                 }
             )
         cells.append(cell_row)
@@ -5277,25 +6242,99 @@ def build_result(
     }
 
 
+# XML 1.0 不允许的码位：除制表/换行/回车之外的控制字符，加上 U+FFFE/U+FFFF。
+# 文本一旦带进这些码位，openpyxl 在序列化时会抛 IllegalCharacterError，
+# 整个 XLSX 导出直接失败 —— 一个格子里的一个坏字符就能让整张表导不出来。
+_XML_ILLEGAL_CHARS = re.compile(
+    "[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]"
+)
+# UTF-16 里的孤立代理项同样过不了 XML 编码。
+_XML_LONE_SURROGATES = re.compile("[\ud800-\udfff]")
+
+
+def xml_safe_text(value: Any) -> str:
+    """去掉 XML 1.0 禁止的码位，保留单元格内换行。
+
+    2026-10-30（lead 复查）：`None` 原来会被 `str()` 成字面 **"None"** 写进
+    Excel —— `cells: [[null]]` 或 `{"text": null}` 的请求实测导出后 A1 单元格就是
+    字符串 "None"，客户表格里凭空多出一列垃圾。空值统一按空字符串处理。
+    """
+    if isinstance(value, dict):
+        raw = value.get("text")
+    else:
+        raw = value
+    if raw is None:
+        return ""
+    text = str(raw)
+    if not text:
+        return text
+    cleaned = _XML_ILLEGAL_CHARS.sub("", text)
+    if _XML_LONE_SURROGATES.search(cleaned):
+        cleaned = _XML_LONE_SURROGATES.sub("", cleaned)
+    return cleaned
+
+
+def cell_display_text(value: Any) -> str:
+    """单元格的显示文本：字典取 ``text``；``None`` 表示"没有内容"。
+
+    **2026-10-28**：旧实现走 ``str(value.get("text", "")) if isinstance(value, dict)
+    else str(value)``，于是 JSON 里的 ``null`` 格被写成**字面量 "None"**：客户端
+    发 ``"cells": [[null, {"text":"b"}]]``，导出的 XLSX 第一格就是 "None"，
+    而且"全表都是 null"的网格会绕过空表判定（"None" 不是空白）写出一张
+    满是 "None" 的工作簿。null 在 JSON 里就是"这一格没有值"，必须归一成空串。
+    """
+    raw = value.get("text", "") if isinstance(value, dict) else value
+    if raw is None:
+        return ""
+    return str(raw)
+
+
 def write_xlsx(
     output_path: str | Path,
     rows: Iterable[Iterable[Any]],
     spans: list[dict[str, Any]] | None = None,
+    structure_certificate: dict[str, Any] | None = None,
 ) -> None:
     raw_grid = _rectangular(rows)
+    # 2026-10-28：空表必须显式失败，不能写一张"成功但空白"的工作簿。
+    # openpyxl 对空网格照样能存盘（实测 4809 B、打开是空工作表），前端拿到
+    # status=ok + 文件存在，客户看到的是空白表 —— 与「导出成功」在语义上冲突。
+    # 契约 docs/BACKEND_API_V1.md §7 规定成功只表示"文件写入成功"，不表示有内容；
+    # 因此这里按既有错误码语义拒绝：消息前缀 "cells must" 会被
+    # ocr_backend._classify_error 映射成 EXPORT_GRID_INVALID（field=cells、
+    # retryable=false），客户端不需要新增分支。
+    # 判据取「没有任何文字」而不是「没有任何行」：只有空白格的网格同样是空表
+    # （实测 2229 例真实识别产物里，结构为空或全空白的用例为 0，不影响既有语料）。
+    # ⚠ 2026-11-02：这里改用 `cell_display_text()`。
+    #   旧写法 `str(value.get("text", "") if isinstance(value, dict) else value)`
+    #   遇到 `{"text": None}` 会拿到 None → str(None) = "None" → 非空
+    #   ⇒ **全 null 的网格被判成"有内容的表"** ⇒ 导出一张满是 "None" 的工作簿。
+    #   ⇒ cell_display_text 把 None 归成空串（与 xml_safe_text 写盘口径同源），
+    #     判定和写盘用同一套口径，不会再出现「判为空表但写出来有内容」的错位。
+    if not raw_grid or not raw_grid[0] or not any(
+        cell_display_text(value).strip()
+        for row in raw_grid
+        for value in row
+    ):
+        raise ValueError(
+            "cells must contain at least one non-empty row: 空表没有可导出的内容。"
+        )
     grid = [
-        [
-            str(value.get("text", "")) if isinstance(value, dict) else str(value)
-            for value in row
-        ]
+        [xml_safe_text(value) for value in row]
         for row in raw_grid
     ]
+    # 复核标记只认两件事：后端明确给的 needs_review（= 界面 UserRole+1），
+    # 以及**真·实测**低置信（实测值 < 0.78 且不是哨兵）。
+    # 旧代码还多了一个非法来源："拿裸 confidence < 0.78 猜低置信"——它把
+    # 0.77 / 0.86 这类别哨兵也当成实测低置信，于是 FC-00005 这张逐格 102/102
+    # 全对的表在导出里被标了 102 条「待人工复核」批注。
     review_grid = [
         [
             bool(value.get("needs_review", False))
             or (
                 bool(str(value.get("text", "")).strip())
-                and float(value.get("confidence", 1.0)) < 0.78
+                and _cell_confidence(value) < 0.78
+                and not _cell_confidence_is_sentinel(value)
             )
             if isinstance(value, dict)
             else False
@@ -5306,6 +6345,30 @@ def write_xlsx(
     occupied: set[tuple[int, int]] = set()
     row_count = len(grid)
     column_count = len(grid[0]) if grid else 0
+    certified_columns: list[float] | None = None
+    certified_rows: list[float] | None = None
+    if structure_certificate is not None:
+        if not isinstance(structure_certificate, dict) or structure_certificate.get("verified") is not True:
+            raise ValueError("invalid XLSX structure certificate")
+        raw_columns = structure_certificate.get("column_boundaries")
+        raw_rows = structure_certificate.get("row_boundaries")
+        if (
+            not isinstance(raw_columns, list)
+            or not isinstance(raw_rows, list)
+            or len(raw_columns) != column_count + 1
+            or len(raw_rows) != row_count + 1
+            or any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in raw_columns + raw_rows)
+        ):
+            raise ValueError("invalid XLSX structure certificate boundaries")
+        certified_columns = [float(value) for value in raw_columns]
+        certified_rows = [float(value) for value in raw_rows]
+        if (
+            any(not math.isfinite(value) for value in certified_columns + certified_rows)
+            or any(right <= left for left, right in zip(certified_columns, certified_columns[1:]))
+            or any(bottom <= top for top, bottom in zip(certified_rows, certified_rows[1:]))
+        ):
+            raise ValueError("invalid XLSX structure certificate boundaries")
+    accepted_spans: list[dict] = []
     for raw_span in spans or []:
         if not isinstance(raw_span, dict):
             raise ValueError("invalid XLSX span: object required")
@@ -5327,19 +6390,35 @@ def write_xlsx(
             or column_span > column_count - column
         ):
             raise ValueError("invalid XLSX span: outside table bounds")
-        for covered_row in range(row, row + row_span):
-            for covered_column in range(column, column + column_span):
-                location = (covered_row, covered_column)
-                if location in occupied:
-                    raise ValueError("invalid XLSX span: overlapping merged cells")
-                occupied.add(location)
-                if location != (row, column) and (
-                    bool(grid[covered_row][covered_column].strip())
-                    or review_grid[covered_row][covered_column]
-                ):
-                    raise ValueError(
-                        "invalid XLSX span: merge would hide cell content or review state"
-                    )
+        locations = [
+            (covered_row, covered_column)
+            for covered_row in range(row, row + row_span)
+            for covered_column in range(column, column + column_span)
+        ]
+        if any(location in occupied for location in locations):
+            raise ValueError("invalid XLSX span: overlapping merged cells")
+        # 2026-10-30（lead 复查 P0）：旧实现在「合并会吞掉一格文字」时**整表抛错**，
+        # 客户点导出直接失败、没有任何退路；两级表头（分组标题跨列）+ 覆盖格里 OCR
+        # 有任何文字就会命中。同一函数下面原本已按「降级 + 把复核标志提到锚点」解决过
+        # 同类问题，这里统一口径：**丢弃这一条合并、保留每格文字**（不丢任何内容），
+        # 并把锚点与冲突格标 needs_review，让客户知道这块结构要人工确认；其余合并与
+        # 整个导出照常完成。
+        hidden_locations = [
+            location
+            for location in locations
+            if location != (row, column) and bool(grid[location[0]][location[1]].strip())
+        ]
+        if hidden_locations:
+            review_grid[row][column] = True
+            for covered_row, covered_column in hidden_locations:
+                review_grid[covered_row][covered_column] = True
+            continue
+        occupied.update(locations)
+        if any(review_grid[r][c] for r, c in locations if (r, c) != (row, column)):
+            # 被合并覆盖的空格本身没有独立内容，但它的复核标志不能被合并吞掉：
+            # 把复核状态提到合并区的锚点上，客户仍能看到"这块要核对"。
+            review_grid[row][column] = True
+        accepted_spans.append(raw_span)
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "识别结果"
@@ -5362,6 +6441,7 @@ def write_xlsx(
     for row_index, row in enumerate(grid, start=1):
         for column_index, value in enumerate(row, start=1):
             cell = sheet.cell(row=row_index, column=column_index, value=value)
+            cell.data_type = "s"
             cell.border = border
             cell.alignment = Alignment(vertical="center", wrap_text=True)
             if row_index == header_row_index + 1:
@@ -5374,7 +6454,8 @@ def write_xlsx(
                     "图片转表格",
                 )
 
-    for span in spans or []:
+    # 只落盘通过校验、且不会吞掉文字的合并区（见上面的 accepted_spans）。
+    for span in accepted_spans:
         row = int(span["row"]) + 1
         column = int(span["column"]) + 1
         row_span = max(1, int(span.get("row_span", 1)))
@@ -5404,7 +6485,27 @@ def write_xlsx(
         values = [str(row[column_index - 1]) for row in grid]
         width = min(48, max(10, max((_display_width(value) for value in values), default=0) + 2))
         column_widths.append(width)
+    if certified_columns:
+        physical_widths = [
+            right - left
+            for left, right in zip(certified_columns, certified_columns[1:])
+        ]
+        median_width = float(np.median(physical_widths))
+        geometry_scale = 14.0 / median_width
+        column_widths = [
+            min(48, max(natural, physical * geometry_scale))
+            for natural, physical in zip(column_widths, physical_widths)
+        ]
+    for column_index, width in enumerate(column_widths, start=1):
         sheet.column_dimensions[get_column_letter(column_index)].width = width
+    physical_row_heights = None
+    row_geometry_scale = 0.0
+    if certified_rows:
+        physical_row_heights = [
+            bottom - top
+            for top, bottom in zip(certified_rows, certified_rows[1:])
+        ]
+        row_geometry_scale = 22.0 / float(np.median(physical_row_heights))
     for row_index, row in enumerate(grid, start=1):
         line_count = 1
         for column_index, value in enumerate(row):
@@ -5415,6 +6516,11 @@ def write_xlsx(
             )
             line_count = max(line_count, wrapped_lines)
         calculated_height = min(396, max(22, line_count * 18))
+        if physical_row_heights:
+            calculated_height = min(
+                396,
+                max(calculated_height, physical_row_heights[row_index - 1] * row_geometry_scale),
+            )
         sheet.row_dimensions[row_index].height = max(
             sheet.row_dimensions[row_index].height or 0,
             calculated_height,
@@ -5442,6 +6548,17 @@ def write_xlsx(
     try:
         workbook.save(temporary)
         os.replace(temporary, destination)
+        # 2026-10-28：写盘调用"成功"不等于**文件真的落在目标路径上**。
+        # Windows 保留设备名（CON / NUL / PRN / COM1 …）会让 open()/os.replace
+        # 一路正常返回，但目标路径上什么都不落 —— 实测 output_path="…\CON.xlsx"
+        # 返回 status=ok、output_path 照原样回传，磁盘上没有这个文件，客户端
+        # 点导出后打开是"找不到文件"，且没有任何错误码可依据（契约 §7：导出成功
+        # 只表示文件写入成功，那就必须真的写成了）。
+        if not destination.is_file():
+            raise PermissionError(
+                "无法写入导出文件（目标路径被系统占用或不支持该文件名）：%s"
+                % (destination,)
+            )
     finally:
         # 仅清理本次创建的临时文件；替换失败时保留用户原目标文件。
         if temporary.exists():

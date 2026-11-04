@@ -5,7 +5,7 @@ import os
 import sys
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from queue import Queue
+from queue import Empty, Full, Queue
 from typing import Any
 
 
@@ -84,8 +84,12 @@ class ParallelTextRecognizer:
         # 同时保证一次调用独占一个 InferRequest。
         self._request_pool: Queue[Any] = Queue(maxsize=self.request_count)
         self._request_pool.put(original_request)
-        for _ in range(1, self.request_count):
-            self._request_pool.put(compiled_model.create_infer_request())
+        self._created_requests = 1
+        self._request_limit = self.request_count
+        self._allocation_failures = 0
+        # 2026-10-30（lead 复查 P2）：等待请求池的超时上限。单批推理耗时是秒级，
+        # 30 秒还拿不到 InferRequest 就一定是记账漂移，必须明确失败而不是挂死。
+        self._request_wait_timeout = 30.0
         self._executor = ThreadPoolExecutor(
             max_workers=self.request_count,
             thread_name_prefix="ocr-recognition",
@@ -110,6 +114,8 @@ class ParallelTextRecognizer:
         return {
             "scheduler": "openvino-shared-requests",
             "requests": self.request_count,
+            "allocated_requests": self._created_requests,
+            "request_allocation_failures": self._allocation_failures,
             "active_request_capacity": self._active_request_count(),
             "inference_threads": self.inference_threads,
             "recognition_batch_size": self.rec_batch_num,
@@ -124,8 +130,26 @@ class ParallelTextRecognizer:
         self._serial_calls = 0
         self._original_batches = 0
 
+    def release_native_resources(self) -> bool:
+        if self._compiled_model is None:
+            return False
+        self._executor.shutdown(wait=True)
+        while True:
+            try:
+                self._request_pool.get_nowait()
+            except Empty:
+                break
+        self._compiled_model = None
+        # 2026-10-30（lead 复查 P2）：清空请求池后 `_created_requests` 原来不复位，
+        # 于是 `execution_profile()["allocated_requests"]` 之后一直报旧值（虚高），
+        # 下一次扩容也会从错误基数开始。这里一并复位成"0 个已建请求"。
+        self._created_requests = 0
+        self._request_limit = 0
+        self._allocation_failures = 0
+        return True
+
     def _active_request_count(self) -> int:
-        return recommended_request_count(self.request_count)
+        return min(self._request_limit, recommended_request_count(self.request_count))
 
     def _batch_jobs(self, img_list: list[Any]) -> list[tuple[list[int], float, list[float]]]:
         # 完整复现 RapidOCR 的宽度排序和原始分批方式。
@@ -162,7 +186,19 @@ class ParallelTextRecognizer:
             for index in image_indices
         ]
         input_tensor = np.concatenate(normalized).astype(np.float32)
-        request = self._request_pool.get()
+        # 2026-10-30（lead 复查 P2）：`get()` 原来没有超时 —— 只要请求池的记账出现
+        # 任何漂移（例如扩容竞态、异常路径少还一次），这里就**永久阻塞**，而 60 秒
+        # 墙钟是协作式检查点、只在阶段边界触发，救不了阻塞在队列上的调用
+        # ⇒ 客户端只能等到自己超时（实测 150 秒）。
+        # 这里给一个远大于单批推理耗时的超时：拿不到请求就明确失败，
+        # 让上层按 INTERNAL_ERROR 收场，而不是把整条请求挂死。
+        try:
+            request = self._request_pool.get(timeout=self._request_wait_timeout)
+        except Empty:
+            raise RuntimeError(
+                "recognition request pool exhausted (%.1fs); refusing to block forever"
+                % self._request_wait_timeout
+            ) from None
         try:
             outputs = request.infer(inputs=[input_tensor])
             if len(outputs) != 1:
@@ -170,7 +206,11 @@ class ParallelTextRecognizer:
             prediction = next(iter(outputs.values()))
         finally:
             # 即使推理失败也必须归还请求，否则后续调用可能因请求池条目泄漏而永久等待。
-            self._request_pool.put(request)
+            try:
+                self._request_pool.put(request, timeout=self._request_wait_timeout)
+            except Full:
+                # 池子已经满 = 记账漂移，不能在这里死等；丢一个条目比挂死整条请求好。
+                pass
         return job, prediction
 
     def _decode_batch(
@@ -207,8 +247,19 @@ class ParallelTextRecognizer:
         return_word_box: bool,
         results: list[tuple[Any, Any]],
     ) -> None:
-        active_requests = self._active_request_count()
+        active_requests = min(self._active_request_count(), self._request_limit, len(jobs))
         self._original_batches += len(jobs)
+        # 单批识别不分配第二套工作缓冲；分配失败时仍完整执行原始批次。
+        while self._created_requests < active_requests:
+            try:
+                request = self._compiled_model.create_infer_request()
+            except Exception:
+                self._allocation_failures += 1
+                self._request_limit = self._created_requests
+                active_requests = self._created_requests
+                break
+            self._request_pool.put(request)
+            self._created_requests += 1
         if len(jobs) <= 1 or active_requests <= 1:
             self._serial_calls += 1
             for job in jobs:
@@ -258,6 +309,8 @@ class ParallelTextRecognizer:
                     next_job += 1
 
     def __call__(self, args: Any) -> Any:
+        if self._compiled_model is None:
+            raise RuntimeError("text recognizer has been released")
         from rapidocr.ch_ppocr_rec.typings import TextRecOutput
         from rapidocr.ch_ppocr_rec.main import normalize_lang, reorder_bidi_for_display
         from rapidocr.utils.vis_res import VisRes
@@ -266,6 +319,18 @@ class ParallelTextRecognizer:
         started = time.perf_counter()
         img_list = [args.img] if isinstance(args.img, np.ndarray) else list(args.img)
         return_word_box = bool(args.return_word_box)
+        if not img_list:
+            return TextRecOutput(
+                [],
+                [],
+                [],
+                [],
+                time.perf_counter() - started,
+                viser=VisRes(
+                    lang_type=self._recognizer.cfg.lang_type,
+                    font_path=self._recognizer.cfg.font_path,
+                ),
+            )
         results: list[tuple[Any, Any]] = [(('', 0.0), None)] * len(img_list)
         jobs = self._batch_jobs(img_list)
         self._run_jobs(jobs, img_list, return_word_box, results)
@@ -300,6 +365,15 @@ def build_parallel_text_recognizer(
         request_count = recommended_request_count(2)
     else:
         request_count = max(1, min(int(request_count), logical_processors))
+    if request_count <= 1:
+        return recognizer
+    try:
+        compiled_model = recognizer.session.session.get_compiled_model()
+        optimal_requests = int(compiled_model.get_property("OPTIMAL_NUMBER_OF_INFER_REQUESTS"))
+        if optimal_requests > 0:
+            request_count = min(request_count, optimal_requests)
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        pass
     if request_count <= 1:
         return recognizer
     inference_threads = min(10, logical_processors)

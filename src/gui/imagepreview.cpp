@@ -26,6 +26,8 @@ QJsonObject rectTrace(const QRect &rect)
 
 ImagePreview::ImagePreview(QWidget *parent)
     : QFrame(parent)
+    , m_previewLogicalSize()
+    , m_scaleSourceBuildCount(0)
     , m_emptyText(QStringLiteral("打开一张手机拍摄的表格照片"))
     , m_cropSelectionActive(false)
     , m_cropDragging(false)
@@ -42,6 +44,7 @@ void ImagePreview::setImage(const QImage &image)
 {
     cancelCropSelection();
     m_image = image;
+    rebuildScaleSource();
     setCursor(image.isNull() ? Qt::ArrowCursor : Qt::PointingHandCursor);
     rebuildScaledPreview();
     update();
@@ -51,7 +54,9 @@ void ImagePreview::clearImage()
 {
     cancelCropSelection();
     m_image = QImage();
+    m_scaleSource = QImage();
     m_scaledPreview = QPixmap();
+    m_previewLogicalSize = QSize();
     setCursor(Qt::ArrowCursor);
     update();
 }
@@ -164,8 +169,8 @@ void ImagePreview::paintEvent(QPaintEvent *event)
     }
     if (m_scaledPreview.isNull())
         rebuildScaledPreview();
-    const QPoint topLeft(target.center().x() - m_scaledPreview.width() / 2,
-                         target.center().y() - m_scaledPreview.height() / 2);
+    const QPoint topLeft(target.center().x() - m_previewLogicalSize.width() / 2,
+                         target.center().y() - m_previewLogicalSize.height() / 2);
     painter.drawPixmap(topLeft, m_scaledPreview);
     if (m_cropSelectionActive && !m_cropSelection.isEmpty()) {
         painter.setPen(QPen(QColor(QStringLiteral("#2F6BFF")), 2, Qt::DashLine));
@@ -291,29 +296,98 @@ void ImagePreview::keyPressEvent(QKeyEvent *event)
     QFrame::keyPressEvent(event);
 }
 
-void ImagePreview::rebuildScaledPreview()
+// 缩放源缓存。原图只在这里（setImage / 换图时）被归一化一次，
+// resize 只做重采样，不再重复深拷贝整张原图。
+void ImagePreview::rebuildScaleSource()
 {
-    const QSize targetSize = rect().adjusted(8, 8, -8, -8).size();
-    if (m_image.isNull() || targetSize.isEmpty()) {
-        m_scaledPreview = QPixmap();
+    if (m_image.isNull()) {
+        m_scaleSource = QImage();
         return;
     }
-    // 框选坐标使用控件逻辑像素。先清除图片携带的设备像素比，避免高 DPI
-    // 截图生成的 QPixmap 尺寸与鼠标坐标分属两套坐标系。
-    QImage previewImage = m_image;
-    previewImage.setDevicePixelRatio(1.0);
-    m_scaledPreview = QPixmap::fromImage(
+    // 框选坐标使用控件逻辑像素，先把图片携带的设备像素比抹平到 1.0，
+    // 避免高 DPI 截图生成的像素尺寸与鼠标逻辑坐标分属两套坐标系。
+    // 抹平会触发 detach（深拷贝整张原图），所以只能在换图时做一次。
+    if (qFuzzyCompare(m_image.devicePixelRatio() + 1.0, 2.0)) {
+        // 已经是 1:1，直接共享像素，零拷贝。
+        m_scaleSource = m_image;
+    } else {
+        QImage previewImage = m_image;
+        previewImage.setDevicePixelRatio(1.0);
+        m_scaleSource = previewImage;
+    }
+    ++m_scaleSourceBuildCount;
+}
+
+qreal ImagePreview::previewDevicePixelRatio() const
+{
+    const qreal ratio = devicePixelRatioF();
+    return ratio > 0.0 ? ratio : 1.0;
+}
+
+QPixmap ImagePreview::buildScaledPreview(qreal devicePixelRatio) const
+{
+    if (m_scaleSource.isNull() || devicePixelRatio <= 0.0)
+        return QPixmap();
+    const QSize logicalTarget = rect().adjusted(8, 8, -8, -8).size();
+    if (logicalTarget.isEmpty())
+        return QPixmap();
+    // 高 DPI：按**物理像素**缩放，再把设备像素比挂回 pixmap。
+    // 过去这里把 ratio 强制成 1.0，于是高 DPI 屏上拿到一张半分辨率位图，
+    // 预览（和定位框选）都是糊的。
+    const QSize targetSize = logicalTarget * devicePixelRatio;
+    const QImage &previewImage = m_scaleSource;
+    QPixmap scaled = QPixmap::fromImage(
         previewImage.scaled(targetSize, Qt::KeepAspectRatio, Qt::SmoothTransformation));
-    m_scaledPreview.setDevicePixelRatio(1.0);
+    scaled.setDevicePixelRatio(devicePixelRatio);
+    return scaled;
+}
+
+QPixmap ImagePreview::scaledPreviewForDevicePixelRatio(qreal devicePixelRatio) const
+{
+    return buildScaledPreview(devicePixelRatio);
+}
+
+void ImagePreview::rebuildScaledPreview()
+{
+    m_scaledPreview = buildScaledPreview(previewDevicePixelRatio());
+    updatePreviewLogicalSize();
+}
+
+void ImagePreview::updatePreviewLogicalSize()
+{
+    if (m_scaledPreview.isNull()) {
+        m_previewLogicalSize = QSize();
+        return;
+    }
+    const qreal ratio = m_scaledPreview.devicePixelRatio() > 0.0
+        ? m_scaledPreview.devicePixelRatio()
+        : 1.0;
+    m_previewLogicalSize = QSize(qRound(m_scaledPreview.width() / ratio),
+                                 qRound(m_scaledPreview.height() / ratio));
+}
+
+QSize ImagePreview::previewLogicalSize() const
+{
+    return m_previewLogicalSize;
+}
+
+int ImagePreview::scaleSourceBuildCount() const
+{
+    return m_scaleSourceBuildCount;
+}
+
+const QImage &ImagePreview::scaleSource() const
+{
+    return m_scaleSource;
 }
 
 QRect ImagePreview::displayedImageRect() const
 {
-    if (m_scaledPreview.isNull())
+    if (m_scaledPreview.isNull() || m_previewLogicalSize.isEmpty())
         return QRect();
     const QRect target = rect().adjusted(8, 8, -8, -8);
     return QRect(
-        QPoint(target.center().x() - m_scaledPreview.width() / 2,
-               target.center().y() - m_scaledPreview.height() / 2),
-        m_scaledPreview.size());
+        QPoint(target.center().x() - m_previewLogicalSize.width() / 2,
+               target.center().y() - m_previewLogicalSize.height() / 2),
+        m_previewLogicalSize);
 }

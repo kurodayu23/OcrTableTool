@@ -29,6 +29,15 @@ public:
                   const QString &outputDirectory,
                   bool inputRectified = false,
                   bool selectedTableRegion = false);
+    // Named entry points for the two supported inputs.  They keep exactly the
+    // same protocol as recognize(); the names exist so an integrator can
+    // express intent (a camera photo versus an already rectified table)
+    // instead of passing bare booleans.
+    int recognizeCameraPhoto(const QString &imagePath,
+                             const QString &outputDirectory,
+                             bool selectedTableRegion = false);
+    int recognizeRectifiedTable(const QString &imagePath,
+                                const QString &outputDirectory);
     int exportXlsx(const QString &outputPath,
                    const QJsonArray &cells,
                    const QJsonArray &spans = QJsonArray());
@@ -38,6 +47,14 @@ public:
                           const QJsonArray &cells,
                           QString *errorMessage = 0);
     void cancel();
+    // Stops the backend process and silences every outward signal.
+    // Call it before deleting the client when a request may still be in
+    // flight: the destructor kills the process, which synchronously triggers
+    // finished() -> processFinished(), and that used to report a retryable
+    // "BACKEND_EXITED" failure to the owner while this object was being
+    // destroyed. Owners that retry on a retryable failure would then start a
+    // new request against a client that is already gone.
+    void shutdown();
 
     // validateRecognitionResponse checks protocol shape and safety metadata.
     // canAutoPublish additionally requires a verified structure and no review cells.
@@ -95,6 +112,7 @@ private:
     int m_nextRequestId;
     int m_activeRequestId;
     bool m_busy;
+    bool m_shuttingDown;
 };
 
 #endif // OCRTABLECLIENT_H

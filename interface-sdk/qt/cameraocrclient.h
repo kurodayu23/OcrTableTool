@@ -1,4 +1,4 @@
-#ifndef CAMERAOCRCLIENT_H
+﻿#ifndef CAMERAOCRCLIENT_H
 #define CAMERAOCRCLIENT_H
 
 #include <QObject>

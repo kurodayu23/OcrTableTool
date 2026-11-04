@@ -10,14 +10,19 @@
 // confidence 归一化到 [0, 1]；needsReview 是明确的质量结论，不能只根据显示文字推断。
 struct TableCell
 {
-    TableCell(const QString &value = QString(), double score = 1.0, bool review = false)
-        : text(value), confidence(score), needsReview(review)
+    TableCell(const QString &value = QString(), double score = 1.0, bool review = false,
+              bool sentinel = false)
+        : text(value), confidence(score), needsReview(review), confidenceSentinel(sentinel)
     {
     }
 
     QString text;
     double confidence;
     bool needsReview;
+    // confidenceSentinel 为真表示这格的 confidence 是识别路径硬写的类别哨兵
+    // （0.77 = 没取得双模型一致确认，0.86 = 取得了），不是实测置信度。
+    // 老后端不写这个可选字段时一律按 false 处理（= 老行为）。
+    bool confidenceSentinel;
 };
 
 class TableData
@@ -33,12 +38,19 @@ public:
     QString cell(int row, int column) const;
     double confidence(int row, int column) const;
     bool needsReview(int row, int column) const;
+    bool confidenceSentinel(int row, int column) const;
+
+    // 该格是否需要人工核对：后端明确要求复核（needs_review），或者实测置信度
+    // 低于 0.78。哨兵格（confidenceSentinel）不是实测置信度，不算低置信告警。
+    // 显示层和导出标记都用这一条口径，避免各写一套。
+    bool requiresAttention(int row, int column) const;
 
     void setCell(int row,
                  int column,
                  const QString &text,
                  double confidence = 1.0,
-                 bool needsReview = false);
+                 bool needsReview = false,
+                 bool confidenceSentinel = false);
     void insertRow(int row);
     void removeRow(int row);
     void insertColumn(int column);

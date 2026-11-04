@@ -1,4 +1,4 @@
-#include "cameraocrclient.h"
+﻿#include "cameraocrclient.h"
 
 #include "ocrtableclient.h"
 
@@ -375,7 +375,12 @@ bool CameraOcrClient::captureImage()
     m_ocrRetryPending = false;
     m_regionFallbackAttempted = false;
     m_originalCapturePath.clear();
-    clearTableRegion();
+    // 2026-10-30（lead 复查 P1）：这里原来无条件 clearTableRegion()。
+    // 而 docs/CAMERA_OCR_INTERFACE.md 里唯一的框选示例就是
+    // setTableRegion() + captureAndRecognize()（→ captureImage）——
+    // 拍照前把区域清掉，等于把用户的框选**静默丢弃**，imageSaved() 里
+    // 「按框选区裁剪成 camera-table.png」的分支也永远执行不到，整图直接送 OCR。
+    // 区域改由 recognizeImage() 统一管理：显式传空区域才清空。
     m_requestDirectory = createRequestDirectory();
     if (m_requestDirectory.isEmpty()) {
         emitFailure(QStringLiteral("WORK_DIRECTORY_CREATE_FAILED"),
@@ -509,10 +514,10 @@ bool CameraOcrClient::recognizeImage(const QString &imagePath,
 
     emit stageChanged(QStringLiteral("recognizing"),
                       QString::fromWCharArray(L"正在识别表格，请稍候。"));
-    m_ocr->recognize(m_capturePath,
-                     m_requestDirectory,
-                     false,
-                     m_tableRegion.isValid());
+    const QString recognitionPath = m_capturePath;
+    m_ocr->recognizeCameraPhoto(recognitionPath,
+                                m_requestDirectory,
+                                m_tableRegion.isValid());
     return true;
 }
 
@@ -559,9 +564,13 @@ QRect CameraOcrClient::resolvedTableRegion(const QSize &imageSize) const
     const QRect bounded = requested.intersected(QRect(QPoint(0, 0), imageSize));
     if (!bounded.isValid())
         return QRect();
-    const int paddingX = qMax(4, qCeil(bounded.width() * 0.015));
-    const int paddingY = qMax(4, qCeil(bounded.height() * 0.025));
-    return bounded.adjusted(-paddingX, -paddingY, paddingX, paddingY)
+    // 边距按框选区域的比例留：左右 2%、上 8%、下 4%。上方留得最多是因为
+    // 页眉标题带和多级表头都在表格上边框之外，裁得太紧会把表头切掉；
+    // 下方留得少一点，避免把表格外面那一大片背景拉进来干扰列检测。
+    const int paddingX = qMax(4, qCeil(bounded.width() * 0.02));
+    const int paddingTop = qMax(4, qCeil(bounded.height() * 0.08));
+    const int paddingBottom = qMax(4, qCeil(bounded.height() * 0.04));
+    return bounded.adjusted(-paddingX, -paddingTop, paddingX, paddingBottom)
         .intersected(QRect(QPoint(0, 0), imageSize));
 }
 
@@ -759,6 +768,14 @@ void CameraOcrClient::captureReadyChanged(bool ready)
 void CameraOcrClient::cameraError()
 {
     m_cameraReady = false;
+    // 2026-10-30（lead 复查 P1）：原来只置 m_cameraReady=false，不复位拍摄标志。
+    // 若错误发生在 m_capturePending=true 期间（拍摄窗口内掉设备/驱动报错），
+    // m_capturePending/m_captureStarted 会永远为真 ⇒ isBusy() 恒真 ⇒
+    // captureImage/startCamera/recognizeImage 全部只能报 BUSY，只有 cancel()/
+    // stopCamera() 能解。与 captureError() 的复位口径对齐。
+    resetCaptureState();
+    if (m_camera)
+        m_camera->unlock();
     emit cameraReadyChanged(false, m_cameraIndex, m_cameraDescription);
     emitFailure(QStringLiteral("CAMERA_OPEN_FAILED"),
                 QString::fromWCharArray(L"\u6444\u50cf\u5934\u65e0\u6cd5\u6253\u5f00\uff0c\u8bf7\u68c0\u67e5\u7cfb\u7edf\u76f8\u673a\u6743\u9650\u3001\u9a71\u52a8\u6216\u5360\u7528\u72b6\u6001\u3002"),
@@ -772,11 +789,11 @@ void CameraOcrClient::captureError(int,
     resetCaptureState();
     if (m_camera)
         m_camera->unlock();
-    QString message = QString::fromWCharArray(
+    // 驱动给的错误文本是英文且随驱动版本变化，混进用户可见提示会让同一次
+    // 故障在不同机器上显示不同文案。这里只给稳定的中文提示。
+    Q_UNUSED(errorString);
+    const QString message = QString::fromWCharArray(
         L"\u62cd\u7167\u4fdd\u5b58\u5931\u8d25\uff0c\u8bf7\u91cd\u8bd5\u3002");
-    if (!errorString.trimmed().isEmpty())
-        message += QString::fromWCharArray(L"\n\u9a71\u52a8\u4fe1\u606f：%1")
-            .arg(errorString.trimmed());
     emitFailure(QStringLiteral("CAMERA_CAPTURE_FAILED"),
                 message,
                 true);
@@ -813,10 +830,18 @@ void CameraOcrClient::ocrRequestFailed(int,
     if (action != QStringLiteral("recognize"))
         return;
     Q_UNUSED(field);
+    // 2026-10-30（lead 复查 P1）：主动取消不是"识别失败"，绝不允许触发自动重试，
+    // 否则用户点「取消」后 300ms 又开始识别。与 OcrTableClient::cancel() 的
+    // retryable=false 一起形成双保险（旧版本那里报 retryable=true，这里就会重跑）。
+    if (errorCode == QStringLiteral("CANCELLED")) {
+        m_ocrRetryPending = false;
+        return;
+    }
     const bool insufficientMemory = errorCode == QStringLiteral("INSUFFICIENT_MEMORY");
     if (!insufficientMemory
         && retryable
         && m_ocrRetryCount < 1
+        && !m_tableRegion.isValid()
         && QFileInfo::exists(m_capturePath)) {
         ++m_ocrRetryCount;
         m_ocrRetryPending = true;
@@ -827,10 +852,9 @@ void CameraOcrClient::ocrRequestFailed(int,
                 return;
             m_ocrRetryPending = false;
             if (!m_ocr->isBusy())
-                m_ocr->recognize(
+                m_ocr->recognizeCameraPhoto(
                     m_capturePath,
                     m_requestDirectory,
-                    false,
                     m_tableRegion.isValid()
                         && m_capturePath != m_originalCapturePath);
         });
@@ -856,17 +880,34 @@ void CameraOcrClient::ocrRequestFailed(int,
                 QStringLiteral("camera-table-retry.png"));
             if (!expandedTable.isNull() && expandedTable.save(retryPath, "PNG")) {
                 m_regionFallbackAttempted = true;
-                m_ocrRetryCount = 0;
+                // 这次"扩大边缘重试"本身就用掉了唯一一次重试机会，
+                // 记成 1 而不是 0：否则再来一次失败还会再扩一轮边距，
+                // 用户看到的是同一个框反复重试而没有明确提示。
+                m_ocrRetryCount = 1;
                 m_capturePath = retryPath;
                 emit stageChanged(
                     QStringLiteral("table_region_fallback"),
                     QString::fromWCharArray(L"框选区域首次识别未形成可靠结果，正在扩大少量边缘后重试。"));
-                QTimer::singleShot(300, this, [this]() {
+                // 2026-10-30（lead 复查 P1）：这条扩边重试原来**不占 busy 位**
+                // （主重试分支会置 m_ocrRetryPending=true，这里漏了）。后果：
+                // ① 这 300ms 窗口内 isBusy()=false，调用方可以再拍/再识别，
+                //    旧定时器仍对旧 m_capturePath 发起识别 ⇒ 被 CLIENT_BUSY 打回
+                //    或覆盖新请求的结果；
+                // ② lambda 不校验标志 ⇒ cancel() 之后照样重跑一次识别
+                //    （与已修的 CANCELLED 重试是同一类问题）。
+                m_ocrRetryPending = true;
+                const QString retryTarget = m_capturePath;
+                QTimer::singleShot(300, this, [this, retryTarget]() {
+                    if (!m_ocrRetryPending)
+                        return;
+                    // 期间用户可能换了图/取消了，路径不一致就不要再跑
+                    if (m_capturePath != retryTarget)
+                        return;
+                    m_ocrRetryPending = false;
                     if (!m_ocr->isBusy())
-                        m_ocr->recognize(
-                            m_capturePath,
+                        m_ocr->recognizeCameraPhoto(
+                            retryTarget,
                             m_requestDirectory,
-                            false,
                             true);
                 });
                 return;

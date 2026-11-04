@@ -13,6 +13,11 @@ package/
 *.spec
 benchmark-results/
 benchmark-data/
+field-corpus/
+field-corpus-nearfill/
+excel-screenshot-corpus/
+no-line-handwritten-corpus/
+stress-test-corpus/
 *.pro.user*
 *.log
 *.tmp
@@ -25,3 +30,6 @@ benchmark-data/
 *.errors.txt
 rectified-*
 smoke-*
+docs/superpowers/plans/
+# 门禁 / 打包产物（verify_all.ps1 默认落在产品树 _work\；改到仓库内时也一并忽略）
+_work/

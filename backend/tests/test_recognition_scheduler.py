@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import numpy as np
 
-from recognition_scheduler import ParallelTextRecognizer
+from recognition_scheduler import ParallelTextRecognizer, build_parallel_text_recognizer
 
 
 class _FakeInferRequest:
@@ -37,8 +37,10 @@ class _FakeCompiledModel:
         self.active = 0
         self.maximum_active = 0
         self.seen_batches = []
+        self.created_requests = 0
 
     def create_infer_request(self):
+        self.created_requests += 1
         return _FakeInferRequest(self)
 
 
@@ -77,6 +79,74 @@ def _image(width, value):
 
 
 class ParallelTextRecognizerTests(unittest.TestCase):
+    def test_release_closes_workers_and_drops_all_native_requests(self):
+        recognizer = _FakeRecognizer(rec_batch_num=1)
+        scheduler = ParallelTextRecognizer(recognizer, request_count=2)
+        images = [_image(10, 10), _image(20, 20)]
+        results = [(('', 0.0), None)] * len(images)
+        with patch.object(scheduler, "_active_request_count", return_value=2):
+            scheduler._run_jobs(scheduler._batch_jobs(images), images, False, results)
+        self.assertEqual(scheduler._request_pool.qsize(), 2)
+
+        self.assertTrue(scheduler.release_native_resources())
+
+        self.assertIsNone(scheduler._compiled_model)
+        self.assertTrue(scheduler._request_pool.empty())
+        self.assertTrue(all(not worker.is_alive() for worker in scheduler._executor._threads))
+        self.assertFalse(scheduler.release_native_resources())
+        with self.assertRaisesRegex(RuntimeError, "released"):
+            scheduler(SimpleNamespace(img=images, return_word_box=False))
+
+    def test_factory_respects_compiled_model_request_budget(self):
+        recognizer = _FakeRecognizer(rec_batch_num=2)
+        with patch.object(recognizer.compiled_model, "get_property", return_value=1, create=True):
+            configured = build_parallel_text_recognizer(recognizer, request_count=2)
+        self.assertIs(configured, recognizer)
+        self.assertEqual(recognizer.compiled_model.created_requests, 0)
+        self.assertEqual(recognizer.rec_batch_num, 2)
+
+    def test_factory_keeps_compatible_fallback_when_property_is_unavailable(self):
+        recognizer = _FakeRecognizer(rec_batch_num=2)
+        with patch.object(recognizer.compiled_model, "get_property", side_effect=RuntimeError, create=True):
+            configured = build_parallel_text_recognizer(recognizer, request_count=2)
+        self.assertIsInstance(configured, ParallelTextRecognizer)
+
+    def test_extra_request_is_allocated_only_for_a_parallel_batch(self):
+        recognizer = _FakeRecognizer(rec_batch_num=2)
+        scheduler = ParallelTextRecognizer(recognizer, request_count=2)
+        self.assertEqual(recognizer.compiled_model.created_requests, 0)
+        images = [_image(10, 10), _image(20, 20)]
+        results = [(('', 0.0), None)] * len(images)
+        with patch.object(scheduler, "_active_request_count", return_value=2):
+            scheduler._run_jobs(scheduler._batch_jobs(images), images, False, results)
+        self.assertEqual(recognizer.compiled_model.created_requests, 0)
+        images += [_image(30, 30), _image(40, 40)]
+        results = [(('', 0.0), None)] * len(images)
+        with patch.object(scheduler, "_active_request_count", return_value=2):
+            scheduler._run_jobs(scheduler._batch_jobs(images), images, False, results)
+        self.assertEqual(recognizer.compiled_model.created_requests, 1)
+        self.assertEqual([result[0][0] for result in results], ["10", "20", "30", "40"])
+
+    def test_extra_request_allocation_failure_preserves_serial_results(self):
+        recognizer = _FakeRecognizer(rec_batch_num=1)
+        scheduler = ParallelTextRecognizer(recognizer, request_count=2)
+        images = [_image(20, 20), _image(10, 10)]
+        results = [(('', 0.0), None)] * len(images)
+        with patch.object(recognizer.compiled_model, "create_infer_request", side_effect=MemoryError), patch.object(
+            scheduler, "_active_request_count", return_value=2
+        ):
+            scheduler._run_jobs(scheduler._batch_jobs(images), images, False, results)
+        self.assertEqual([result[0][0] for result in results], ["20", "10"])
+        self.assertEqual(recognizer.compiled_model.maximum_active, 1)
+
+    def test_empty_batch_returns_empty_result_without_inference(self):
+        recognizer = _FakeRecognizer(rec_batch_num=2)
+        scheduler = ParallelTextRecognizer(recognizer, request_count=2)
+        result = scheduler(SimpleNamespace(img=[], return_word_box=False))
+        self.assertEqual(list(result.txts), [])
+        self.assertEqual(list(result.scores), [])
+        self.assertEqual(recognizer.compiled_model.seen_batches, [])
+
     def test_parallel_requests_keep_single_image_batches_and_original_order(self):
         recognizer = _FakeRecognizer(rec_batch_num=1)
         scheduler = ParallelTextRecognizer(recognizer, request_count=2)

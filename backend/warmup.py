@@ -3,7 +3,7 @@ import shutil
 from pathlib import Path
 
 import rapid_table
-from rapidocr import RapidOCR
+from rapidocr import ModelType as OcrModelType, OCRVersion, RapidOCR
 from rapid_table import ModelType, RapidTable, RapidTableInput
 
 from ocr_backend import (
@@ -23,6 +23,24 @@ def main() -> int:
 
     RapidOCR(params=build_model_download_parameters(models))
     RapidOCR(params=build_fast_model_download_parameters(models))
+    if not (models / "ch_PP-OCRv5_rec_mobile.onnx").is_file():
+        mobile_parameters = build_model_download_parameters(models)
+        mobile_parameters.update({
+            "Global.use_det": False,
+            "Global.use_cls": False,
+            "Rec.model_type": OcrModelType.MOBILE,
+            "Rec.ocr_version": OCRVersion.PPOCRV5,
+        })
+        RapidOCR(params=mobile_parameters)
+    if not (models / "ch_PP-OCRv5_rec_server.onnx").is_file():
+        v5_parameters = build_model_download_parameters(models)
+        v5_parameters.update({
+            "Global.use_det": False,
+            "Global.use_cls": False,
+            "Rec.model_type": OcrModelType.SERVER,
+            "Rec.ocr_version": OCRVersion.PPOCRV5,
+        })
+        RapidOCR(params=v5_parameters)
     packaged_table_model = Path(rapid_table.__file__).resolve().parent / "models" / "slanet-plus.onnx"
     target_table_model = models / packaged_table_model.name
     if not target_table_model.is_file():

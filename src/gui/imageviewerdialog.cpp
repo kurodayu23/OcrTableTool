@@ -186,8 +186,10 @@ ImageViewerDialog::ImageViewerDialog(const QImage &image,
     : QDialog(parent)
     , m_view(new ImageViewerView(this))
 {
-    Q_UNUSED(title);
-    setWindowTitle(QString());
+    // findings：原来这里 Q_UNUSED(title) + setWindowTitle(QString())，
+    // 调用方（"原图预览" / "矫正结果预览"）传进来的标题被整个丢掉，
+    // 大图窗口标题栏是空的。现在如实使用调用方标题，空标题才回退到默认文案。
+    setWindowTitle(title.trimmed().isEmpty() ? QStringLiteral("查看大图") : title);
     setModal(true);
     setWindowFlags(windowFlags() | Qt::WindowMaximizeButtonHint);
     const QRect available = QApplication::desktop()->availableGeometry(parent);

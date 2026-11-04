@@ -83,18 +83,33 @@ TableData TableData::fromBackendJson(const QJsonObject &object, QString *errorMe
                 || !reviewValue.isBool()) {
                 return fail(QStringLiteral("识别结果包含无效的单元格字段。"));
             }
-            // 非空低置信内容只有在后端明确标为人工核对时才允许展示。
-            // 该阈值必须与界面核对语义一致；静默接受会破坏证据与确认的边界。
-            if (!textValue.toString().trimmed().isEmpty()
-                && confidence < 0.78
-                && !reviewValue.toBool()) {
-                return fail(QStringLiteral("识别结果包含未标黄的低置信度单元格。"));
-            }
+            // 低置信但未标黄的格子不整表拒收。
+            //
+            // 0.77 / 0.86 是各识别路径硬写的保守上限哨兵值，不是实测置信度。
+            // 后端对此的结论是“只提示，不阻断”，并记录了实测代价：
+            // 43 例里这一条单独就阻断了 14 张准确率 0.73~1.00 的正确表（含 4 张
+            // 1.000），客户拿到的是完全对的表却被告禁止发布。
+            //
+            // 真实语料 47 例里 30 例（63.8%）因此完全不可用：表格不显示、导出禁用、
+            // 失败格不可见。本函数不再重复后端已经做过的判断，交给
+            // MainWindow::showTable 的既有降级路径：浅黄底 + 待确认提示 + 计入待复核格数。
+            //
+            // 字段格式校验（类型 / 有限性 / 0~1 区间 / 布尔）保留在上面的 if 里，
+            // 真正畸形的响应仍然照常拒收；这里只放行格式合法、仅仅偏低的读数。
+            //
+            // confidence_sentinel 是后端新增的可选布尔字段：为真表示这格的
+            // confidence 是 0.77 / 0.86 这类类别哨兵，不是实测置信度。老后端
+            // 不写这个字段时按 false 处理（= 老行为），显示层再据此决定要不要
+            // 补黄格。字段本身不参与上面的格式校验，缺失或类型不符一律按
+            // false 处理，不改变既有的拒收口径。
+            const bool confidenceSentinel = cell.value(QStringLiteral("confidence_sentinel"))
+                                                .toBool(false);
             table.setCell(row,
                           column,
                           textValue.toString(),
                           confidence,
-                          reviewValue.toBool());
+                          reviewValue.toBool(),
+                          confidenceSentinel);
         }
     }
     if (errorMessage)
@@ -133,18 +148,45 @@ bool TableData::needsReview(int row, int column) const
     return m_rows.at(row).at(column).needsReview;
 }
 
+bool TableData::confidenceSentinel(int row, int column) const
+{
+    if (row < 0 || row >= m_rows.size() || column < 0 || column >= m_columnCount)
+        return false;
+    return m_rows.at(row).at(column).confidenceSentinel;
+}
+
+bool TableData::requiresAttention(int row, int column) const
+{
+    if (row < 0 || row >= m_rows.size() || column < 0 || column >= m_columnCount)
+        return false;
+    const TableCell &cell = m_rows.at(row).at(column);
+    if (cell.needsReview)
+        return true;
+    // 哨兵值是类别标记，不是实测置信度：不能拿它和 0.78 比大小，
+    // 否则一张逐格全对的表会被整表标成待确认。
+    if (cell.confidenceSentinel)
+        return false;
+    // 「有内容」的判据必须与公开 SDK 一致：那边用的是
+    // !text.trimmed().isEmpty()，纯空白格不算内容、判 valid。
+    // 这里原来用 !cell.text.isEmpty()，纯空白格（text 只有空格）会被当成
+    // 有内容，低置信就刷黄格 —— 同一份数据界面标黄、SDK 判通过。
+    // needsReview 的显式标记与 confidenceSentinel 的语义不受影响。
+    return cell.confidence < 0.78 && !cell.text.trimmed().isEmpty();
+}
+
 void TableData::setCell(int row,
                         int column,
                         const QString &text,
                         double confidence,
-                        bool needsReview)
+                        bool needsReview,
+                        bool confidenceSentinel)
 {
     if (row < 0 || column < 0)
         return;
     // 结构编辑可能访问新的末尾单元格，必须通过 ensureSize() 同时扩展行列，
     // 防止产生长度不一致的非矩形行。
     ensureSize(row + 1, column + 1);
-    m_rows[row][column] = TableCell(text, confidence, needsReview);
+    m_rows[row][column] = TableCell(text, confidence, needsReview, confidenceSentinel);
 }
 
 void TableData::insertRow(int row)

@@ -43,6 +43,40 @@ class InterfaceSdkContractTests(unittest.TestCase):
         self.assertIn('QStringLiteral("accuracy_mode"), QStringLiteral("maximum")', source)
         self.assertIn('QStringLiteral("deadline_seconds"), 0', source)
 
+    def test_client_stays_silent_while_being_destroyed(self):
+        """析构期不得向主人发出误导性失败回调。
+
+        2026-10-23：公开 SDK 的 OcrTableClient 析构时 kill() + waitForFinished()
+        会同步触发 finished() -> processFinished()，若此刻有请求在飞（m_busy），
+        它会 emit 一次 requestFailed(..., "BACKEND_EXITED", ..., retryable=true)；
+        主人若按 retryable 自动重试（本项目 GUI 的既有策略），就会在对象析构
+        过程中又发起新请求。修法与 src/gui/backendrunner.cpp 的 shutdown() 同款。
+        """
+        source = CLIENT_CPP.read_text(encoding="utf-8")
+        header = CLIENT_H.read_text(encoding="utf-8")
+        self.assertIn("bool m_shuttingDown;", header)
+        self.assertIn("void shutdown();", header)
+        self.assertIn("m_shuttingDown = true;", source)
+        self.assertIn("disconnect(this, nullptr, nullptr, nullptr);", source)
+        # 析构函数必须先调 shutdown()
+        destructor = source.split("OcrTableClient::~OcrTableClient()", 1)[1].split("\n}", 1)[0]
+        self.assertIn("shutdown();", destructor)
+        # 五个可能被析构期触发的槽 + 响应消费函数都要有守卫
+        for slot in (
+            "readStandardOutput",
+            "readStandardError",
+            "processFinished",
+            "processError",
+            "requestTimedOut",
+            "consumeResponseLine",
+        ):
+            body = source.split("OcrTableClient::%s(" % slot, 1)[1].split("\n}", 1)[0]
+            self.assertIn(
+                "if (m_shuttingDown)",
+                body,
+                "slot %s lacks the shutdown guard" % slot,
+            )
+
     def test_camera_and_rectified_inputs_have_named_entry_points(self):
         header = CLIENT_H.read_text(encoding="utf-8")
         source = CLIENT_CPP.read_text(encoding="utf-8")

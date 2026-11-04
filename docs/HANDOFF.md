@@ -1,6 +1,11 @@
 # OCR 表格接口交接说明
 
-交付目录同时包含可直接运行的 `OcrTableTool.exe` 和可被同事程序调用的离线接口 `ocr-runtime/OcrBackend/OcrBackend.exe`。
+本交付目录包含**离线识别后端** `ocr-runtime/OcrBackend/OcrBackend.exe`（含模型与原生运行库），
+以及客户侧自检脚本 `customer_selfcheck.py` / `selfcheck.bat`。
+
+⚠ **本包不含图形界面 `OcrTableTool.exe`**（2026-10-30 订正：旧版此处写成"同时包含可直接运行的
+`OcrTableTool.exe`"，与实况相反）。GUI 需从源码 `ocr-table-tool.pro` 用 Qt 5.9.6 / MSVC2015 x64 构建；
+把构建出的 `OcrTableTool.exe` 放到本包同级的 `ocr-runtime/` 旁边即可被自动找到。
 
 ## 同事接入顺序
 
