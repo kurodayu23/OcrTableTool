@@ -90,6 +90,9 @@ private:
     void clearOwnedRectifiedImage();
     void clearOwnedCroppedImage();
     void clearStaleRectifiedImages();
+    // 把最近一次识别失败的真实原因显示成结果区上方的提示条。
+    // 换图或新结果发布成功后由调用方清掉 m_lastRecognitionFailureDisplay。
+    void showRecognitionFailureNotice();
 
     BackendRunner *m_backend;
     QString m_imagePath;
@@ -108,6 +111,14 @@ private:
     // 等用户明确要求显示时再发布，避免后台结果突然覆盖当前界面。
     QJsonObject m_pendingRecognitionResponse;
     QString m_pendingRecognitionError;
+    // 后台识别失败时暂存的**结构化**错误码。原来只暂存 message，界面既无法
+    // 按码分支、也无法把失败原因显示出来（见 m_lastRecognitionFailureDisplay）。
+    QString m_pendingRecognitionErrorCode;
+    // 最近一次识别失败的可行动中文说明（按 error_code 分支出来的文案）。
+    // 换图时清空；下一次结果发布成功后由发布流程覆盖。
+    QString m_lastRecognitionFailureDisplay;
+    // 最近一次识别失败时后端给出的**原文**，用于 tooltip 展示真实原因。
+    QString m_lastRecognitionFailureMessage;
     bool m_loadingTable;
     bool m_touchTracking;
     // 这些标志共同组成界面侧识别状态机：后台结果只在用户请求后显示；

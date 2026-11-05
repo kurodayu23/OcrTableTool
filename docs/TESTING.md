@@ -2,7 +2,8 @@
 
 > 结论先行：改完代码只跑一条命令 —— `pwsh -File scripts\verify_all.ps1`。
 > 它任一失败即退出码非 0，并且**只打印首要错误行**，完整日志落盘。
-> CI 加 `-Json` 拿机器可读摘要。要跑交付包校验加 `-IncludeDelivery`，要编译 C++ 加 `-IncludeCpp`。
+> CI 加 `-Json` 拿机器可读摘要。要跑交付包校验加 `-IncludeDelivery`，要编译 C++ 加 `-IncludeCpp`，
+> 要守真实翻拍照片的逐格准确率加 `-IncludePhoto`。
 
 本文件解决的是"**流程型**缺陷"：代码没错，但流程让人测错了东西。
 2026-10-28 一次就集中暴露了四类，见文末「已知坑」。
@@ -12,18 +13,24 @@
 ## 一、一键门禁
 
 ```powershell
-# 日常（约 60 秒，后端单测占 50 秒左右）
+# 日常（约 3.5 分钟，后端单测占 190~230 秒）
 pwsh -File scripts\verify_all.ps1
 
 # CI：只有一段 JSON 输出，其余全部进日志
 pwsh -File scripts\verify_all.ps1 -Json
 
-# 交付前：再加交付包 13 项 + 自检 28 项 + 交付说明数字校验（几分钟，需要已打好的包）
+# 交付前：再加交付包校验 + 客户侧自检 + 交付说明数字校验（几分钟，需要已打好的包）
 pwsh -File scripts\verify_all.ps1 -IncludeDelivery
 
 # 要编译并跑 C++ 测试
 pwsh -File scripts\verify_all.ps1 -IncludeCpp
 pwsh -File scripts\verify_all.ps1 -IncludeCpp -SkipCppBuild   # 复用已有构建目录，只跑测试
+
+# 要跑真实翻拍照片的逐格准确率门禁（需要先构建 photo-corpus，见「门禁清单」）
+pwsh -File scripts\verify_all.ps1 -IncludePhoto
+
+# 语料不在默认位置（<产品树>\photo-corpus）时，用 -PhotoCorpusDir 指定
+pwsh -File scripts\verify_all.ps1 -IncludePhoto -PhotoCorpusDir D:\somewhere\photo-corpus
 ```
 
 产物：`D:\AP\AP7000\OcrTableTool\_work\gate-r1\run-<时间戳>\`
@@ -31,16 +38,17 @@ pwsh -File scripts\verify_all.ps1 -IncludeCpp -SkipCppBuild   # 复用已有构�
 
 ### 门禁清单
 
-> 2026-11-02 更新：本清单此前停在 10-28，此后门禁新增了 16 处判据
-> （见「门禁判据演进」一节）。**以本表为准**。
+> 2026-11-05 更新：步骤**编号与执行顺序**、真实照片门禁的判据、C++ 构建脚本
+> 都已按当前实现逐条核对过（改动都标了「订正」，见下面各条）。
+> 此前停在 10-28 / 11-02，此后门禁新增了 16 处判据（见「门禁判据演进」一节）。**以本表为准**。
 
-**基础步（默认全跑，15 步 + 1 步清单核对）**
+**基础步（默认全跑，15 步）**
 
 | # | 名称 | 默认 | 说明 | 典型耗时 |
 |---|---|---|---|---|
 | 1 | `bom` | 开 | `src\`、`tests\`、`interface-sdk\` 下含非 ASCII 的 `.cpp/.h` 必须带 UTF-8 BOM | 0.2s |
 | 2 | `identity` | 开 | `backend\tests`、`tests\*.py` 不许写死指向本机项目树的绝对路径（**仓库树 + 产品树两棵都扫**） | 0.3s |
-| 3 | `backend-unit` | 开 | `python -B -m unittest discover -s backend\tests -t backend\tests`（1465 用例） | 190–200s |
+| 3 | `backend-unit` | 开 | `python -B -m unittest discover -s backend\tests -t backend\tests`（1538 用例） | 190–230s |
 | 4 | `contract-ui` | 开 | `tests\test_ui_contract.py` | 0.3s |
 | 5 | `contract-sdk` | 开 | `tests\test_interface_sdk_contract.py` | 0.3s |
 | 6 | `hygiene-unit` | 开 | `tests\test_repo_hygiene.py`（覆盖 1/2/7 + 交付说明模板） | 1.5s |
@@ -53,24 +61,106 @@ pwsh -File scripts\verify_all.ps1 -IncludeCpp -SkipCppBuild   # 复用已有构�
 | 13 | `hygiene-isolation-unit` | 开 | `tests\test_hygiene_fixture_isolation.py`（门禁用例不许拿真实机器目录当夹具） | 0.2s |
 | 14 | `qt-integrity-unit` | 开 | `tests\test_qt_test_integrity.py`（C++/Qt 侧测试黑洞：孤儿方法 / 没实例化的类 / 平凡断言） | 0.2s |
 | 15 | `mirror` | 开 | 仓库工作树 ↔ 产品树镜像逐文件比对（LF 归一化 + SHA-256） | 0.3s |
-| 16 | `gate-coverage` | 开 | **步骤清单核对**：实际跑了哪些步 vs 必须跑的清单（少跑 / 多跑 / 重名 ⇒ FAIL） | 0s |
+
+> `gate-coverage`（**步骤清单核对**）**永远排在最后一步** —— 它得在其它步都跑完之后
+> 才能核对"实际跑了哪些步 vs 必须跑的清单"（少跑 / 多跑 / 重名 ⇒ FAIL）。
+> 所以结果里的编号是：基础 1~15 → 可选步按**执行顺序**接在后面 → `gate-coverage` 最后一条。
+
+**真实照片步（`-IncludePhoto`，1 步；排在交付步之前）**
+
+| # | 名称 | 说明 | 典型耗时 |
+|---|---|---|---|
+| 16 | `photo-acceptance` | `scripts\gate_photo_acceptance.py`：**真实翻拍照片**的逐格端到端准确率 + "错值不许静默"（判据见下） | 30–90s |
 
 **交付步（`-IncludeDelivery`，3 步）**
 
 | # | 名称 | 说明 | 典型耗时 |
 |---|---|---|---|
 | 17 | `delivery-notes` | `交付说明.md` 的数字能否由模板 + 实际目录重算 | 0.3s |
-| 18 | `delivery-verify` | `scripts\verify_delivery_package.py`（13 项，**真的跑打包后的 exe**） | 1–5min |
-| 19 | `delivery-selfcheck` | `scripts\customer_selfcheck.py`（19 项，客户侧视角） | 1–5min |
+| 18 | `delivery-verify` | `scripts\verify_delivery_package.py`（**真的跑打包后的 exe**；脚本自己打印 `summary: N passed, N failed, N skipped`） | 1–5min |
+| 19 | `delivery-selfcheck` | `scripts\customer_selfcheck.py`（客户侧视角；脚本自己打印"自检结果：通过 N 项，失败 N 项，跳过 N 项"） | 1–5min |
 
 **C++ 步（`-IncludeCpp`，4 步）**
 
 | # | 名称 | 说明 | 典型耗时 |
 |---|---|---|---|
-| 20 | `cpp-build` | `scripts\build_msvc2015.ps1`（qmake + nmake + windeployqt） | 2–10min |
+| 20 | `cpp-build` | `scripts\build_qt_all.ps1`（三套都建：主程序 + core tests、GUI tests、SDK tests；qmake + nmake） | 2–10min |
 | 21 | `cpp-core-test` | `<build>\tests\release\tst_ocrtable_core.exe` | 秒级 |
-| 22 | `cpp-gui-test` | `<build>\tstgui\bin\tst_ocrtable_gui.exe` | 分钟级 |
+| 22 | `cpp-gui-test` | `<build>\gui-tests\bin\tst_ocrtable_gui.exe` | 分钟级 |
 | 23 | `cpp-sdk-test` | `<build>\sdk-tests\release\tst_ocrtableclient.exe` | 秒级 |
+
+> ⚠ 2026-11-05 订正：上表原来写的是 `scripts\build_msvc2015.ps1` 与 `<build>\tstgui\bin\...`，
+> **与实现不符**。门禁实际跑的是 `scripts\build_qt_all.ps1` —— 只跑 `build_msvc2015.ps1` 的话
+> GUI 套件与 SDK 套件根本不会被构建，干净构建目录上 `-IncludeCpp` 必然报两项 FAIL；
+> GUI 测试的产物目录是 `gui-tests\bin\`（不是 `tstgui\bin\`）。
+
+> 2026-11-05 新增。**为什么合成语料不够**：field-corpus 的 1200 例全是渲染
+> 出来的清晰表格，它测不到翻拍照片上的框线残留、背面透印、倾斜拍摄、低分辨率。
+> 真实照片上"真值 `55` 被读成 `552`""真值 `2298` 被读成 `12298`"这类**静默瞎编**
+> 就是这么漏到用户手上的 —— 合成语料长期全绿，真实照片一直没人守。
+>
+> 这一步同时守住三件事（`scripts\gate_photo_acceptance.py`）：
+> ① **逐格准确率** `--min-cell-exact-rate`（默认 **0.97**）不低于阈值；
+> ② **错格总数** `--max-wrong-cells`（默认 **4**）不超过上限；
+> ③ **错值必须被标黄**（`needs_review=true`）—— "读错了却没标黄"的格数
+>    `--max-silent-wrong-cells`（默认 **0**）必须为 0。
+>    这一条是"杜绝静默瞎编"的制度性防线：即使准确率还没修到位，错值也**不许**
+>    以"已确认"的姿态导出。
+>
+> 前置：真实照片语料（人工逐格真值）。
+> ```powershell
+> # 1) 构建语料（把照片 + 人工真值转成 field-corpus 同款布局）
+> python scripts\build_photo_corpus.py `
+>     --source "C:\Users\jss18\Pictures\excel3" --output photo-corpus
+> # 2) 跑门禁
+> pwsh -File scripts\verify_all.ps1 -IncludePhoto
+> ```
+> 人工真值在 `scripts\photo_corpus_truths.py`（**逐格放大核对后转录**，看不清的格
+> 放进歧义格集合，不参与比对）。改动它等于改动门禁的判据，改前请三思。
+
+### 真实照片门禁的判据与参数（`scripts\gate_photo_acceptance.py`）
+
+门禁内部实际执行的那条命令：
+
+```powershell
+python -B scripts\gate_photo_acceptance.py --corpus <语料目录> --output <报告目录>
+```
+
+- `--corpus`：语料目录，必须同时有 `images/` 与 `_truth/`。
+  `verify_all.ps1` 不传 `-PhotoCorpusDir` 时默认取 **`<产品树>\photo-corpus`**。
+- `--output`：报告目录；门禁传的是 `<OutDir>\photo-gate`，落盘 `photo-gate-report.json`。
+- `--ids PF-00014,PF-00001`：只跑指定用例（默认全跑）。
+- `--model-dir`：模型目录（默认 `<项目>\runtime\models`）。
+- `--skip-models`：跳过模型指纹检查（`batch_acceptance_runner.verify_models`）。
+- 这一步**不是**标准库能跑的：它 `import ocr_backend`，需要完整后端依赖
+  （numpy / opencv / onnxruntime / rapidocr）与 `runtime\models\` 下的模型。
+
+退出码：
+
+| 码 | 含义 |
+|---|---|
+| 0 | 判据全过 |
+| 1 | 判据未达标（准确率 / 错格数 / 静默错值） |
+| 2 | 语料或环境不可用：模型门禁不过、`images/` + `_truth/` 不全、或没有可跑的用例 |
+
+> ⚠ `gate_photo_acceptance.py` 的模块 docstring 里把 `--min-cell-exact-rate` 的示例写成 `0.98`，
+> 但 `argparse` 的**实际默认值是 0.97** —— 以 0.97 为准。
+
+### 人工真值（`scripts\photo_corpus_truths.py`）
+
+- `CASES`：`case_id → (真值网格, 歧义格集合)`。真值网格是**逐格人工放大核对后转录**的文字。
+- 歧义格（写进 `_truth\*.json` 的 `ambiguous_cells`）：人工划改 / 印刷不清 / 真值不确定
+  ⇒ **不参与**逐格比对（`gate_photo_acceptance.py` 的 `load_truth` 直接跳过）。
+  当前只有 `PF-00014` 的 `(6, 4)` 一格。
+- `SOURCES`：`case_id → 原图相对 `PHOTO_ROOT` 的路径`；`PHOTO_ROOT` 是照片库根目录。
+- ⚠ `photo_corpus_truths.py` 的注释写着"默认从环境变量 `OCR_TABLE_PHOTO_ROOT` 覆盖"，
+  但代码里**没有**读这个环境变量 —— 换机器请用 `build_photo_corpus.py --source <照片库>`。
+- 语料目录（`photo-corpus\images\` + `photo-corpus\_truth\`）是**本机生成物**，不入库：
+  登记进版本库的是 `scripts\photo_corpus_truths.py` 里的真值源，语料由
+  `scripts\build_photo_corpus.py` 重建。
+  ⚠ 产品树的 `.gitignore` 目前**没有**登记 `photo-corpus/`（只登记了 `field-corpus/`、
+  `field-corpus-nearfill/`、`excel-screenshot-corpus/`、`no-line-handwritten-corpus/`、
+  `stress-test-corpus/`），别把重建出来的语料提交进去。
 
 ### 「没查」怎么算
 
@@ -78,7 +168,9 @@ pwsh -File scripts\verify_all.ps1 -IncludeCpp -SkipCppBuild   # 复用已有构�
 
 - 契约测试文件缺失 ⇒ FAIL；
 - 点了 `-IncludeDelivery` 但交付包 / exe 不存在 ⇒ 三步全 FAIL；
-- 点了 `-IncludeCpp` 但测试可执行文件没构建出来 ⇒ FAIL。
+- 点了 `-IncludeCpp` 但测试可执行文件没构建出来 ⇒ FAIL；
+- 点了 `-IncludePhoto` 但 `scripts\gate_photo_acceptance.py` 或真实照片语料不存在 ⇒ FAIL
+  （"没查"不等于"通过"）。
 
 **只有一种情况允许 SKIP**：用户**明确**传了 `-SkipCppBuild`（= 本来就打算复用旧构建目录）。
 其余没查到的情形一律 FAIL ——「没查」必须等同于「不通过」。
@@ -101,6 +193,20 @@ pwsh -File scripts\verify_all.ps1 -IncludeCpp -SkipCppBuild   # 复用已有构�
 清单**必须独立维护** —— 若由执行代码推导，执行代码少跑一步时清单也跟着少，
 核对就变成自己跟自己比，缺陷照样漏网。改执行代码时记得同步改清单
 （漏改会被 `gate-coverage-unit` 的静态交叉核对当场抓住）。
+
+清单里现在登记的步骤（`Get-ExpectedGateSteps` 的返回）：
+
+- **基础 15 步**（永远要跑）：`bom`、`identity`、`backend-unit`、`contract-ui`、`contract-sdk`、
+  `hygiene-unit`、`gate-log-unit`、`gate-delivery-unit`、`gate-policy-unit`、`gate-identity-unit`、
+  `gate-vacuous-unit`、`gate-coverage-unit`、`hygiene-isolation-unit`、`qt-integrity-unit`、`mirror`；
+- `-IncludeDelivery` 时追加 3 步：`delivery-notes`、`delivery-verify`、`delivery-selfcheck`；
+- `-IncludeCpp` 时追加 4 步：`cpp-build`、`cpp-core-test`、`cpp-gui-test`、`cpp-sdk-test`
+  （`-SkipCppBuild` 也恒为 4 步 —— `cpp-build` 会被记成一条 SKIP 结果）；
+- `-IncludePhoto` 时追加 1 步：`photo-acceptance`。
+
+> ⚠ 2026-11-05 补：清单里**不含** `gate-coverage` 自己 —— 它是核对动作，不是被核对的那一步；
+> 但它照样会作为一条结果出现在汇总里（最后一条）。新增步骤**必须先登记**，
+> 否则会被判成 `unexpected` ⇒ FAIL。
 
 ### 门禁判据演进（2026-11-02）
 
@@ -179,7 +285,7 @@ pwsh -File scripts\verify_all.ps1 -IncludeCpp -SkipCppBuild   # 复用已有构�
 $py = "D:\AP\AP7000\OcrTableTool\.venv\Scripts\python.exe"
 $env:PYTHONIOENCODING = "utf-8"   # 中文日志在 pwsh 里不乱码
 
-# 后端单测（约 1400 用例，50~60 秒）
+# 后端单测（1538 用例，约 190~230 秒）
 & $py -B -m unittest discover -s backend\tests -t backend\tests
 
 # Python 契约
@@ -203,8 +309,13 @@ $env:PYTHONIOENCODING = "utf-8"   # 中文日志在 pwsh 里不乱码
 & $py -B scripts\verify_delivery_package.py --package-dir D:\...\package\backend-delivery\ocr-runtime\OcrBackend --backend-source .\backend
 & $py -B scripts\customer_selfcheck.py  --package-dir D:\...\package\backend-delivery
 
+# 真实照片门禁（先有语料，再跑门禁）
+& $py -B scripts\build_photo_corpus.py --source "C:\Users\jss18\Pictures\excel3" --output photo-corpus
+& $py -B scripts\gate_photo_acceptance.py --corpus photo-corpus --output _work\photo-gate
+
 # C++
-powershell -File scripts\build_msvc2015.ps1
+powershell -File scripts\build_msvc2015.ps1            # 只建主程序 + core tests
+pwsh -File scripts\build_qt_all.ps1 -BuildDirectory <dir>   # 门禁用的那个：三套都建
 $env:QT_QPA_PLATFORM = "offscreen"
 & build\windows-msvc2015\tests\release\tst_ocrtable_core.exe
 ```
@@ -514,11 +625,11 @@ if ($LASTEXITCODE -ne 0) { Get-Content gate-summary.json; exit 1 }
 | 退出码 | 由 PowerShell 返回（0/1），不用再解析日志 |
 | 环境 | `QT_QPA_PLATFORM=offscreen`；`PATH` 含 Qt bin 与 venv `Scripts`；`TMPDIR=%TEMP%`（**不要**指向检出目录） |
 | 产物 | `_work\**\logs\*.log`、`_work\**\summary.json` |
-| 快速失败 | 先用 `-Json` 只跑默认 15 项（约 4 分钟，含后端单测），交付/编译放独立 Build step |
+| 快速失败 | 先用 `-Json` 只跑默认那 15 步 + 步骤清单核对（共 16 条结果，约 3.5~4 分钟，含后端单测），交付/编译放独立 Build step |
 
 ### 推荐的分层
 
-1. **提交前（4 分钟）**：`verify_all.ps1`（15 项：静态门禁 + 单测 + 契约）；
+1. **提交前（3.5~4 分钟）**：`verify_all.ps1`（15 步：静态门禁 + 单测 + 契约，外加一条 `gate-coverage` 核对）；
 2. **合并前（含 C++）**：`-IncludeCpp`；
 3. **交付前（含包）**：`-IncludeDelivery`（要求包已打出）。
 
@@ -538,3 +649,6 @@ if ($LASTEXITCODE -ne 0) { Get-Content gate-summary.json; exit 1 }
 | `permission denied` 写 `_work\` / `__pycache__` | 目录权限 / 只读挂载 | 把 `-OutDir` 指到可写目录；用 `-B` 禁止写 `__pycache__` |
 | `delivery-notes` FAIL「已过期」 | 包重建后没重算交付说明 | `delivery_notes.py render --package-dir <包>` |
 | `delivery-verify` FAIL「backend sources not found」 | 没给 `--backend-source` 且包里也没有源码树 | 传 `--backend-source .\backend`（门禁已默认传仓库 backend） |
+| `photo-acceptance` FAIL「真实照片语料不存在」 | 没建语料，或语料不在默认位置 | 先跑 `build_photo_corpus.py`，或用 `-PhotoCorpusDir` 指到语料目录 |
+| `photo-acceptance` FAIL「逐格准确率低于阈值」 | 真实照片上的读法还没修到位 | 看 `<OutDir>\photo-gate\photo-gate-report.json` 的 `records[].details`（逐格列了真值 / 识别值 / 有没有标黄） |
+| `photo-acceptance` FAIL「有 N 个错值格没有被标黄」 | 静默瞎编 —— 读错了却没标 `needs_review` | 查 `ocr_backend._ruled_cell_reading_needs_confirmation`（多模型分歧兜底）有没有被摘掉 |

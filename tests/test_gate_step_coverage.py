@@ -187,12 +187,24 @@ class ExpectedStepManifestTest(unittest.TestCase):
         for name in ("cpp-build", "cpp-core-test", "cpp-gui-test", "cpp-sdk-test"):
             self.assertIn(name, with_cpp, "C++ 清单缺 %s" % name)
 
+    def test_photo_adds_one_step(self):
+        """真实翻拍照片的端到端准确率门禁（2026-11-04 新增）。
+
+        合成语料长期全绿，真实照片上"真值 55 被读成 552"这类静默瞎编
+        一直没人守 —— 缺的就是这一步。
+        """
+        base = _expected_steps()
+        with_photo = _expected_steps("-IncludePhoto")
+        self.assertEqual(len(with_photo), len(base) + 1)
+        self.assertIn("photo-acceptance", with_photo, "照片清单缺 photo-acceptance")
+        self.assertNotIn("photo-acceptance", base, "基础清单不该含照片步骤")
+
     def test_all_is_the_union(self):
         all_steps = set(_expected_steps("-All"))
         union = set(_expected_steps()) | set(_expected_steps("-IncludeDelivery")) | set(
             _expected_steps("-IncludeCpp")
-        )
-        self.assertEqual(all_steps, union, "-All 不是三种子集的并集")
+        ) | set(_expected_steps("-IncludePhoto"))
+        self.assertEqual(all_steps, union, "-All 不是四种子集的并集")
 
 
 class StepCoverageTest(unittest.TestCase):

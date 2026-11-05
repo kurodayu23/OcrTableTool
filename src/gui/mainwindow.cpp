@@ -144,15 +144,22 @@ QString canonicalDisplayedResultHash(const TableData &table,
         QCryptographicHash::hash(canonical, QCryptographicHash::Sha256).toHex());
 }
 
-QString localizedBackendError(const QString &message)
+// 没有命中任何具体原因时的通用兜底文案。单独取成常量，便于判断"命中的是不是
+// 只是兜底"：INVALID_REQUEST / INTERNAL_ERROR / RECOGNITION_BUDGET_EXCEEDED 是
+// **桶型**错误码，后端把具体原因写进 message（"图里没检测到表格""网格切分异常…"
+// "发生内部错误"…），这些码要优先用更具体的那条，而不是码本身那句通用话。
+const QString kGenericBackendError =
+    QStringLiteral("识别失败，已保留原始错误信息。请展开“详细信息”查看后重试。");
+
+// 结构性失败的具体原因：命中即返回可行动的具体文案。
+//
+// 2026-10-24 修正（findings/104）：后端这几类失败的文案都带「图片」或「模型」二字，
+// 而下面 model/模型 分支与 image/图片 分支会把它们一律说成
+// 「识别模型文件缺失或损坏」或「无法读取图片」—— 于是「60 秒没跑完」
+// 「结构过于复杂」「内部错误」「联网被拦截」这些失败在界面上被说成了别的问题。
+// 这几条关键词很具体，放在函数最前面，命中即返回，不再往下走。
+QString localizedBackendSpecificError(const QString &message)
 {
-    // 2026-10-24 修正（findings/104）：后端这几类失败的文案都带「图片」或「模型」二字，
-    // 而下面 model/模型 分支与 image/图片 分支会把它们一律说成
-    // 「识别模型文件缺失或损坏」或「无法读取图片」—— 于是「60 秒没跑完」
-    // 「结构过于复杂」「内部错误」「联网被拦截」这些失败在界面上被说成了别的问题。
-    // 这几条关键词很具体，放在函数最前面，命中即返回，不再往下走。
-    // ⚠ 签名与调用点**保持不变**：UI 契约测试（test_ui_contract.py:254）锚定了
-    //   localizedBackendError 的**单参数**调用形态，本次改动不动它。
     if (message.contains(QStringLiteral("逐格复核超过"))
         || message.contains(QStringLiteral("判定表格结构过于复杂"))) {
         return QStringLiteral("本次识别未能在 60 秒内完成：这张图的表格结构过于复杂，已中止以免长时间无响应。请用「框选区域」只框住表格本体（去掉桌面背景、条纹或其他网格），或裁剪掉干扰内容后重新识别。");
@@ -224,6 +231,17 @@ QString localizedBackendError(const QString &message)
         || message.contains(QStringLiteral("30秒"))) {
         return QStringLiteral("识别流程已正常结束，但不同模型或结构结果不一致。为避免输出错位或拼错列的表格，软件主动没有生成结果；这不是程序崩溃。截图请裁剪到表格区域并保留原始分辨率，照片请改善光线、对焦或靠近后重试。");
     }
+    return QString();
+}
+
+// 弱猜测：模型 / 图片 / 进程等关键词。只在**没有**更具体原因时使用。
+//
+// 2026-11-05：这些分支原先和上面的具体分支混在一个函数里，于是
+// IMAGE_PATH_REQUIRED / IMAGE_NOT_FOUND 的消息里带「图片」二字就被说成
+// 「图片格式或文件损坏」（与真实原因不符）。现在这类码由 error_code 分支
+// 接管，弱猜测只作关键词兜底。
+QString localizedBackendWeakError(const QString &message)
+{
     if (message.contains(QStringLiteral("model"), Qt::CaseInsensitive)
         || message.contains(QStringLiteral("模型"))) {
         return QStringLiteral("识别模型文件缺失或损坏，请重新配置识别组件。");
@@ -241,7 +259,121 @@ QString localizedBackendError(const QString &message)
     if (message.contains(QStringLiteral("process"), Qt::CaseInsensitive)) {
         return QStringLiteral("识别组件本次运行异常。请再次点击开始识别；若仍失败，请关闭其他正在运行的版本后重启软件。");
     }
-    return QStringLiteral("识别失败，已保留原始错误信息。请展开“详细信息”查看后重试。");
+    return QString();
+}
+
+// 单参数版本：**签名与调用形态保持不变**（UI 契约测试 test_ui_contract.py:254
+// 锚定了 localizedBackendError(message) 这个调用形态）。
+QString localizedBackendError(const QString &message)
+{
+    const QString specific = localizedBackendSpecificError(message);
+    if (!specific.isEmpty())
+        return specific;
+    const QString weak = localizedBackendWeakError(message);
+    if (!weak.isEmpty())
+        return weak;
+    return kGenericBackendError;
+}
+
+// 2026-11-05 修正（缺陷：识别链路的错误提示不按 error_code 分支，19 个错误码
+// 里有 8 个给出空泛或错误的提示）。
+//
+// 契约 docs/BACKEND_API_V1.md §2 明确要求："程序只能根据 error_code、field、
+// retryable 分支；message 仅用于显示/日志"，并**禁止**对 message 做关键字匹配。
+// 修复前这里只有单参数版本、只能靠关键词猜：
+//   · UNSUPPORTED_PROTOCOL / UNSUPPORTED_ACTION / INVALID_REQUEST /
+//     INVALID_OPTION / OUTPUT_DIRECTORY_INVALID / OUTPUT_WRITE_FAILED
+//     —— 全部落到「识别失败，已保留原始错误信息…」，用户看不出该做什么；
+//   · IMAGE_PATH_REQUIRED / IMAGE_NOT_FOUND —— 被说成「图片格式或文件损坏」。
+//
+// 这里按契约逐个错误码给出**具体、可行动**的中文提示（说清楚"发生了什么 +
+// 用户该做什么"），不再用「识别失败」这种空泛话。
+// 码表取自 docs/BACKEND_API_V1.md §2 的 19 个码，另加界面侧传输层
+// （backendrunner.cpp）与 GUI 自造的 INVALID_RESPONSE。
+QString localizedBackendErrorByCode(const QString &errorCode)
+{
+    if (errorCode.isEmpty())
+        return QString();
+    // ── 协议层 ────────────────────────────────────────────────────────
+    if (errorCode == QStringLiteral("UNSUPPORTED_PROTOCOL"))
+        return QStringLiteral("识别组件与当前程序版本不兼容，本次任务没有被受理。请更新或重新安装识别组件后再试。");
+    if (errorCode == QStringLiteral("UNSUPPORTED_ACTION"))
+        return QStringLiteral("识别组件不支持本次操作，本次任务没有被受理。请更新或重新安装识别组件后再试。");
+    // ── 请求层 ────────────────────────────────────────────────────────
+    if (errorCode == QStringLiteral("INVALID_REQUEST"))
+        return QStringLiteral("识别请求没有被受理：请求内容不合法，或这张图里没有可识别的表格。请裁剪到表格区域并保留原始分辨率后重试。");
+    if (errorCode == QStringLiteral("INVALID_OPTION"))
+        return QStringLiteral("识别选项不合法（裁剪方式／识别精度／时限），本次任务没有被受理。请重新选择识别选项，或重新安装软件后再试。");
+    // ── 图片层 ────────────────────────────────────────────────────────
+    if (errorCode == QStringLiteral("IMAGE_PATH_REQUIRED"))
+        return QStringLiteral("没有拿到要识别的图片路径，本次任务没有被受理。请重新打开图片后再点开始识别。");
+    if (errorCode == QStringLiteral("IMAGE_NOT_FOUND"))
+        return QStringLiteral("找不到要识别的图片文件（文件可能已被移动或删除）。请重新打开图片后再点开始识别。");
+    if (errorCode == QStringLiteral("IMAGE_READ_FAILED"))
+        return QStringLiteral("图片读不出来（文件为空或已损坏，或不是受支持的图片格式／超出尺寸上限）。请换一张完整清晰的图片重试。");
+    // ── 输出层 ────────────────────────────────────────────────────────
+    if (errorCode == QStringLiteral("OUTPUT_DIRECTORY_INVALID"))
+        return QStringLiteral("识别组件拿到的临时输出目录无效，无法写入中间文件。请重启软件后重试；若反复出现，请检查本机临时目录是否可用。");
+    if (errorCode == QStringLiteral("OUTPUT_WRITE_FAILED"))
+        return QStringLiteral("识别结果写不进临时目录。请检查磁盘剩余空间与临时目录的写入权限后重试。");
+    // ── 模型层 ────────────────────────────────────────────────────────
+    if (errorCode == QStringLiteral("MODEL_MISSING"))
+        return QStringLiteral("识别模型文件缺失，识别无法开始。请重新安装或修复安装目录后重试。");
+    if (errorCode == QStringLiteral("MODEL_HASH_MISMATCH"))
+        return QStringLiteral("识别模型文件校验不通过（文件损坏或被改动），识别无法开始。请重新安装或修复安装目录后重试。");
+    // ── 导出层 ────────────────────────────────────────────────────────
+    if (errorCode == QStringLiteral("EXPORT_PATH_REQUIRED"))
+        return QStringLiteral("没有指定导出文件路径。请重新选择保存位置后再导出。");
+    if (errorCode == QStringLiteral("EXPORT_GRID_INVALID"))
+        return QStringLiteral("导出内容不是规整的矩形表格，无法写入 Excel。请重新识别后再导出。");
+    if (errorCode == QStringLiteral("EXPORT_SPAN_INVALID"))
+        return QStringLiteral("合并单元格信息无效，无法写入 Excel。请重新识别后再导出。");
+    if (errorCode == QStringLiteral("EXPORT_WRITE_FAILED"))
+        return QStringLiteral("无法写入导出文件。请关闭正在占用该文件的程序（例如 Excel），或换一个保存位置后重试。");
+    // ── 其它协议码 ────────────────────────────────────────────────────
+    if (errorCode == QStringLiteral("NETWORK_ACCESS_DENIED"))
+        return QStringLiteral("本产品不会进行任何网络访问，识别组件的联网行为已被拦截。请检查本地识别组件后重试。");
+    if (errorCode == QStringLiteral("RECOGNITION_BUDGET_EXCEEDED"))
+        return QStringLiteral("在 60 秒等待预算内没能确认表格结构，本次识别已中止。请用「框选区域」只框住表格本体，或裁掉桌面背景、条纹等干扰内容后重试。");
+    if (errorCode == QStringLiteral("INSUFFICIENT_MEMORY"))
+        return QStringLiteral("可用内存不足，识别已中止。请关闭占用内存的程序，或用「框选区域」缩小识别范围后重试。");
+    if (errorCode == QStringLiteral("INTERNAL_ERROR"))
+        return QStringLiteral("识别组件发生内部错误，本次识别未完成。请重试；若反复出现，请更换图片或联系技术支持。");
+    // ── 传输层（由界面侧 backendrunner.cpp 产生，后端不会返回）──────────
+    if (errorCode == QStringLiteral("EMPTY_RESPONSE"))
+        return QStringLiteral("识别组件没有返回有效结果，本次识别未完成。请重试。");
+    if (errorCode == QStringLiteral("BACKEND_BUSY"))
+        return QStringLiteral("识别组件正在处理上一个任务，请稍候再试。");
+    if (errorCode == QStringLiteral("BACKEND_NOT_CONFIGURED"))
+        return QStringLiteral("识别组件未配置就绪。请检查安装目录是否完整（识别组件与模型文件）后重试。");
+    if (errorCode == QStringLiteral("BACKEND_START_FAILED"))
+        return QStringLiteral("识别组件启动失败。请关闭其他正在运行的版本后重试。");
+    if (errorCode == QStringLiteral("BACKEND_CRASHED"))
+        return QStringLiteral("识别组件异常退出，本次识别未完成。请重试；若反复出现请重启软件。");
+    if (errorCode == QStringLiteral("INVALID_RESPONSE"))
+        return QStringLiteral("识别组件返回的结果不完整，本次结果未被采用。请重新识别；若反复出现，请重启软件。");
+    return QString();
+}
+
+// 带错误码的重载（新增）：**优先按 error_code 精确分支**，关键词匹配作为兜底。
+QString localizedBackendError(const QString &errorCode, const QString &message)
+{
+    // ① 桶型错误码：后端把**具体原因**写进 message，先用它（比码本身那句
+    //    通用话更可行动，例如 RECOGNITION_BUDGET_EXCEEDED 的"网格切分异常…
+    //    同一批单元格被反复复核"）。
+    if (errorCode == QStringLiteral("INVALID_REQUEST")
+        || errorCode == QStringLiteral("INTERNAL_ERROR")
+        || errorCode == QStringLiteral("RECOGNITION_BUDGET_EXCEEDED")) {
+        const QString specific = localizedBackendSpecificError(message);
+        if (!specific.isEmpty())
+            return specific;
+    }
+    // ② 按 error_code 精确分支（契约 §2 的主路径）。
+    const QString byCode = localizedBackendErrorByCode(errorCode);
+    if (!byCode.isEmpty())
+        return byCode;
+    // ③ 兜底：老后端可能不带 error_code（协议 v1 之前），按消息关键词匹配。
+    return localizedBackendError(message);
 }
 
 QString localizedExportError(const QString &errorCode, const QString &message)
@@ -307,8 +439,10 @@ QString localizedExportError(const QString &errorCode, const QString &message)
     // 最终兜底：不要再断言"被占用"（2026-10-23 修正，见 findings/68 F1）。
     // 真实原因可能与文件占用无关。
     // 2026-10-23 第 50 轮修正（findings/109 M2）：**不要承诺「展开详细信息」**——
-    // localizedBackendDetail()（本文件下方）只在原文纯中文时把原文放进 tooltip，
-    // 多数情况下 tooltip 与状态栏逐字相同 ⇒ 那个提示是假承诺，会把用户引到空处。
+    // 2026-11-05 之前 localizedBackendDetail() 只在原文纯中文时把原文放进
+    // tooltip，多数情况下 tooltip 与状态栏逐字相同 ⇒ 那个提示是假承诺，会把用户
+    // 引到空处。现在 localizedBackendDetail() 一律保留后端原文（见该函数），
+    // tooltip 里确实能看到原始信息。
     return QStringLiteral("导出失败。请重试；若仍失败，请重新识别后再导出。");
 }
 
@@ -326,7 +460,16 @@ QString localizedBackendDetail(const QString &technicalMessage,
     }
     if (containsChinese && !containsLatinLetter)
         return technicalMessage;
-    return displayMessage;
+    // 2026-11-05 修正（缺陷：后端原文被丢弃）：原文原先只在「纯中文」时留下，
+    // 含英文/数字的后端原话被**整个丢掉** ⇒ tooltip 里看不到后端到底说了什么，
+    // 真实原因在界面上无处可查（只落在未开启环境变量就不写任何内容的 GuiTrace
+    // 里）。现在一律保留原文，排在可读文案后面；截断到 1000 字符，与
+    // backendFailed 写 GuiTrace 的截断口径一致。
+    if (technicalMessage.trimmed().isEmpty())
+        return displayMessage;
+    if (technicalMessage == displayMessage)
+        return displayMessage;
+    return displayMessage + QStringLiteral("\n原始信息：") + technicalMessage.left(1000);
 }
 
 bool validateSpans(const QJsonValue &value,
@@ -912,6 +1055,10 @@ bool MainWindow::loadImage(const QString &path)
     m_structureCertificate = QJsonObject();
     m_pendingRecognitionResponse = QJsonObject();
     m_pendingRecognitionError.clear();
+    m_pendingRecognitionErrorCode.clear();
+    // 换图 ⇒ 上一次失败的原因不再相关（新图片会有自己的失败原因）。
+    m_lastRecognitionFailureDisplay.clear();
+    m_lastRecognitionFailureMessage.clear();
     m_recognitionDisplayRequested = false;
     m_recognitionActive = false;
     m_recognitionRetryCount = 0;
@@ -1015,9 +1162,24 @@ void MainWindow::recognizeImage()
         return;
     }
     if (!m_pendingRecognitionError.isEmpty()) {
+        // 2026-11-05 修正（缺陷：后台识别失败的真实原因被丢弃）：原来这里
+        // **第一件事**就是 clear() 掉原因、然后直接重新识别 —— 用户点
+        // 「开始识别」既看不到上一次为什么失败，界面上也没有任何地方能查
+        // （原因只在 GuiTrace 里，而未设环境变量时它一条都不写）。
+        // 现在：先把上一次失败的真实原因摆出来（状态栏 + tooltip + 结果区
+        // 提示条），再开始新一轮识别。
+        const QString previousMessage = m_pendingRecognitionError;
+        const QString previousCode = m_pendingRecognitionErrorCode;
+        const QString previousDisplay = m_lastRecognitionFailureDisplay.isEmpty()
+            ? localizedBackendError(previousCode, previousMessage)
+            : m_lastRecognitionFailureDisplay;
         m_pendingRecognitionError.clear();
+        m_pendingRecognitionErrorCode.clear();
         m_recognitionRetryCount = 0;
-        m_statusLabel->setText(QStringLiteral("正在重新尝试识别当前表格…"));
+        m_statusLabel->setText(QStringLiteral("上一次识别未完成：%1 正在重新识别…")
+                                   .arg(previousDisplay));
+        m_statusLabel->setToolTip(localizedBackendDetail(previousMessage, previousDisplay));
+        showRecognitionFailureNotice();
         startRecognitionRequest();
         return;
     }
@@ -1084,6 +1246,7 @@ void MainWindow::startRecognitionRequest(int budgetSeconds)
     QDir().mkpath(outputDirectory);
     m_pendingRecognitionResponse = QJsonObject();
     m_pendingRecognitionError.clear();
+    m_pendingRecognitionErrorCode.clear();
     m_recognitionActive = true;
     m_startRequestedWhileStopping = false;
     // 一次识别的预算从**首个**请求发出时开始计；自动重试沿用同一个计时器，
@@ -1162,6 +1325,17 @@ void MainWindow::exportCsv()
         m_statusLabel->setText(
             QStringLiteral("无法保存 CSV 文件。请检查保存位置、文件名、磁盘空间及文件占用状态。"));
         m_statusLabel->setToolTip(error);
+        return;
+    }
+    // 2026-11-05：导出的 CSV 在文件末尾标出了待确认单元格的位置（见
+    // CsvExporter::encode），这里也把同样的信息说一遍 —— 客户只看状态栏时
+    // 也不会以为这份 CSV 是"全部已确认"的。
+    const int pending = pendingReviewCount();
+    if (pending > 0) {
+        m_statusLabel->setText(
+            QStringLiteral("CSV 已保存：%1（%2 项待确认，已在文件末尾标出位置，请对照原图核对后再使用）")
+                .arg(QDir::toNativeSeparators(path))
+                .arg(pending));
         return;
     }
     m_statusLabel->setText(QStringLiteral("CSV 已保存：%1").arg(QDir::toNativeSeparators(path)));
@@ -1305,6 +1479,7 @@ void MainWindow::backendSucceeded(const QString &action, const QJsonObject &resp
         m_restartRecognitionAfterCancel = false;
         m_pendingRecognitionResponse = QJsonObject();
         m_pendingRecognitionError.clear();
+        m_pendingRecognitionErrorCode.clear();
         setBusy(false);
         GuiTrace::write(QStringLiteral("stale_recognition_discarded"));
         QTimer::singleShot(0, this, [this]() {
@@ -1329,6 +1504,10 @@ void MainWindow::backendSucceeded(const QString &action, const QJsonObject &resp
 void MainWindow::publishRecognitionResult(const QJsonObject &response)
 {
     setBusy(false);
+    // 2026-11-05：新结果发布成功 ⇒ 上一次识别失败的提示条不再适用。
+    // （本函数里任何校验失败都会走 backendFailed，由它写回新的失败原因。）
+    m_lastRecognitionFailureDisplay.clear();
+    m_lastRecognitionFailureMessage.clear();
     QString error;
     const TableData table = TableData::fromBackendJson(response, &error);
     if (!error.isEmpty()) {
@@ -1672,6 +1851,7 @@ void MainWindow::backendFailed(const QString &action, const QString &message,
             m_restartRecognitionAfterCancel = false;
             m_pendingRecognitionResponse = QJsonObject();
             m_pendingRecognitionError.clear();
+            m_pendingRecognitionErrorCode.clear();
             // 这是用户新发起的一轮，预算重新从 0 计（重试计数归零）。
             m_recognitionRetryCount = 0;
             setBusy(false);
@@ -1755,6 +1935,7 @@ void MainWindow::backendFailed(const QString &action, const QString &message,
             ++m_recognitionRetryCount;
             m_pendingRecognitionResponse = QJsonObject();
             m_pendingRecognitionError.clear();
+            m_pendingRecognitionErrorCode.clear();
             setBusy(false);
             const QString retrySource = m_sourceImagePath;
             m_statusLabel->setText(QStringLiteral("首次识别未完成，正在自动恢复并重试…"));
@@ -1773,10 +1954,23 @@ void MainWindow::backendFailed(const QString &action, const QString &message,
         if (!m_recognitionDisplayRequested) {
             m_pendingRecognitionResponse = QJsonObject();
             m_pendingRecognitionError = message;
-            setBusy(false);
-            m_statusLabel->setText(insufficientMemory
+            m_pendingRecognitionErrorCode = errorCode;
+            // 2026-11-05 修正（缺陷：后台失败的真实原因被丢弃）：原来这里只写
+            // 「后台识别未完成，点击开始识别查看原因」，而用户点「开始识别」后
+            // 原因被 clear() 掉、直接重新识别 ⇒ 真实原因只留在 GuiTrace，
+            // 未设环境变量时一条都不写，生产环境无处可查。
+            // 现在：状态栏直接给出可行动的原因，tooltip 给出后端原文，
+            // 结果区上方的提示条持续显示（直到下一次成功结果或换图）。
+            const QString failureDisplay = insufficientMemory
                 ? QStringLiteral("可用内存不足，已暂停识别；释放内存后点击开始识别重试")
-                : QStringLiteral("后台识别未完成，点击开始识别查看原因"));
+                : localizedBackendError(errorCode, message);
+            m_lastRecognitionFailureDisplay = failureDisplay;
+            m_lastRecognitionFailureMessage = message;
+            setBusy(false);
+            m_statusLabel->setText(QStringLiteral("后台识别未完成：%1（点击开始识别重试）")
+                                       .arg(failureDisplay));
+            m_statusLabel->setToolTip(localizedBackendDetail(message, failureDisplay));
+            showRecognitionFailureNotice();
             return;
         }
         clearPublishedResult(QStringLiteral("本次识别未生成可导出结果"));
@@ -1785,19 +1979,23 @@ void MainWindow::backendFailed(const QString &action, const QString &message,
         // localizedBackendError()，该函数没有内存不足分支 ⇒ 落到通用兜底
         // "识别失败，已保留原始错误信息"，后端那条可操作建议（关闭占内存程序 /
         // 用框选区域减少识别量）只落在 tooltip 里。前台与后台（:1524）保持一致。
+        // 2026-11-05：改成按 error_code 精确分支（新增重载），关键词匹配兜底。
         const QString displayMessage = insufficientMemory
             ? QStringLiteral("可用内存不足，已中止识别；释放内存后点击开始识别重试")
-            : localizedBackendError(message);
+            : localizedBackendError(errorCode, message);
+        m_lastRecognitionFailureDisplay = displayMessage;
+        m_lastRecognitionFailureMessage = message;
         m_statusLabel->setText(QStringLiteral("识别未完成：%1 可重新识别或重新框选表格。")
                                    .arg(displayMessage)
                                + (retrySkippedByBudget
                                       ? QStringLiteral("（本次识别已用完 60 秒等待预算，未再自动重试。）")
                                       : QString()));
         m_statusLabel->setToolTip(localizedBackendDetail(message, displayMessage));
+        showRecognitionFailureNotice();
         return;
     }
     setBusy(false);
-    const QString displayMessage = localizedBackendError(message);
+    const QString displayMessage = localizedBackendError(errorCode, message);
     if (action == QStringLiteral("warmup")) {
         m_statusLabel->setText(QStringLiteral("识别组件准备失败：%1").arg(displayMessage));
         return;
@@ -1823,11 +2021,32 @@ void MainWindow::clearPublishedResult(const QString &summary)
     m_publicationBlocked = false;
     m_structureCertificate = QJsonObject();
     m_resultStack->setCurrentIndex(0);
-    m_reviewNotice->hide();
+    // 2026-11-05：失败提示条不能跟着结果一起被清掉 —— 上一次识别失败的**真实
+    // 原因**必须一直可见，直到新结果发布成功或用户换图。
+    if (m_lastRecognitionFailureDisplay.isEmpty())
+        m_reviewNotice->hide();
+    else
+        showRecognitionFailureNotice();
     if (!summary.isEmpty())
         m_resultSummaryLabel->setText(summary);
     m_loadingTable = false;
     updateActions();
+}
+
+// 2026-11-05（缺陷：后台识别失败的真实原因被丢弃）：把最近一次失败原因显示成
+// 结果区上方的提示条 —— 状态栏会被"正在识别…"覆盖，提示条不会。
+void MainWindow::showRecognitionFailureNotice()
+{
+    if (m_lastRecognitionFailureDisplay.isEmpty()) {
+        m_reviewNotice->hide();
+        return;
+    }
+    m_reviewNotice->setText(
+        QStringLiteral("上一次识别未完成：%1").arg(m_lastRecognitionFailureDisplay));
+    m_reviewNotice->setToolTip(
+        localizedBackendDetail(m_lastRecognitionFailureMessage,
+                               m_lastRecognitionFailureDisplay));
+    m_reviewNotice->show();
 }
 
 void MainWindow::showTable(const TableData &table, const QJsonArray &spans)

@@ -117,7 +117,9 @@ stderr : 日志，不属于协议
 - `input_rectified=true` 表示输入图已经完成透视矫正。
 - `selected_table_region=true` 表示输入图来自用户框选的单个表格区域，后端会启用框选区域的运动模糊恢复路线。
 
-成功响应的稳定业务字段：`rows`、`columns`、`cells`、`spans`、`recognition_state`、`publication_blocked`、`publication_block_reasons`、`structure_verified`、`structure_certificate`、`image_quality`、`rectified_image`、`elapsed_seconds`、`review_cell_count`、`memory_mode`。
+成功响应的稳定业务字段：`rows`、`columns`、`cells`、`spans`、`recognition_state`、`publication_blocked`、`publication_block_reasons`、`processing_notices`、`structure_verified`、`structure_certificate`、`image_quality`、`rectified_image`、`elapsed_seconds`、`review_cell_count`、`review_ratio`、`memory_mode`。
+
+`recognition_state` 取值只有三个：`verified` / `needs_review` / `blocked`（见 `docs/schemas/backend-api-v1.schema.json`）。
 
 `memory_mode=normal` 使用正常批量；`memory_mode=low_memory` 在可用内存低于
 `max(2 GB, min(4 GB, 物理内存 × 35%))` 时切到串行小批量（8 GB 机器上约 2.8 GB），识别与复核步骤不变。
@@ -137,25 +139,86 @@ stderr : 日志，不属于协议
 - `options.deadline_seconds` 传正数会**收紧**本次上限为 `min(60, 该值)`；传 `0`（正式集成固定值）保持 60 秒。
 - 环境变量 `OCRTABLE_BUDGET_DISABLED=1` 可**整条关闭**该墙钟（仅供批量验收，生产不建议）。
 
-单元格结构：
+单元格结构（识别响应里每格固定是这四个字段）：
 
 ```json
-{"text":"515.472","confidence":0.96,"needs_review":false}
+{"text":"515.472","confidence":0.96,"needs_review":false,"confidence_sentinel":false}
 ```
 
-可能还带一个**可选**字段：
+- `text`：格内文字；没有内容时是**空串**（不是 `null`）。
+- `confidence`：**实测置信度或类别哨兵**，取值 `0.0`～`1.0`（见 §4.2）。
+- `needs_review`：**唯一的人工复核依据**，布尔值（见 §4.3）。
+- `confidence_sentinel`：布尔值，标识这一格的 `confidence` 是不是"类别哨兵"（见 §4.4）。
 
-```json
-{"text":"515.472","confidence":0.77,"needs_review":false,"confidence_sentinel":true}
-```
+### 4.2 `confidence` 的取值范围与钳位
 
-- `confidence_sentinel`：**可选**（老客户端可以完全忽略）。为 `true` 表示这一格的 `confidence`
-  是识别路径硬写的**类别哨兵**（`0.77` = 未取得双模型一致确认，`0.86` = 已取得），
-  **不是实测置信度**。消费方**不要**把它当成"低置信度告警"，也**不要**拿它跟 `0.78` 之类的
-  阈值比大小 —— 那样会把逐格全对的表整片标成待复核。老客户端没有这个字段时，
+| 位置 | 行为 |
+|---|---|
+| `table_pipeline.build_result` | `cell_score = max(0.0, min(1.0, raw_cell_score))` ⇒ 内部哨兵 `-1.0`（结构不可信）、`-2.0`（有墨迹却读不出内容）发布成 `0.0` |
+| `ocr_backend._trim_grid_to_populated_extent` | 把网格裁到"有内容的最小外接矩形"后重建 cells 时同样钳位到 `[0,1]`，且 **`needs_review` 原样保留**（`*cell` 展开，不丢"要人工确认"的结论） |
+| ⚠ `ocr_backend._handle_request_body` 发布前的最后一个循环 | 把 `cell["confidence"]` 重写成 `confidence_grid` 的**原始值**（不是钳位值）⇒ "合计列位移""物理网格边界不可信"这两条路径上的 `-1.0` 仍可能原样发布 |
+
+> ⚠ 2026-11-05 补：GUI 的协议边界（`src/core/tabledata.cpp`）对 `confidence < 0.0` **整表拒收**，
+> 公开 SDK 也会把 `confidence < 0.0` 判成"非法响应"。
+> ⇒ 消费方**必须自己兜住负值**（按 `needs_review=true` 处理），不能假设后端一定给的是 `[0,1]`。
+
+### 4.3 `needs_review` 的判定
+
+基准判定在 `table_pipeline.build_result`：
+
+- `raw_cell_score < 0`（内部哨兵 `-1.0` / `-2.0`）⇒ `true`；
+- `0 < raw_cell_score < 0.78` 且（该格**无文字** **或** `raw_cell_score` 不是哨兵）⇒ `true`；
+- 其余（`raw_cell_score == 0.0`、`raw_cell_score >= 0.78`、以及"有文字 + `raw_cell_score == 0.77` 哨兵"）⇒ `false`。
+
+两条最容易搞反的：
+
+- "有文字 + `0.77` 哨兵"**不标黄** —— 0.77 / 0.86 是类别哨兵不是实测置信度；
+  早期版本按 `confidence < 0.78` 判复核，把逐格 102/102 全对的表整片标成了待复核。
+- "空格子 + 非零置信度"**要标黄** —— 那里确实检出过内容却读不出文字，属于真·不确定。
+
+`ocr_backend._handle_request_body` 在发布前用**硬证据**重写每格 `needs_review`：
+
+- `confidence_grid <= -2.0`（检测到墨迹却读不出内容）；
+- 文本含豆腐块 / 替换字符（`ocr_backend._has_unknown_glyph`）；
+- 格里有文字但 `confidence <= 0.0`。
+
+整表是否因此阻断，看 `ocr_backend._cell_requires_human_confirmation`（判据同上，**空格不算**）：
+命中即 `publication_blocked=true` + `recognition_state=blocked`，并往 `publication_block_reasons` 追加
+"最终文本与物理单元格证据仍存在未确认内容，禁止直接作为已验证结果导出。"。
+
+`review_cell_count` / `review_ratio` 在发布前最后按"真正标黄的格数"统一重算，与界面看到的黄格数一致。
+
+### 4.4 `confidence_sentinel` 的产出条件
+
+- `table_pipeline.build_result` 逐格写入：`confidence_sentinel = _is_sentinel_confidence(cell_score)`。
+- `ocr_backend._is_sentinel_confidence` 的判据是"**值恰好等于 0.77 或 0.86**"（容差 `1e-9`）：
+  - `0.77` = 没取得双模型一致确认 / 被截短读法的上限；`0.86` = 取得了双模型一致确认；
+  - 其它值（实测置信度）⇒ `false`。
+- `ocr_backend._refresh_confidence_sentinel_flags` 在**发布前**按**最终发布的** `confidence` 重算一遍
+  （大小写修复把置信度抬到 `0.86`、公式括号不平衡检查压到 `0.77`）
+  ⇒ 该字段与对外发布的 `confidence` 永远自洽。
+- 识别响应的**每格都带**这个布尔字段；机器可读 schema 仍标为可选，老客户端可以完全忽略。
+- 消费方**不要**拿 `confidence` 跟 `0.78` 之类的阈值比大小来代替 `needs_review`
+  —— 那样会把逐格全对的表整片标成待复核。老客户端没有这个字段时，
   应以 `needs_review` 为唯一的人工复核依据。
 
-必须满足：`cells.length == rows`，每行长度等于 `columns`，置信度在 0～1。合并格坐标从 0 开始：
+### 4.5 `processing_notices`（只提示，不阻断）
+
+`processing_notices` 是**字符串数组**，只作提示：它不会把 `publication_blocked` 置 true，
+也不改 `recognition_state`。与本文相关的实际文案：
+
+- 多模型读法不一致：
+  `"有 N 格的多模型读法不一致（共识结果没有得到多数模型支持，或胜出读法置信度偏低），已标黄，请逐格对照原图确认。"`
+- 未取得双模型一致确认（**只提示，不阻断**）：
+  `"有 N 格未取得两个模型的一致确认（R1C1、R2C2 等 N 格），请对照原图确认。"`
+- 裁掉空白网格行列：
+  `"已按表格实际内容范围裁去空白网格行列（Excel 视图中的空白单元格区）。"`
+- 结构未取得物理证据认证：
+  `"整表结构未取得物理证据认证，请对照原图确认行列归属。"`
+- 列位置是推断出来的：
+  `"这张表可能只有横向分隔线、没有纵向分隔线，列位置由推断得出、尚未取得物理证据，请对照原图确认每一列的归属。"`
+
+必须满足：`cells.length == rows`，每行长度等于 `columns`，置信度在 0～1（例外见 §4.2）。合并格坐标从 0 开始：
 
 ```json
 {"row":0,"column":0,"row_span":1,"column_span":7,"role":"title"}
@@ -174,15 +237,47 @@ AND 所有 cells[*][*].needs_review == false
 ```
 
 - `needs_review`：可以展示，必须人工确认后才能进入业务发布。**这是唯一的人工复核依据**；
-  `confidence_sentinel=true` 不等于要复核（见 §4）。
+  `confidence_sentinel=true` 不等于要复核（见 §4.4）。
+- ⚠ **2026-11-05 新增（重要）**：真实翻拍照片上，多个模型读法不一致时后端会**主动**把该格
+  标成 `needs_review=true`。判据在 `ocr_backend._ruled_cell_reading_needs_confirmation`
+  （入参：各模型的读法 + 分数 `readings`、共识选中的读法 `winner`），四个分支依次判：
+
+  1. 只有一种读法（`len(votes) <= 1`）⇒ 不标黄；
+  2. 胜出读法是**纯符号**（不含数字 / 拉丁字母 / 汉字）⇒ 不标黄
+     （表格横线、勾选框这类格，模型读出 `207` / `ST` / 空串很正常，标黄会整片误伤）；
+  3. 胜出读法的**票数不是最多**（源码：`votes.get(winner_key, 0) < max(votes.values())`）⇒ 标黄
+     （例如真值 `55`：两个模型读 `55`、一个读 `552`，截短合并把票数反转 ⇒ 共识选了 `552`）；
+  4. 否则，胜出读法的**最低分 < 0.80** ⇒ 标黄。
+
+  命中后：`_recognize_complete_ruled_candidate` 把该格的置信度降到 `-1.0`（"结构不可信"哨兵），
+  发布成 `confidence=0.0` + `needs_review=true`，并追加一条 `processing_notices`（§4.5）；
+  同时整表 `publication_blocked=true` / `recognition_state=blocked`。
+  这类格子**必须**按"要人工确认"处理 —— 它不代表一定错，但代表**没有足够证据**。
+  消费方**不要**拿 `confidence` 跟阈值比大小来代替 `needs_review`（§4）。
 - `blocked`：只能展示草稿，禁止自动发布；原因见 `publication_block_reasons`。
-- ⚠ **2026-10-30 订正（重要）**：旧版本写"`structure_verified=false` 时…进入 `blocked`"，**与实现不符** ——
-  结构认证被撤销时后端只清 `structure_certificate`、置 `structure_verified=false` 并追加一条
-  *提示性* 说明（`processing_notices`），**不会**把 `publication_blocked` 置 true、也不改 `recognition_state`。
-  这类结果可能同时出现 `status=ok` / `recognition_state=verified` / `publication_blocked=false` /
-  `structure_verified=false` / `structure_certificate=null`。
+- ⚠ **2026-10-30 订正（重要）**：旧版本写"`structure_verified=false` 时…进入 `blocked`"，**与实现不符**。
+  "撤销结构认证"在实现里有**多条**路径，后果**不一样**，客户端不能只看 `structure_verified`：
+
+  1. **启发式锁格降级**（`ocr_backend._demote_heuristic_certified_structure`）：只清 `structure_certificate`、
+     置 `structure_verified=false`、`structure_review_required=true`，并追加一条*提示性*说明
+     （`processing_notices`："整表结构未取得物理证据认证，请对照原图确认行列归属。"），
+     **不会**把 `publication_blocked` 置 true、也不改 `recognition_state`。
+     这类结果可能同时出现 `status=ok` / `recognition_state=verified` / `publication_blocked=false` /
+     `structure_verified=false` / `structure_certificate=null`。
+  2. **列结构明显不成立**（`ocr_backend._demote_implausible_column_structure`，如"只有横线没有竖线"）：
+     `publication_blocked=true`、`recognition_state=blocked`，原因追加"线框只框出 N 列却跨了 M 行，
+     列边界不是真实列分隔线（该表可能只有横线没有竖线），已撤销结构认证，整表需人工核对。"，
+     并追加一条 `processing_notices`（"这张表可能只有横向分隔线、没有纵向分隔线，列位置由推断得出、
+     尚未取得物理证据，请对照原图确认每一列的归属。"）。
+  3. **物理网格边界不可信**（`ocr_backend._certificate_boundaries_are_sane` 判定不成立）：追加一条
+     `structure_warnings`（"表格物理网格边界不可信（…），整表需重新取景并人工核对。"），
+     并把每格置信度置 `-1.0` ⇒ 这些格全部标黄、整表阻断（§4.2 的例外路径）。
+  4. **证书与最终网格对不齐**（`_handle_request_body` 末尾的复核）：`publication_blocked=true`、
+     `recognition_state=blocked`，原因追加"表格结构边界与最终网格不一致，已撤销结构认证，整表需人工核对。"。
+
   ⇒ **客户端必须自己校验 `structure_verified == true`**（上面门禁五行缺一不可），
-  绝不能因为 `publication_blocked=false` 就认为结构已经过认证。
+  绝不能因为 `publication_blocked=false` 就认为结构已经过认证；
+  也不能反过来以为 `structure_verified=false` 一定是"不阻断"的那一类。
 - 结构证书证明结果与后端锁定的物理边界自洽，不代表外部真值 100% 正确。
 - 用户修改任一单元格或行列后，原证书不能再代表编辑后的结果；客户端要记录"人工确认"来源。
 
@@ -217,7 +312,7 @@ AND 所有 cells[*][*].needs_review == false
 | 字段 | 必填 | 说明 |
 |---|---|---|
 | `output_path` | 是 | xlsx 落盘路径；父目录不存在会自动创建 |
-| `cells` | 是 | 非空**矩形**二维数组，元素为 `{text, confidence, needs_review}`；`text` 为 `null` 时按空串导出 |
+| `cells` | 是 | 非空**矩形**二维数组，元素为 `{text, confidence, needs_review}`（`confidence_sentinel` 可选，透传不影响导出）；`text` 为 `null` 时按空串导出；`confidence` 必须是数值（`bool` 按缺失处理、当 `1.0`），非数值 ⇒ `EXPORT_GRID_INVALID`（`field=cells`） |
 | `spans` | 否 | 合并单元格 `[{row, column, row_span, column_span, role?}]`，坐标从 0 开始 |
 | `structure_certificate` | 否 | `recognize` 返回的证书原样透传；**非法证书**（缺 boundaries/长度不符/非数值）返回 `INVALID_REQUEST`（`field=structure_certificate`，不可重试） |
 

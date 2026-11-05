@@ -14,6 +14,7 @@ package/
 benchmark-results/
 benchmark-data/
 field-corpus/
+photo-corpus/
 field-corpus-nearfill/
 excel-screenshot-corpus/
 no-line-handwritten-corpus/

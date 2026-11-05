@@ -35,6 +35,7 @@ function Get-ExpectedGateSteps {
     param(
         [switch]$IncludeDelivery,
         [switch]$IncludeCpp,
+        [switch]$IncludePhoto,
         [switch]$All
     )
 
@@ -63,6 +64,12 @@ function Get-ExpectedGateSteps {
         # 所以这里恒为 4 步。（旧版 PlannedGates 在 -SkipCppBuild 时只算 3 步，
         # 计数器本来就少算 1 —— 显示上就已经对不上了。）
         $steps += @("cpp-build", "cpp-core-test", "cpp-gui-test", "cpp-sdk-test")
+    }
+    if ($IncludePhoto -or $All) {
+        # 真实翻拍照片的端到端准确率门禁。
+        # 2026-11-04：合成语料（field-corpus）长期全绿，而真实照片上
+        # "真值 55 被读成 552"这类瞎编一直没人守 —— 缺的就是这一项。
+        $steps += @("photo-acceptance")
     }
     return $steps
 }

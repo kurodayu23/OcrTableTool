@@ -5500,6 +5500,25 @@ def assign_ocr_to_grid(
                             ((rows[target_row] + rows[target_row + 1]) * 0.5, center_x, part, score)
                         )
                     continue
+            if crossed_rows:
+                # 2026-11-05（lead 复查，数据错位 P0）：一个文本框跨越多个行带时，
+                # 原来统一按**中心** `searchsorted(center_y)` 落格。而纵向合并格里的
+                # 文字是**垂直居中**的 ⇒ 中心正好落在合并块的中间行，整块标签被放到
+                # 第二行/中间行，首行变空。实测 FC-00001：真值「第三车间」在第 2 行，
+                # 我们输出到第 3 行，同型共 58 格「真值有字、识别为空」。
+                # Excel/真值语义是**合并区左上锚点** ⇒ 跨行时落到最上面那一行。
+                #
+                # ⚠ 只对**明显跨多行的高文本框**生效：正常高度的单行文字偶尔压线
+                # （实测 test_assign_ocr_to_grid_keeps_normal_height_text_crossing_row_line：
+                # 行距 40、文字高 18、压在 y=40 的线上）必须继续按中心落格，否则
+                # 一行普通文字会被挪到上一行。判据用「高度 ≥ 1.25 倍中位行距」。
+                pitch_values = np.diff(np.asarray(rows, dtype=float))
+                pitch = float(np.median(pitch_values)) if pitch_values.size else 0.0
+                if pitch > 0 and box_height >= pitch * 1.25:
+                    row = max(0, min(row_count - 1, crossed_rows[0] - 1))
+            if os.environ.get("OCRTABLE_ROW_ANCHOR", "1") == "0":
+                # 诊断开关：关掉跨行锚点（回到"按中心落格"的旧行为），用于 A/B 对比。
+                row = int(np.searchsorted(rows, center_y, side="right") - 1)
             if horizontal_split is not None:
                 boundary, split_at = horizontal_split
                 left_value = value[:split_at].strip()

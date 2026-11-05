@@ -143,6 +143,23 @@ bool needsTextGuard(const QString &value)
     return losesPrecisionAsNumber(value);
 }
 
+// 待人工确认的单元格位置。口径与界面上的「N 项待确认」完全一致：
+// TableData::requiresAttention = 后端 needs_review 或实测置信度偏低。
+// 坐标写成「R<行>C<列>」，行列都从 1 开始 —— 与 Excel 里看到的行列号一致，
+// 用户拿它回到界面/原图上直接定位。
+QStringList pendingReviewCellLabels(const TableData &table)
+{
+    QStringList labels;
+    for (int row = 0; row < table.rowCount(); ++row) {
+        for (int column = 0; column < table.columnCount(); ++column) {
+            if (!table.requiresAttention(row, column))
+                continue;
+            labels.append(QStringLiteral("R%1C%2").arg(row + 1).arg(column + 1));
+        }
+    }
+    return labels;
+}
+
 // 整张表没有任何文字（0 行 / 0 列，或者全是空白格）就不算一张表。
 bool hasExportableContent(const TableData &table)
 {
@@ -201,6 +218,26 @@ QByteArray CsvExporter::encode(const TableData &table)
         for (int column = 0; column < table.columnCount(); ++column)
             fields.append(escaped(table.cell(row, column)));
         output += fields.join(QLatin1Char(','));
+        output += QStringLiteral("\r\n");
+    }
+
+    // 2026-11-05 修正（缺陷：CSV 丢掉全部「待复核」标记）。
+    // 原来这里只写 cells[].text，界面上标黄的「N 项待确认」在导出文件里一处
+    // 都没有 —— 用户会把**未确认内容**当成已确认数据用（XLSX 路径给这些格加
+    // 黄底 FFF4D6 + 批注，CSV 路径没有）。
+    //
+    // 修法（不动任何数据格）：内容列仍然是单元格原文，数据行的行数与列数都不
+    // 变，只在**全部数据行之后**追加一行以 '#' 开头的说明行。RFC4180 下它仍是
+    // 一条普通记录、只占一列（说明文字里不用半角逗号），不会把数据行串列；
+    // 「#」开头 +「说明（非数据行）」字样让客户一眼看出它不是数据。
+    // 整表没有待确认格时不追加 ⇒ 无待确认的导出与改动前逐字节一致。
+    const QStringList pendingLabels = pendingReviewCellLabels(table);
+    if (!pendingLabels.isEmpty()) {
+        QString note = QStringLiteral("# 说明（非数据行）：本表有 %1 个单元格仍待人工确认，位置：%2。")
+                       + QStringLiteral("坐标为「行-列」，行列均从 1 开始。")
+                       + QStringLiteral("请对照原图核对后再使用；导出 Excel（.xlsx）可在对应单元格看到黄色标记与批注。");
+        note = note.arg(pendingLabels.size()).arg(pendingLabels.join(QStringLiteral("、")));
+        output += escaped(note);
         output += QStringLiteral("\r\n");
     }
     return QByteArray::fromHex("EFBBBF") + output.toUtf8();

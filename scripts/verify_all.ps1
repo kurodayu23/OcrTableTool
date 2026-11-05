@@ -36,6 +36,8 @@ param(
     [string]$DeliveryBackendSource = "",
     [switch]$IncludeCpp,
     [switch]$SkipCppBuild,
+    [switch]$IncludePhoto,
+    [string]$PhotoCorpusDir = "",
     [string]$BuildDirectory = "",
     [string]$QMake = "",
     [string]$VcVarsAll = "",
@@ -283,7 +285,7 @@ try {
 # 必须跑的步骤清单（**独立于执行代码维护** —— 执行代码少跑一步时清单不变，
 # 核对才抓得到；反过来若清单由执行代码推导，就变成自己跟自己比，永远相等）。
 # +1 = 核对步骤自身（gate-coverage），它在所有步骤跑完之后才产生。
-$expectedGateSteps = @(Get-ExpectedGateSteps -IncludeDelivery:$IncludeDelivery -IncludeCpp:$IncludeCpp)
+$expectedGateSteps = @(Get-ExpectedGateSteps -IncludeDelivery:$IncludeDelivery -IncludeCpp:$IncludeCpp -IncludePhoto:$IncludePhoto)
 $script:PlannedGates = $expectedGateSteps.Count + 1
 
 # 必跑的契约测试清单（步骤名 + 用例路径）
@@ -346,7 +348,31 @@ $mirrorJson = Join-Path $logDir "mirror.json"
         -Environment @{ PYTHONIOENCODING = "utf-8"; PYTHONDONTWRITEBYTECODE = "1" } `
         -JsonFile $mirrorJson)
 
-# --- 7 交付包校验（可选：几分钟，需要已打好的包）-------------------------
+# --- 7 真实翻拍照片端到端准确率（可选：需要照片库与逐格人工真值）-------
+# 2026-11-04：合成语料全绿 ≠ 产品没问题。真实翻拍照片上"真值 55 被读成 552"
+# 这类静默瞎编，合成语料永远测不出来 —— 必须单独有一道门禁盯着真实照片。
+# 它同时守住两件事：逐格准确率不许掉，以及**错值必须被标黄**（不许静默导出）。
+if ($IncludePhoto) {
+    $photoGate = Join-Path $RepoPath "scripts\gate_photo_acceptance.py"
+    if (-not $PhotoCorpusDir) {
+        $PhotoCorpusDir = Join-Path $ProductPath "photo-corpus"
+    }
+    if (-not (Test-Path -LiteralPath $photoGate -PathType Leaf)) {
+        $reason = ("缺失: " + $photoGate)
+        $status = Get-MissingStepStatus -Name "photo-acceptance" -Reason $reason -Requested $true
+        Add-Result -Name "photo-acceptance" -Status $status -Seconds 0 -Summary $reason -FirstError $reason -Log ""
+    } elseif (-not (Test-Path -LiteralPath $PhotoCorpusDir -PathType Container)) {
+        $reason = ("真实照片语料不存在: " + $PhotoCorpusDir + " （先跑 scripts\build_photo_corpus.py）")
+        $status = Get-MissingStepStatus -Name "photo-acceptance" -Reason $reason -Requested $true
+        Add-Result -Name "photo-acceptance" -Status $status -Seconds 0 -Summary $reason -FirstError $reason -Log ""
+    } else {
+        [void](Invoke-GateProcess -Name "photo-acceptance" -FilePath $PythonExe `
+                -Arguments @("-B", $photoGate, "--corpus", $PhotoCorpusDir, "--output", (Join-Path $OutDir "photo-gate")) `
+                -Environment @{ PYTHONIOENCODING = "utf-8"; PYTHONDONTWRITEBYTECODE = "1"; TMPDIR = $TmpDir; TEMP = $TmpDir; TMP = $TmpDir })
+    }
+}
+
+# --- 8 交付包校验（可选：几分钟，需要已打好的包）-------------------------
 if ($IncludeDelivery) {
     $verifyScript = Join-Path $RepoPath "scripts\verify_delivery_package.py"
     $selfcheckScript = Join-Path $RepoPath "scripts\customer_selfcheck.py"
@@ -374,7 +400,7 @@ if ($IncludeDelivery) {
     }
 }
 
-# --- 8 C++ 编译 + 测试（可选）-------------------------------------------
+# --- 9 C++ 编译 + 测试（可选）-------------------------------------------
 if ($IncludeCpp) {
     if ($SkipCppBuild) {
         Add-Skip -Name "cpp-build" -Reason "-SkipCppBuild：复用已有构建目录"

@@ -31108,12 +31108,120 @@ def _normalize_proven_reversed_percentages(
     return changed
 
 
+def _recovery_time_gate_open(budget: Any, limit: float) -> bool:
+    """耗时门：是否还允许做"补充读取/复核"这类可选的补救工作。
+
+    2026-11-05（稳定性实测 P0）：原来的写法是裸的 `budget.elapsed() <= 19.0`，
+    机器一忙就越门 ⇒ 漏格补读被跳过，而跳过时**不留任何痕迹**：格子是空的、
+    confidence 是 0.0、needs_review 是 false、notice 一条没有。
+    同一张图 36 次里有 26 次少字（72%），客户看到的就是"同一张图有时对有时错"。
+
+    这里把口径改成：
+      · `OCRTABLE_BUDGET_DISABLED=1` ⇒ 永远放行（验收/回归必须可复现）；
+      · 其余情况仍按耗时判断，但**由调用方负责留痕**（见 `_note_skipped_recovery`）。
+    """
+    if os.environ.get("OCRTABLE_BUDGET_DISABLED") == "1":
+        return True
+    try:
+        return float(budget.elapsed()) <= float(limit)
+    except (AttributeError, TypeError, ValueError):
+        return True
+
+
+def _note_skipped_recovery(notices: Any, what: str, limit: float) -> None:
+    """耗时门挡下补救步骤时必须留痕——宁可让客户去核对，也不能静默少字。"""
+    if not isinstance(notices, list):
+        return
+    notices.append(
+        "本机耗时已接近 %.0f 秒上限，已跳过「%s」这一步；若有空白或可疑单元格，"
+        "请对照原图核对后再发布。" % (float(limit), what)
+    )
+
+
+def _restore_dropped_decimal_separator(
+    grid: list[list[str]],
+    confidence: list[list[float]],
+) -> set[tuple[int, int]]:
+    """把整列小数点在识别时被吞掉的数字还原成小数（如 `321226` → `321.226`）。
+
+    **2026-11-05（大规模语料普查，数据破坏 P0）**：120 例抽样里 `punct_swap` 1719 处，
+    主体正是小数点整体丢失：`388.050 → 388050`（**1000 倍错**）、`861.588 → 861588`、
+    `321.226 → 321226`。这类错会静默导出（多模型共识后置信度固定 0.86，不触发复核），
+    是客户最痛的"数据错"。既有的 `_restore_regular_decimal_punctuation` 只处理
+    「逗号被读成小数点」，完全没覆盖"分隔符直接消失"。
+
+    判据必须来自**同列证据**，不凭形状猜：
+      ① 同列正文 ≥60%（且 ≥3 个）的格是同一小数位宽 `\\d+.\\d{k}`（k=2 或 3）；
+      ② 目标格是**纯数字**，位数正好等于「该列典型整数位宽 + k」；
+      ③ 还原后的量级落在该列中位数的 1/20 ~ 20 倍内（防止把编号当数值）。
+    三条同时满足才改写，并把置信度压到 0.77（类别哨兵）留痕。
+    """
+    if len(grid) < 4 or not grid[0]:
+        return set()
+    changed: set[tuple[int, int]] = set()
+    width = min(len(row) for row in grid)
+    for column in range(width):
+        body = [str(row[column]).strip() for row in grid[1:]]
+        # 分母只算**非空**格：空格既不是"有小数点"的证据也不是反证；
+        # 把被清空的格计进分母会把门槛抬到无法满足（实测 FC-00003 因此 0 改动）。
+        populated = [value for value in body if value]
+        if len(populated) < 3:
+            continue
+        decimals: Counter = Counter()
+        for value in populated:
+            match = re.fullmatch(r"(\d+)\.(\d{2,3})", value)
+            if match:
+                decimals[len(match.group(2))] += 1
+        if not decimals:
+            continue
+        places, dotted = decimals.most_common(1)[0]
+        if dotted < max(3, int(len(populated) * 0.40)):
+            continue
+        integer_widths: Counter = Counter()
+        magnitudes: list[float] = []
+        pattern = re.compile(r"(\d+)\.(\d{%d})" % places)
+        for value in populated:
+            match = pattern.fullmatch(value)
+            if match:
+                integer_widths[len(match.group(1))] += 1
+                magnitudes.append(float(value))
+        if not integer_widths:
+            continue
+        typical_integer = integer_widths.most_common(1)[0][0]
+        median_magnitude = float(median(magnitudes)) if magnitudes else 0.0
+        if median_magnitude <= 0:
+            continue
+        expected_digits = typical_integer + places
+        for row in range(1, len(grid)):
+            if column >= len(grid[row]):
+                continue
+            value = str(grid[row][column]).strip()
+            if not value.isdigit() or len(value) != expected_digits:
+                continue
+            candidate = value[:typical_integer] + "." + value[typical_integer:]
+            number = float(candidate)
+            low, high = median_magnitude / 20.0, median_magnitude * 20.0
+            raw = float(value)
+            # 只有「还原后回到量级内、而原始值明显在量级外」才动手；
+            # 两端都在范围内说明本来就说不清，宁可不动（避免把大数改小）。
+            if not (low <= number <= high):
+                continue
+            if low <= raw <= high:
+                continue
+            grid[row][column] = candidate
+            if row < len(confidence) and column < len(confidence[row]):
+                confidence[row][column] = min(float(confidence[row][column]), 0.77)
+            changed.add((row, column))
+    return changed
+
+
 def _apply_consistency_checks(
     grid: list[list[str]],
     confidence: list[list[float]],
 ) -> None:
     if len(grid) < 2 or not grid[0]:
         return
+    _restore_dropped_decimal_separator(grid, confidence)
     _strip_proven_spreadsheet_row_ruler_prefixes(grid, confidence)
     _strip_absolute_spreadsheet_row_prefixes(grid, confidence)
     _remove_proven_spreadsheet_row_ruler_cells(grid, confidence)
@@ -35022,6 +35130,141 @@ def _cell_interior_is_smooth_background(crop: np.ndarray) -> bool:
     return True
 
 
+def _clean_ruled_cell_crop(crop: np.ndarray) -> np.ndarray:
+    """清掉翻拍照片单元格里的框线残留与背面透印。
+
+    **2026-11-04（真实翻拍照片回归）**：真实照片里表格**竖线**会被识别模型读成
+    数字 "1"（真值 2298 → 12298），纸张**背面透印**会被读成额外数字
+    （真值 83 → 832092、66 → 662）。这两样都不是本格的内容，却因为多模型共识
+    （两个模型读的是同一张脏图，结论一致）被当成可信结果，而共识后的置信度是
+    **固定 0.86** ⇒ 低置信标黄机制永远不会触发，错的数字会**静默导出**。
+
+    这里只做**几何裁剪 + 定向换底色**，文字本身的像素一个都不动：
+
+      ① **框线**：框线贯穿整格（竖线：列投影 ≥ 格高-1 行）或整宽（横线：行投影
+         ≥ 格宽-1 列），而真实文字再密也不超过 0.85 格高 ⇒ 用投影把边缘的框线
+         带**裁掉**。阈值必须卡在"贯穿整格"，放宽到 0.85 会把"工"字中间的竖笔
+         （2 列宽、16/19 行）当成框线裁掉，把字裁残。
+         倾斜拍摄的照片里框线在轴对齐裁剪中是斜的，投影抓不到，但它是**细长且
+         贯穿整格**的连通域 ⇒ 再加一条"长边 ≥ 0.8 格高且长宽比 ≥ 3"的判定
+         （数字 1 只有 0.7 格高，不会被误判）。
+      ② **背面透印**：分两路清除。
+         - **成片**的透印（几十像素宽）局部背景去不掉，局部对比度≈0 ⇒ 只能用
+           "比纸面暗"的绝对灰阶判断，把**文字外接框之外**的这类像素换回纸面；
+           纸面色取 85 分位（一格里透印占大半时，70 分位会落在透印里判不准）。
+         - **紧贴文字**的透印（66 → 662）落在文字框之内 ⇒ 按连通域判断：局部
+           对比度很弱、且**不含任何强墨迹**的连通域是透印/噪点，换回纸面。
+
+    前两版试过"白化非墨迹像素"和"抹白线像素"，都会削坏笔画，已废弃；
+    第三版把整格收紧到文字外接框，虽然能清掉透印，但识别器内部自适应阈值的
+    窗口相对笔画太大，细笔画被吃掉（"陈静"→"31\n1"），也已废弃。
+    """
+    if crop is None or getattr(crop, "size", 0) == 0:
+        return crop
+    height, width = crop.shape[:2]
+    if min(height, width) < 8:
+        return crop
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    size = max(9, int(round(min(gray.shape) * 0.70)) | 1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+    local_background = cv2.morphologyEx(gray, cv2.MORPH_CLOSE, kernel)
+    contrast = cv2.subtract(local_background, gray)
+    ink = contrast > 28
+    col_ink = ink.sum(axis=0)
+    row_ink = ink.sum(axis=1)
+
+    left, right, top, bottom = 0, width, 0, height
+    column_threshold = max(4, height - 1)
+    x = 0
+    while x < width:
+        if col_ink[x] >= column_threshold:
+            start = x
+            while x < width and col_ink[x] >= column_threshold:
+                x += 1
+            end = x - 1
+            if end - start + 1 <= 8:
+                if start <= 5:
+                    left = max(left, end + 1)
+                elif end >= width - 6:
+                    right = min(right, start)
+        else:
+            x += 1
+    row_threshold = max(4, width - 1)
+    y = 0
+    while y < height:
+        if row_ink[y] >= row_threshold:
+            start = y
+            while y < height and row_ink[y] >= row_threshold:
+                y += 1
+            end = y - 1
+            if end - start + 1 <= 5:
+                if start <= 1:
+                    top = max(top, end + 1)
+                elif end >= height - 2:
+                    bottom = min(bottom, start)
+        else:
+            y += 1
+    if left >= right or top >= bottom:
+        return crop
+
+    region = crop[top:bottom, left:right]
+    region_contrast = contrast[top:bottom, left:right]
+    region_gray = (
+        cv2.cvtColor(region, cv2.COLOR_BGR2GRAY) if region.ndim == 3 else region
+    )
+    paper = float(np.percentile(region_gray, 85))
+    strong = region_contrast > 40
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        strong.astype(np.uint8), 8)
+    boxes: list[tuple[int, int, int, int]] = []
+    rule_components = np.zeros(region.shape[:2], dtype=bool)
+    for index in range(1, count):
+        bx, by, bw, bh, area = stats[index]
+        if area < 12:
+            continue
+        long_side = max(bw, bh)
+        short_side = max(1, min(bw, bh))
+        if (
+            long_side >= 0.80 * (height if bh >= bw else width)
+            and long_side / short_side >= 3.0
+        ):
+            # 细长且贯穿整格 ⇒ 框线（倾斜拍摄时框线在裁剪图里是斜的）。
+            rule_components[labels == index] = True
+            continue
+        if bw >= 0.92 * region.shape[1] or bh >= 0.92 * region.shape[0]:
+            continue
+        boxes.append((int(bx), int(by), int(bw), int(bh)))
+    if not boxes:
+        return region
+    x0 = max(0, min(box[0] for box in boxes) - 2)
+    x1 = min(region.shape[1], max(box[0] + box[2] for box in boxes) + 3)
+    y0 = max(0, min(box[1] for box in boxes) - 2)
+    y1 = min(region.shape[0], max(box[1] + box[3] for box in boxes) + 3)
+    outside = np.ones(region.shape[:2], dtype=bool)
+    outside[y0:y1, x0:x1] = False
+    targets = outside & (region_gray < paper - 6)
+    targets |= rule_components
+
+    faint = (region_contrast > 10).astype(np.uint8)
+    faint_count, faint_labels, faint_stats, _ = cv2.connectedComponentsWithStats(
+        faint, 8)
+    cell_area = region.shape[0] * region.shape[1]
+    for index in range(1, faint_count):
+        fx, fy, fw, fh, farea = faint_stats[index]
+        if farea < 3:
+            continue
+        if fw * fh > 0.25 * cell_area:
+            continue
+        component = faint_labels == index
+        if (strong & component).any():
+            continue
+        targets |= component
+    if not targets.any():
+        return region
+    background = np.full(region.shape, int(round(paper)), dtype=np.uint8)
+    result = region.copy()
+    result[targets] = background[targets]
+    return result
 def _physical_cell_has_visible_text_ink(crop: np.ndarray) -> bool:
     """Detect local foreground after removing residual cell-border lines."""
     if crop.size == 0 or min(crop.shape[:2]) < 4:
@@ -41951,6 +42194,60 @@ def _select_ruled_line_consensus(
     return representative, 0.86 if confirmed else 0.77
 
 
+def _ruled_cell_reading_needs_confirmation(
+    readings: list[tuple[str, float]],
+    winner: str,
+) -> bool:
+    """这一格的最终读法有没有"证据不足"的硬伤，必须人工确认。
+
+    真实翻拍照片上确认过的两个静默错误：真值 ``55`` 被读成 ``552``、真值 ``91``
+    被读成 ``912``。两者的根因都是 ``_merge_truncated_reading_groups`` ——
+    它把"被截短的读法"并进"更完整的超集版本"，理由是"丢字没有独立证据能证明
+    完整版本是错的"。这个规则在低分辨率下能救回 ``序号→号``、``4598->45`` 这类
+    真丢字；但在"背面透印残留被读成多一个字符"这个方向上，它会把**票数更多**的
+    短读法并进**票数更少**的长读法，于是共识反过来选了少数票的错值，而置信度
+    还固定写 0.86 ⇒ 低置信标黄永远不会触发 ⇒ 错值静默导出。
+
+    另一类：几个模型读法不一致、且胜出读法自己的分数也很低（实测 0.797）。
+    这类格子在机器负载变化时会在两个读法之间摇摆 —— OpenVINO 多线程的浮点归约
+    顺序受调度影响，边界分数就会翻转，也就是"同样的照片两次跑结果不同"。
+
+    判据（两条任一成立就要人工确认）：
+
+    ① 胜出读法**没有拿到严格多数票** —— 共识把证据权重反转了；
+    ② 存在分歧，且胜出读法自己的最低分 < 0.80 —— 胜出这件事本身就没把握。
+
+    刻意**不**做的事：不用"字符数 vs 墨迹块数"这类像素启发式。多出来的字符
+    往往确实对应真实墨迹（背面透印的残留），连通域计数抓不到；而数字粘连又会
+    误报。实测（两张真实翻拍照片、198 格）：该判据命中 2 个错值格、误伤 1 个
+    正确格（误伤率 0.5%），而"只按像素残留"和"只按最低分"两种做法要么抓不到
+    错值、要么误伤 6% 以上的正确格。
+    """
+    votes: dict[str, int] = {}
+    scores: dict[str, list[float]] = {}
+    for text, score in readings:
+        key = _comparable_text(str(text))
+        if not key:
+            continue
+        votes[key] = votes.get(key, 0) + 1
+        scores.setdefault(key, []).append(float(score))
+    if len(votes) <= 1:
+        return False
+    winner_key = _comparable_text(str(winner))
+    if not winner_key:
+        return False
+    if not re.search(r"[0-9A-Za-z\u3400-\u9fff]", str(winner)):
+        # 纯符号格（表格横线、勾选框、分隔符）模型读不出是正常的 ——
+        # 三个模型在这种格上会读出 '207' / 'ST' / '' 这种完全不相干的东西
+        # （实测 PF-00001 里 7 个横线格全部如此）。拿它们当"证据不足"会把
+        # 整张表标黄一大片。符号格另有 _repair_* 从像素证据处理。
+        return False
+    if votes.get(winner_key, 0) < max(votes.values()):
+        # 共识选出来的读法票数不是最多 ⇒ 证据权重被反转了。
+        return True
+    return min(scores.get(winner_key, [1.0])) < 0.80
+
+
 def _select_ruled_family_consensus(
     families: list[list[tuple[str, float]]],
 ) -> tuple[str, float]:
@@ -42170,6 +42467,48 @@ def _column_letter_leading_ratio(grid: list[list[str]], column: int) -> float:
 _dual_model_corroborated: set[tuple[int, int]] = set()
 
 
+def _confidence_at(
+    confidence_grid: list[list[float]] | None,
+    row: int,
+    column: int,
+    default: float = 0.0,
+) -> float:
+    """读置信度；越界/非数值返回 default。
+
+    ⚠ ``grid`` 与 ``confidence_grid`` 的**形状不一定一致**：有些路径裁掉了
+    置信度网格里的部分行/列，grid 仍是完整的那一份。直接 ``confidence_grid[row][column]``
+    会抛 IndexError —— 2026-11-05 实测真实照片
+    ``03-外网真实图片\\WC-055-File-United-States-Department-of-Agricul.jpg``
+    就在 ``_guard_unresolved_ascii_ambiguities`` 里崩掉（IndexError: list index
+    out of range），整次识别直接失败而不是降级。
+    """
+    if confidence_grid is None or row < 0 or row >= len(confidence_grid):
+        return default
+    line = confidence_grid[row]
+    if column < 0 or column >= len(line):
+        return default
+    try:
+        return float(line[column])
+    except (TypeError, ValueError):
+        return default
+
+
+def _write_confidence(
+    confidence_grid: list[list[float]] | None,
+    row: int,
+    column: int,
+    value: float,
+) -> bool:
+    """写置信度；越界返回 False（不抛异常，见 _confidence_at 的说明）。"""
+    if confidence_grid is None or row < 0 or row >= len(confidence_grid):
+        return False
+    line = confidence_grid[row]
+    if column < 0 or column >= len(line):
+        return False
+    line[column] = value
+    return True
+
+
 def _guard_unresolved_ascii_ambiguities(
     grid: list[list[str]], confidence_grid: list[list[float]],
     corroborated: set[tuple[int, int]] | None = None,
@@ -42207,8 +42546,11 @@ def _guard_unresolved_ascii_ambiguities(
                 changed |= candidate != part
             if changed and corrected_parts:
                 values[column] = " ".join(corrected_parts)
-                confidence_grid[row][column] = max(
-                    0.86, float(confidence_grid[row][column])
+                _write_confidence(
+                    confidence_grid,
+                    row,
+                    column,
+                    max(0.86, _confidence_at(confidence_grid, row, column)),
                 )
                 continue
             ambiguous = bool(
@@ -42242,8 +42584,11 @@ def _guard_unresolved_ascii_ambiguities(
                 and ", " not in value
             )
             if ambiguous or timestamp_pair:
-                confidence_grid[row][column] = min(
-                    0.77, float(confidence_grid[row][column])
+                _write_confidence(
+                    confidence_grid,
+                    row,
+                    column,
+                    min(0.77, _confidence_at(confidence_grid, row, column)),
                 )
                 guarded.add((row, column))
     return guarded
@@ -44903,6 +45248,7 @@ def _read_very_wide_latin_lines(
     candidate: Any, ocr_engine: Any,
     line_locations: list[tuple[int, int, int]], line_crops: list[np.ndarray],
     *, group_size: int | None = None,
+    readings_by_cell: dict[tuple[int, int], list[list[tuple[str, float]]]] | None = None,
 ) -> tuple[dict[tuple[int, int], list[tuple[int, str, float]]], list[float]] | None:
     """清晰超宽英文格先全量英语识别，再用独立模型复核风险行。"""
     if (not candidate.source_projection or len(candidate.rows) - 1 < 60
@@ -44988,6 +45334,7 @@ def _read_very_wide_latin_lines(
             first = english[index]
             second = alternate_by_index.get(index)
             checked = small_by_index.get(index)
+            medium_reading: tuple[str, float] | None = None
             variants = list(dict.fromkeys(value[0] for value in (first, second, checked)
                                           if value is not None))
             peer_choice = peer_winner(column, variants)
@@ -45006,11 +45353,18 @@ def _read_very_wide_latin_lines(
                     [enhanced_by_index[index]],
                 )[0]
                 scores.append(medium[1])
+                medium_reading = medium
                 text, confidence = _select_ruled_line_consensus(
                     [first, second, checked, medium]
                 )
             else:
                 return None
+            if readings_by_cell is not None:
+                # 2026-11-04：把这一行用到的各个读法带出去，供分歧兜底判定使用。
+                readings_by_cell.setdefault((row, column), []).append(
+                    [item for item in (first, second, checked, medium_reading)
+                     if item is not None]
+                )
             per_cell.setdefault((row, column), []).append((line_index, text, confidence))
         _write_runtime_trace(
             "route", name="very_wide_latin_selective_proof",
@@ -45086,6 +45440,7 @@ def _recognize_complete_ruled_candidate(
             ]
         if crop.size == 0:
             return None
+        crop = _clean_ruled_cell_crop(crop)
         if _cell_interior_is_smooth_background(crop):
             blank_locations.add((row, column))
             continue
@@ -45099,11 +45454,13 @@ def _recognize_complete_ruled_candidate(
         else:
             lines, positions = cached
         if column == 0 and not left_rule_confirmed and len(lines) > 1:
+            # 2026-11-04：回退分支过去直接用未清理的原裁剪图，框线又被读成字符。
+            cleaned_normal = _clean_ruled_cell_crop(normal_crop)
             normal_positions: list[tuple[int, int]] = []
             normal_lines = _split_low_resolution_ruled_cell_lines(
-                normal_crop, line_positions=normal_positions)
+                cleaned_normal, line_positions=normal_positions)
             if (len(normal_lines) == 1
-                    and _physical_cell_has_visible_text_ink(normal_crop)):
+                    and _physical_cell_has_visible_text_ink(cleaned_normal)):
                 lines, positions = normal_lines, normal_positions
         if len(positions) == len(lines):
             blank_lines.update({(row, column, index): count
@@ -45135,6 +45492,29 @@ def _recognize_complete_ruled_candidate(
         return [(re.sub(r"(?<=[A-Za-z0-9²³])\|$", "", text), score)
                 for text, score in _read_unique_line_views(
                     label, recognizer, line_crops, group_size=line_group_size)]
+
+    # 2026-11-04：模型分歧兜底用的两个容器。
+    # `model_readings_by_cell` 存每一行三个模型的原始读法（与共识用的是同一组），
+    # `minority_cells` 存"共识把证据权重反转了 / 胜出读法没把握"的格子。
+    # 两者都在 finalize 之前声明，因为 finalize 可能先于它们的计算被调用
+    # （_read_very_wide_latin_lines 分支），那时它们是空的 → 不产生任何标记。
+    model_readings_by_cell: dict[tuple[int, int], list[list[tuple[str, float]]]] = {}
+    minority_cells: set[tuple[int, int]] = set()
+
+    def _collect_minority_cells(per_cell: dict[tuple[int, int], Any]) -> None:
+        """把"共识把证据权重反转了 / 胜出读法没把握"的格子记进 minority_cells。"""
+        for (row, column), per_line in per_cell.items():
+            readings = model_readings_by_cell.get((row, column))
+            if not readings:
+                continue
+            winner_by_line = {item[0]: item[1] for item in per_line}
+            for index, line_readings in enumerate(readings):
+                winner = winner_by_line.get(index)
+                if winner is None:
+                    continue
+                if _ruled_cell_reading_needs_confirmation(line_readings, winner):
+                    minority_cells.add((row, column))
+                    break
 
     def finalize(per_cell, scores, engine_name):
         grid = [[""] * column_count for _ in range(row_count)]
@@ -45547,6 +45927,14 @@ def _recognize_complete_ruled_candidate(
             dict(source_quality) if candidate.image is source_image
             else pipeline.assess_image_quality(candidate.image)
         )
+        # 2026-11-04：把兜底判定出来的"证据不足"格子降到 -1（结构不可信哨兵）。
+        # -1 会让 _cell_requires_human_confirmation 判 True ⇒ 进 review_locations
+        # ⇒ 界面标黄 + 禁止当作已验证结果导出。必须放在所有 _repair_* 之后：
+        # 那些修复会把置信度重新抬回 0.86。
+        for row, column in minority_cells:
+            if 0 <= row < row_count and 0 <= column < column_count:
+                if str(grid[row][column]).strip():
+                    confidence_grid[row][column] = -1.0
         review_locations = [
             (row, column)
             for row in range(row_count)
@@ -45570,6 +45958,12 @@ def _recognize_complete_ruled_candidate(
                 preview += f" 等 {len(review_locations)} 格"
             reasons.append(
                 f"存在尚未人工确认的黄色单元格（{preview}），禁止作为已验证结果直接导出。"
+            )
+        if minority_cells:
+            notices.append(
+                "有 %d 格的多模型读法不一致（共识结果没有得到多数模型支持，或胜出读法"
+                "置信度偏低），已标黄，请逐格对照原图确认。"
+                % len(minority_cells)
             )
         if unconfirmed_locations:
             preview = "、".join(
@@ -45647,9 +46041,11 @@ def _recognize_complete_ruled_candidate(
     wide_reading = _read_very_wide_latin_lines(
         candidate, ocr_engine, line_locations, line_crops,
         group_size=line_group_size,
+        readings_by_cell=model_readings_by_cell,
     )
     if wide_reading is not None:
         wide_cells, wide_scores = wide_reading
+        _collect_minority_cells(wide_cells)
         return finalize(
             wide_cells, wide_scores,
             "PP-OCRv5 English + selective PP-OCRv6 Small/Medium",
@@ -45791,6 +46187,14 @@ def _recognize_complete_ruled_candidate(
                 if text and (confidence < .78 or near):
                     still_uncertain.append(index)
             uncertain_indices = still_uncertain
+
+    # 2026-11-04：把每一行三个模型的**原始读法**存下来（与共识用的是同一组），
+    # 供后面的分歧兜底判定使用。放在 use_english 分支之后 —— 那一步会把
+    # `medium` 换成英文模型的读法，提前存就存到旧值了。
+    model_readings_by_cell.clear()
+    for index, location in enumerate(line_locations):
+        model_readings_by_cell.setdefault(location[:2], []).append(
+            [small[index], medium[index], mobile[index]])
 
     # Re-read only unresolved lines through two deterministic image views.
     # This expands evidence for clipped/faint glyphs without weakening the
@@ -45965,6 +46369,10 @@ def _recognize_complete_ruled_candidate(
     _repair_code_zero_o_from_pixels(
         per_cell, line_locations, line_crops, mobile_recognizer
     )
+    # 2026-11-04：模型分歧兜底 —— 共识把证据权重反转了（胜出读法没拿到多数票），
+    # 或者胜出读法自己的分数就很低，这两种格子一律标成"待人工确认"，
+    # 杜绝错值以 0.86 的"双模型一致确认"置信度静默导出。
+    _collect_minority_cells(per_cell)
     native_case_locations = []
     native_case_crops = []
     for index, (row, column, line_index) in enumerate(line_locations):
@@ -59323,9 +59731,11 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                     duplicate_rows,
                     ocr_engine,
                 )
-                if budget.elapsed() <= 19.0
+                if _recovery_time_gate_open(budget, 19.0)
                 else (set(), [])
             )
+            if not _recovery_time_gate_open(budget, 19.0):
+                _note_skipped_recovery(processing_notices, "补读可见漏格", 19.0)
             scores.extend(repeated_blank_scores)
             if repeated_blank_recoveries:
                 locations = "、".join(
@@ -61071,7 +61481,18 @@ def _trim_grid_to_populated_extent(
             {
                 **cell,
                 "text": str(cell.get("text", "")),
-                "confidence": float(confidence_grid[row_index][column_index]),
+                # ⚠ 2026-11-05：这里原来写的是 confidence_grid 的**原始值**，
+                # 绕过了 build_result 的钳位。而 confidence_grid 里存着 -1.0
+                # （"结构不可信"哨兵）⇒ 一旦结果被裁剪过（trimmed_any 为真），
+                # 负置信度就会**原样发布**出去：
+                #   * 公开 SDK 的 confidence < 0.0 校验 ⇒ 判成"非法响应"；
+                #   * GUI 的协议边界（tabledata.cpp 的 confidence < 0.0 整表拒收）
+                #     ⇒ 用户看到的是"识别失败"，整张表都丢了。
+                # 契约规定 confidence ∈ [0,1]，"要人工确认"由 needs_review 表达
+                # —— 那一格在 build_result 里已经置真了，钳位不会丢信息。
+                "confidence": max(
+                    0.0, min(1.0, float(confidence_grid[row_index][column_index]))
+                ),
             }
             if isinstance(cell, dict)
             else cell
@@ -63251,6 +63672,67 @@ def main() -> int:
         print(_json_line(response, request), flush=True)
         return 1
 
+
+
+# === 2026-11-05 小数还原：全路径后处理（lead）===
+# 实测 `_apply_consistency_checks` 只在 `_recognize` 的某一条分支里调用，
+# 走 complete-ruled / screen / 文本栅格等其它路径时**根本不执行**（FC-00011 实测 0 次调用），
+# 于是"小数点被吞掉"这类 1000 倍数量级错会漏到导出。这里在所有路径的**统一出口**补一刀：
+# `_recognize` 返回后，用同一套列一致性判据复核整表。幂等、可安全重复执行。
+def _finalize_decimal_restore(result):
+    if not isinstance(result, dict):
+        return result
+    cells = result.get("cells")
+    if not isinstance(cells, list) or len(cells) < 4:
+        return result
+    grid = [[str(cell.get("text", "")) if isinstance(cell, dict) else str(cell) for cell in row]
+            for row in cells]
+    if not grid or not grid[0]:
+        return result
+    width = min(len(row) for row in grid)
+    if width != max(len(row) for row in grid):
+        return result
+    confidence = [[(float(row[column].get("confidence", 0.0))
+                   if isinstance(row[column], dict) else 0.0) for column in range(width)]
+                  for row in grid]
+    changed = _restore_dropped_decimal_separator(grid, confidence)
+    if not changed:
+        return result
+    for row, column in changed:
+        cell = cells[row][column]
+        if isinstance(cell, dict):
+            cell["text"] = grid[row][column]
+            cell["confidence"] = float(confidence[row][column])
+    notices = result.setdefault("processing_notices", [])
+    if isinstance(notices, list):
+        locations = "、".join("R%dC%d" % (row + 1, column + 1) for row, column in sorted(changed))
+        notices.append(
+            "已按同列小数位一致证据补回丢失的小数点（%s），相关单元格置信度已下调。" % locations
+        )
+    return result
+
+
+if not globals().get("_LEAD_DECIMAL_WRAPPED"):
+    _LEAD_RECOGNIZE_INNER = _recognize
+
+    def _lead_decimal_restore_wrapper(request):
+        """识别出口统一补回被吞掉的小数点（幂等，可安全重复执行）。"""
+        return _finalize_decimal_restore(_LEAD_RECOGNIZE_INNER(request))
+
+    # 这里用**赋值**覆盖入口，而不是再 `def _recognize` 一遍：
+    # 源码级护栏（backend/tests/test_recognition_guard_ast.py 的 _FUNCTIONS、
+    # test_recognition_guard_runtime.py 的同名表、test_backend.py 的
+    # inspect.getsource）都按**函数名**定位 `_recognize`，同名后定义会覆盖前定义
+    # —— 一旦这里再 def 一次 _recognize，护栏看到的就是这个几行包装器而不是真正
+    # 的实现体（2026-11-05 实测：14 个护栏用例变红，含"模糊告警文案不见了"
+    # "找不到 ruled_cell_count 的链式比较"这类误报）。
+    # __wrapped__ 让 inspect.getsource 能穿透回真正的实现体。
+    _lead_decimal_restore_wrapper.__wrapped__ = _LEAD_RECOGNIZE_INNER
+    _lead_decimal_restore_wrapper.__name__ = "_recognize"
+    _lead_decimal_restore_wrapper.__qualname__ = "_recognize"
+    _recognize = _lead_decimal_restore_wrapper
+
+    _LEAD_DECIMAL_WRAPPED = True
 
 if __name__ == "__main__":
     raise SystemExit(main())
