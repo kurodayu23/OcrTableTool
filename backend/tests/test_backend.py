@@ -3511,6 +3511,8 @@ class TablePipelineTests(unittest.TestCase):
                 ocr_backend._require_recognition_memory_headroom(),
                 "normal",
             )
+            # 2026-11-07（lead 回退）：批大小改动会改变识别输出（FC-00010 表头行丢失、
+            # hard 0.738 → 0.000），是识别语义的一部分，必须保持 16。
             self.assertEqual(ocr_backend._MEDIUM_RECOGNITION_BATCH_SIZE, 16)
 
     def test_low_memory_threshold_scales_with_device_memory(self):
@@ -3536,6 +3538,34 @@ class TablePipelineTests(unittest.TestCase):
         self.assertLess(threshold, 4 * gibibyte)
         self.assertGreater(threshold, 1755 * 1024 * 1024)
 
+    def test_low_memory_hysteresis_band_exceeds_mode_footprint(self):
+        """迟滞带必须大于两档自身的驻留差，否则会自激横跳。
+
+        2026-11-06（lead 复查）：实测 normal 档私有峰值 ~1589 MB、low 档 ~791 MB，
+        差约 800 MB。旧迟滞带只有 512 MB < 800 MB ⇒ 降档释放的 800 MB 立刻把可用
+        内存推过「阈值+512 MB」，下一例又升回正常档、重建全部模型，然后又被压回；
+        实测 16 个请求翻转 6 次，同图 15.9 s ↔ 42.3 s。
+        这里用**固定的可用内存序列**锁住黏性：跨过阈值但没超过阈值+迟滞带时不得升档。
+        """
+        GB = 1024 ** 3
+        original = ocr_backend._available_memory_bytes
+        original_mode = ocr_backend._ACTIVE_RECOGNITION_MEMORY_MODE
+        threshold = ocr_backend._low_memory_threshold_bytes()
+        # 迟滞带必须覆盖档位占用差（800 MB 以上）
+        self.assertGreaterEqual(ocr_backend._low_memory_release_margin_bytes(), 800 * 1024 ** 2)
+        # 降档后可用内存涨到「阈值 + 迟滞带的一半」时，必须仍然留在低档
+        just_below_release = threshold + ocr_backend._low_memory_release_margin_bytes() // 2
+        try:
+            ocr_backend._configure_recognition_memory_mode(True)
+            ocr_backend._available_memory_bytes = lambda: (just_below_release, just_below_release)
+            self.assertEqual("low_memory", ocr_backend._require_recognition_memory_headroom())
+            # 超过「阈值 + 迟滞带」才允许升回正常档
+            above_release = threshold + ocr_backend._low_memory_release_margin_bytes() + GB // 4
+            ocr_backend._available_memory_bytes = lambda: (above_release, above_release)
+            self.assertEqual("normal", ocr_backend._require_recognition_memory_headroom())
+        finally:
+            ocr_backend._available_memory_bytes = original
+            ocr_backend._configure_recognition_memory_mode(original_mode == "low_memory")
     def test_low_memory_threshold_honours_field_override(self):
         with patch.dict(os.environ, {"OCRTABLE_LOW_MEMORY_THRESHOLD_MB": "1536"}):
             self.assertEqual(
@@ -27766,6 +27796,9 @@ class TablePipelineTests(unittest.TestCase):
         # Crop batches are memory-bounded for the target device.  This does not
         # remove any model or recognition view; it only amortizes OpenVINO
         # scheduling while keeping width-sorted batches bounded.
+        #
+        # 2026-11-07（lead 回退）：批大小会改变识别输出（FC-00010 表头行丢失），
+        # 必须保持 16 —— 提速不能拿精度换。
         self.assertEqual(parameters["Rec.rec_batch_num"], 16)
         self.assertEqual(server_parameters["Rec.rec_batch_num"], 8)
         self.assertEqual(parameters["EngineConfig.openvino.inference_num_threads"], 6)

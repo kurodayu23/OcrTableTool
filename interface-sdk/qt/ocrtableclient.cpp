@@ -1048,10 +1048,18 @@ bool OcrTableClient::validateRecognitionResponse(const QJsonObject &response,
                 const QJsonValue confidence = cell.value(QStringLiteral("confidence"));
                 const QJsonValue needsReview = cell.value(QStringLiteral("needs_review"));
                 const double confidenceValue = confidence.toDouble(-1.0);
+                // 2026-11-05（lead 复查）：后端把"这一格不可信"编码成负的 confidence
+                // （-1.0 锚点格 / -2.0 判定为空），并同时置 needs_review=true。
+                // 这里原来一刀 `confidenceValue < 0.0` 就判非法字段 ⇒ 整份响应不可发布，
+                // 而客户其实拿到了一张完全可用的表（只是有几格要人工确认）。
+                // 现在把 -2.0 ~ 0.0 当"复核哨兵"接受；比 -2.0 更负、NaN/Inf、类型错照旧判非法。
+                const bool negativeReviewSentinel = qIsFinite(confidenceValue)
+                    && confidenceValue < 0.0
+                    && confidenceValue >= -2.0;
                 if (!text.isString()
                     || !confidence.isDouble()
                     || !qIsFinite(confidenceValue)
-                    || confidenceValue < 0.0
+                    || (confidenceValue < 0.0 && !negativeReviewSentinel)
                     || confidenceValue > 1.0
                     || !needsReview.isBool()) {
                     addDetailReason(&details,

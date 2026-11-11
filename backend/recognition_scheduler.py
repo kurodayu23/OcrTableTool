@@ -9,6 +9,33 @@ from queue import Empty, Full, Queue
 from typing import Any
 
 
+# 2026-11-06（lead 复查，内存增长 P1）：已创建识别器包装器的登记表。
+# 目的是让上层能在**请求收尾**时查询"这次进程里已经见过多少个不同输入几何"，
+# 据此决定是否释放 OpenVINO 的原生激活缓冲（动态形状模型按几何各留一份）。
+_SCHEDULER_REGISTRY: list[Any] = []
+
+
+def native_shape_pressure() -> int:
+    """当前进程里累计出现过的不同输入几何数量（原生激活缓冲的代理指标）。"""
+    total = 0
+    for scheduler in _SCHEDULER_REGISTRY:
+        counter = getattr(scheduler, "distinct_shape_count", None)
+        if callable(counter):
+            try:
+                total += int(counter())
+            except (TypeError, ValueError):
+                continue
+    return total
+
+
+def reset_native_shape_pressure() -> None:
+    """释放原生缓冲后清零计数，让下一轮从"这次释放之后新增了多少几何"重新计。"""
+    for scheduler in _SCHEDULER_REGISTRY:
+        shapes = getattr(scheduler, "_distinct_shapes", None)
+        if isinstance(shapes, set):
+            shapes.clear()
+
+
 class _MemoryStatus(ctypes.Structure):
     _fields_ = [
         ("length", ctypes.c_ulong),
@@ -90,6 +117,14 @@ class ParallelTextRecognizer:
         # 2026-10-30（lead 复查 P2）：等待请求池的超时上限。单批推理耗时是秒级，
         # 30 秒还拿不到 InferRequest 就一定是记账漂移，必须明确失败而不是挂死。
         self._request_wait_timeout = 30.0
+        # 2026-11-06（lead 复查，内存增长 P1）：OpenVINO CPU 插件对**动态形状**识别模型
+        # （`x[?,3,48,?]`）按**每个不同输入几何**各留一份激活缓冲，直到编译模型被释放。
+        # 实测：固定 crop 形状跑 12 轮 RSS 完全平（468→469 MB）；每轮换新形状 +8 MB/轮；
+        # 单个新几何 (16,3,48,640) 就 +152 MB、(16,3,48,1280) +297 MB；同形状重跑只 +0.2 MB。
+        # 每张表宽度都不同 ⇒ 几何不断新增 ⇒ RSS 无平台期（13 例 851→1356 MB）。
+        # 这里**只计数**（不改变推理），供请求收尾时决定要不要释放原生缓冲。
+        self._distinct_shapes: set[tuple[int, ...]] = set()
+        _SCHEDULER_REGISTRY.append(self)
         self._executor = ThreadPoolExecutor(
             max_workers=self.request_count,
             thread_name_prefix="ocr-recognition",
@@ -123,7 +158,12 @@ class ParallelTextRecognizer:
             "parallel_calls": self._parallel_calls,
             "serial_calls": self._serial_calls,
             "original_batches": self._original_batches,
+            "distinct_input_shapes": len(self._distinct_shapes),
         }
+
+    def distinct_shape_count(self) -> int:
+        """本次进程里已经出现过的**不同输入几何**数量（原生激活缓冲的代理指标）。"""
+        return len(self._distinct_shapes)
 
     def reset_execution_profile(self) -> None:
         self._parallel_calls = 0
@@ -186,6 +226,13 @@ class ParallelTextRecognizer:
             for index in image_indices
         ]
         input_tensor = np.concatenate(normalized).astype(np.float32)
+        # 2026-11-06（lead 复查，内存增长 P1）：记录本次输入的几何形状。
+        # OpenVINO CPU 插件对动态形状模型按几何各留一份激活缓冲，几何越多占得越多。
+        # 这里只记账，不改变任何推理行为。
+        try:
+            self._distinct_shapes.add(tuple(int(value) for value in input_tensor.shape))
+        except (AttributeError, TypeError, ValueError):
+            pass
         # 2026-10-30（lead 复查 P2）：`get()` 原来没有超时 —— 只要请求池的记账出现
         # 任何漂移（例如扩容竞态、异常路径少还一次），这里就**永久阻塞**，而 60 秒
         # 墙钟是协作式检查点、只在阶段边界触发，救不了阻塞在队列上的调用

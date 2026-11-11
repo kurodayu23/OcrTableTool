@@ -128,6 +128,18 @@ stderr : 日志，不属于协议
 只在真的内存分配失败（原生 OOM / `MemoryError`）时出现。阈值可用环境变量
 `OCRTABLE_LOW_MEMORY_THRESHOLD_MB` 现场标定。
 
+### 4.0 识别失败的兜底契约（2026-11-07 新增）
+
+**识别失败不再返回 error，一定返回 `status="ok"` 的结果。**
+
+| 触发 | 后端行为 | 客户端应如何判断 |
+|---|---|---|
+| 60 秒预算内未完成 | 关掉墙钟**自动重试一次**（准确优先），成功则返回完整结果 + `degraded=true` + 提示 | `degraded=true` ⇒ 本次比常规慢，可提示"已用更完整方式重算" |
+| 重试仍失败 / 无文字 / 未检出表格 | 返回 1×1 空表，`status="ok"`，全部 `needs_review=true`，`publication_blocked=true` | 看 `degraded=true` + `publication_blocked=true` + `processing_notices` 文案 |
+| 图片不存在 / 无法解码 / 尺寸非法 / 模型缺失 / 请求缺字段 | **仍然返回 error**（输入或安装问题，报错才有行动价值） | 按 §4 错误码处理 |
+
+**导出口径不变**：可自动发布仍要求 §5 五条全部成立；兜底结果一律 `publication_blocked=true`，绝不冒充"这张表就是空的"。
+
 ### 4.1 60 秒墙钟契约（原文档缺失，2026-10-30 补）
 
 - 单次识别有 **60 秒上限**，由后端在若干检查点（解码/几何/结构/逐格复核/发布前恢复）判定；
@@ -158,9 +170,18 @@ stderr : 日志，不属于协议
 | `ocr_backend._trim_grid_to_populated_extent` | 把网格裁到"有内容的最小外接矩形"后重建 cells 时同样钳位到 `[0,1]`，且 **`needs_review` 原样保留**（`*cell` 展开，不丢"要人工确认"的结论） |
 | ⚠ `ocr_backend._handle_request_body` 发布前的最后一个循环 | 把 `cell["confidence"]` 重写成 `confidence_grid` 的**原始值**（不是钳位值）⇒ "合计列位移""物理网格边界不可信"这两条路径上的 `-1.0` 仍可能原样发布 |
 
-> ⚠ 2026-11-05 补：GUI 的协议边界（`src/core/tabledata.cpp`）对 `confidence < 0.0` **整表拒收**，
-> 公开 SDK 也会把 `confidence < 0.0` 判成"非法响应"。
-> ⇒ 消费方**必须自己兜住负值**（按 `needs_review=true` 处理），不能假设后端一定给的是 `[0,1]`。
+> ⚠ 2026-11-05 补：`ocr_backend._handle_request_body` 的最后一个循环会把 `confidence` 重写成
+> `confidence_grid` 的**原始值**，所以线上确实能收到 `-1.0` / `-2.0`。
+> 消费方**必须自己兜住负值**（按 `needs_review=true` 处理），不能假设后端一定给 `[0,1]`。
+>
+> 2026-11-05 晚补（lead 修复）：两个官方客户端现在都能兜住负值了 ——
+> - Qt GUI（`src/core/tabledata.cpp`）：把 `-1.0`/`-2.0` 当"复核哨兵"**接受**，落表夹到
+>   `0.0` 并强制 `needsReview=true`；只有 `<-2.0`、`NaN/Inf`、类型错才拒收。此前是
+>   `confidence < 0.0` **整表拒收**，实测 FC-00024（38 个 `-1.0` 格）客户看到的是空白表。
+> - 公开 SDK（`interface-sdk/qt/ocrtableclient.cpp`）：同样按哨兵接受并夹到 `0.0`。
+>
+> ⇒ 跨版本兼容：老客户端遇到负值仍可能整表/整响应失败，**后端发布层最好钳到 `[0,1]`**；
+> 但语义必须靠 `needs_review` 承载，不能靠负值本身传递。
 
 ### 4.3 `needs_review` 的判定
 

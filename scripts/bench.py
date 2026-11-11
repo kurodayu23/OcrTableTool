@@ -68,30 +68,118 @@ def classify(expected: str, actual: str) -> str:
     return "replaced_text"
 
 
-def exact_rate(resp_cells, truth, row_shift=0, col_shift=0):
-    if not resp_cells or not truth:
+def _concurrent_ocr_processes() -> int:
+    """当前机器上有多少个**其它** OCR 进程在跑（bench/soak）。
+
+    2026-11-09（lead 实测，重要）：并行跑两个 OCR 进程会让形状/行数失真 ——
+    实测 FC-00680 在普查并行期间是 38×11/hard 0.053，单进程跑同一份代码是 41×11（完全正确）。
+    原因是 ocr_backend 有大量请求级模块级全局（_request_started_at / _budget_exhausted /
+    _fine_grained_* 等），两个进程争抢引擎与线程会互相改写。
+    ⇒ 这个函数用来在结果里留下"当时的并发快照"，避免把污染数据当成代码缺陷。
+    """
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' "
+             "-and $_.CommandLine -match 'bench\\.py|_forge_soak' } | Measure-Object).Count"],
+            capture_output=True, text=True, timeout=20)
+        return int((out.stdout or "0").strip() or 0)
+    except Exception:  # noqa: BLE001
+        return -1
+
+
+def _backend_fingerprint() -> str:
+    """被评测后端源码的指纹（ocr_backend.py sha256 前 16 位）。
+
+    2026-11-09（lead）：普查 JSON 必须能证明"这份数据是哪个版本的代码跑出来的"。
+    否则会拿旧数据对新代码做分诊 —— 实测因此对着已修好的缺陷改了三版判据。
+    """
+    import hashlib
+    for candidate in (ROOT / "backend" / "ocr_backend.py",):
+        try:
+            return hashlib.sha256(candidate.read_bytes()).hexdigest()[:16]
+        except OSError:
+            continue
+    return "unknown"
+
+
+def exact_rate(resp_cells, truth, row_shift=0, col_shift=0, strict=False):
+    """逐格一致率。
+
+    `strict=True` 时**分母固定为真值全部格数**：越界（缺行缺列）按错处理。
+    旧口径只统计落在实际形状内的格，缺列整列不进分母 ⇒ 短表天然高分
+    （实测 FC-00023 丢 12 行仍 hard=0.958、FC-00122 丢整列仍 1.000）。
+    """
+    if not truth:
+        return None
+    if not resp_cells and not strict:
         return None
     total = hit = 0
     for r, truth_row in enumerate(truth):
         for c, expected in enumerate(truth_row):
             rr, cc = r + row_shift, c + col_shift
-            if not (0 <= rr < len(resp_cells)) or not (0 <= cc < len(resp_cells[rr])):
+            inside = (0 <= rr < len(resp_cells)) and (0 <= cc < len(resp_cells[rr]))
+            if not inside and not strict:
+                continue
+            total += 1
+            if not inside:
                 continue
             actual = str(resp_cells[rr][cc].get("text", "")).strip()
-            total += 1
             if actual == str(expected).strip():
                 hit += 1
     return (hit / total) if total else None
 
 
-def best_alignment(resp_cells, truth):
+def best_alignment(resp_cells, truth, strict=False):
     best = None
     for row_shift in range(-3, 4):
         for col_shift in range(-2, 3):
-            rate = exact_rate(resp_cells, truth, row_shift, col_shift)
+            rate = exact_rate(resp_cells, truth, row_shift, col_shift, strict=strict)
             if rate is not None and (best is None or rate > best):
                 best = rate
     return best
+
+
+def process_rss_mb():
+    """当前进程 RSS（MB）。优先 psutil，没有就用 Win32 GetProcessMemoryInfo。"""
+    try:
+        import psutil  # noqa: PLC0415
+        return round(psutil.Process().memory_info().rss / (1024 * 1024), 1)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        import ctypes
+        import ctypes.wintypes as wintypes
+
+        class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = PROCESS_MEMORY_COUNTERS()
+        counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
+        # 必须显式声明 argtypes/restype，否则 ctypes 按 int 传递指针/64 位句柄会失败，
+        # 表现为静默返回 0（实测未声明时一直拿不到数值）。
+        function = ctypes.WinDLL("psapi.dll").GetProcessMemoryInfo
+        function.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS),
+                            wintypes.DWORD]
+        function.restype = wintypes.BOOL
+        handle = ctypes.windll.kernel32.GetCurrentProcess()
+        if function(handle, ctypes.byref(counters), counters.cb):
+            return round(counters.WorkingSetSize / (1024 * 1024), 1)
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def main() -> int:
@@ -144,6 +232,9 @@ def main() -> int:
         cells = response.get("cells") or []
         hard = exact_rate(cells, truth) if truth else None
         best = best_alignment(cells, truth) if truth else None
+        hard_strict = exact_rate(cells, truth, strict=True) if truth else None
+        best_strict = best_alignment(cells, truth, strict=True) if truth else None
+        rss_after = process_rss_mb()
         diffs = []
         if truth and cells:
             for r, truth_row in enumerate(truth):
@@ -167,6 +258,10 @@ def main() -> int:
             "degraded": response.get("degraded"), "memory_mode": response.get("memory_mode"),
             "hard": None if hard is None else round(hard, 4),
             "best": None if best is None else round(best, 4),
+            # 严格口径（2026-11-05）：分母固定为真值全部格，缺行缺列按错计
+            "hard_strict": None if hard_strict is None else round(hard_strict, 4),
+            "best_strict": None if best_strict is None else round(best_strict, 4),
+            "rss_mb": rss_after,
             "diffs": diffs,
             # 门禁字段（2026-11-05）：决定这份错数据**能不能流到客户**。
             "publication_blocked": response.get("publication_blocked"),
@@ -215,11 +310,36 @@ def main() -> int:
 
     scored = [row for row in rows if row.get("hard") is not None]
     ok = [row for row in rows if row.get("status") == "ok"]
+    elapsed_values = sorted(row["elapsed"] for row in rows if row.get("elapsed") is not None)
+    rss_values = [row["rss_mb"] for row in rows if row.get("rss_mb")]
+
+    def _percentile(values, fraction):
+        if not values:
+            return None
+        position = min(len(values) - 1, int(round((len(values) - 1) * fraction)))
+        return values[position]
+
+    strict_scored = [row for row in rows if row.get("hard_strict") is not None]
     summary = {
         "tag": args.tag, "backend": args.backend, "count": len(rows),
         "ok": len(ok), "scored": len(scored),
+        "backend_fingerprint": _backend_fingerprint(),
+        "concurrent_ocr_processes": _concurrent_ocr_processes(),
         "mean_hard": round(sum(row["hard"] for row in scored) / len(scored), 4) if scored else None,
         "mean_best": round(sum(row["best"] for row in scored) / len(scored), 4) if scored else None,
+        # 严格口径（2026-11-05）：缺行缺列按错计，不能被"短表占便宜"掩盖
+        "mean_hard_strict": (round(sum(row["hard_strict"] for row in strict_scored) / len(strict_scored), 4)
+                             if strict_scored else None),
+        "mean_best_strict": (round(sum(row["best_strict"] for row in strict_scored) / len(strict_scored), 4)
+                             if strict_scored else None),
+        # 时间/内存红线
+        "elapsed_p50": _percentile(elapsed_values, 0.5),
+        "elapsed_p95": _percentile(elapsed_values, 0.95),
+        "elapsed_max": elapsed_values[-1] if elapsed_values else None,
+        "over_60s": sum(1 for value in elapsed_values if value > 60.0),
+        "rss_max_mb": max(rss_values) if rss_values else None,
+        "rss_first_mb": rss_values[0] if rss_values else None,
+        "rss_last_mb": rss_values[-1] if rss_values else None,
         "degraded": sum(1 for row in rows if row.get("degraded")),
         "errors": Counter(row.get("error") for row in rows if row.get("status") != "ok"),
         "diff_patterns": pattern_counter,
@@ -230,8 +350,12 @@ def main() -> int:
     Path(args.out).write_text(json.dumps(summary, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
     print("\n=== %s 汇总 ===" % args.tag)
     print(json.dumps({key: summary[key] for key in
-                      ("count", "ok", "scored", "mean_hard", "mean_best", "degraded",
-                       "diff_patterns", "structure_issues", "wall_seconds")}, ensure_ascii=False, default=str), flush=True)
+                      ("count", "ok", "scored", "mean_hard", "mean_best",
+                       "mean_hard_strict", "mean_best_strict",
+                       "elapsed_p50", "elapsed_p95", "elapsed_max", "over_60s",
+                       "rss_first_mb", "rss_last_mb", "rss_max_mb",
+                       "degraded", "diff_patterns", "structure_issues", "wall_seconds")},
+                     ensure_ascii=False, default=str), flush=True)
     return 0
 
 

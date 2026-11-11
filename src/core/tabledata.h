@@ -33,6 +33,12 @@ public:
     static TableData fromRows(const QVector<QStringList> &rows);
     static TableData fromBackendJson(const QJsonObject &object, QString *errorMessage = 0);
 
+    // fromBackendJsonLenient 是**兜底解析器**：严格协议校验失败时（status 非 ok、
+    // rows/columns 与实际不符、超出行列上限、单元格字段缺失等），只要 cells 是
+    // 非空二维数组就把内容读出来，**全部单元格标记为待核对**。
+    // 产品策略：扫描到什么就给什么，绝不因契约细节丢掉整张表。
+    static TableData fromBackendJsonLenient(const QJsonObject &object, QString *noticeMessage = 0);
+
     int rowCount() const;
     int columnCount() const;
     QString cell(int row, int column) const;

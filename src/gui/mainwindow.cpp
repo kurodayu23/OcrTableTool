@@ -1509,8 +1509,33 @@ void MainWindow::publishRecognitionResult(const QJsonObject &response)
     m_lastRecognitionFailureDisplay.clear();
     m_lastRecognitionFailureMessage.clear();
     QString error;
-    const TableData table = TableData::fromBackendJson(response, &error);
+    TableData table = TableData::fromBackendJson(response, &error);
     if (!error.isEmpty()) {
+        // 2026-11-10（用户实测反馈）：**绝不因契约细节丢掉整张表**。
+        // 用户要求："任何情况一定要先传出数据出来，不要出现识别失败的情况。"
+        // 严格校验失败时改用宽松解析；只要能读出单元格就降级发布
+        // （全部标黄、禁止认证导出），把已识别的内容完整展示给用户。
+        QString lenientNotice;
+        TableData lenient = TableData::fromBackendJsonLenient(response, &lenientNotice);
+        if (lenient.rowCount() > 0 && lenient.columnCount() > 0) {
+            m_structureCertificate = QJsonObject();
+            m_publicationBlocked = true;
+            m_spans = QJsonArray();
+            showTable(lenient, m_spans);
+            QJsonObject fallbackTrace;
+            fallbackTrace.insert(QStringLiteral("reason"), error);
+            fallbackTrace.insert(QStringLiteral("rows"), lenient.rowCount());
+            fallbackTrace.insert(QStringLiteral("columns"), lenient.columnCount());
+            GuiTrace::write(QStringLiteral("result_published_lenient_fallback"), fallbackTrace);
+            m_lastRecognitionFailureDisplay.clear();
+            m_lastRecognitionFailureMessage.clear();
+            m_recognitionRetryCount = 0;
+            m_recognizeButton->setText(QStringLiteral("重新识别"));
+            m_reviewNotice->setText(lenientNotice);
+            m_statusLabel->setText(
+                QStringLiteral("识别完成（结果未通过完整性校验，已降级展示，请逐格核对）"));
+            return;
+        }
         backendFailed(QStringLiteral("recognize"), error,
                       QStringLiteral("INVALID_RESPONSE"), false);
         return;

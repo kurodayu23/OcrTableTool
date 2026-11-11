@@ -20,6 +20,79 @@ TableData TableData::fromRows(const QVector<QStringList> &rows)
     return table;
 }
 
+// 2026-11-10（用户实测反馈）：严格协议校验失败时**不再丢整表**。
+// 用户明确要求："图片要是有缺陷的话，先传出来再说；任何情况一定要先传出数据出来，
+// 不要出现识别失败的情况。"
+// 本函数只要求 `cells` 是非空二维数组；列数按最长行对齐，缺格补空；
+// 全部单元格标记 needsReview=true（界面标黄、禁止认证导出），但**数据全部可见可导出**。
+// noticeMessage 回填人类可读的降级原因，供界面提示条展示。
+TableData TableData::fromBackendJsonLenient(const QJsonObject &object, QString *noticeMessage)
+{
+    const QJsonValue cellsValue = object.value(QStringLiteral("cells"));
+    if (!cellsValue.isArray()) {
+        if (noticeMessage)
+            *noticeMessage = QStringLiteral("响应里没有表格数据。");
+        return TableData();
+    }
+    const QJsonArray rows = cellsValue.toArray();
+    if (rows.isEmpty()) {
+        if (noticeMessage)
+            *noticeMessage = QStringLiteral("响应里的表格是空的。");
+        return TableData();
+    }
+    // 列数取最长行，保证矩形。
+    int columns = 0;
+    for (int row = 0; row < rows.size(); ++row) {
+        if (rows.at(row).isArray())
+            columns = qMax(columns, rows.at(row).toArray().size());
+    }
+    if (columns <= 0) {
+        if (noticeMessage)
+            *noticeMessage = QStringLiteral("响应里的表格没有可用单元格。");
+        return TableData();
+    }
+    if (columns > 128)
+        columns = 128;
+    int rowCount = rows.size();
+    if (rowCount > 256)
+        rowCount = 256;
+
+    TableData data;
+    data.m_columnCount = columns;   // 矩形存储：每行都有 columns 个单元格
+    data.m_rows.reserve(rowCount);
+    for (int row = 0; row < rowCount; ++row) {
+        const QJsonArray source = rows.at(row).toArray();
+        QVector<TableCell> cells;
+        cells.reserve(columns);
+        for (int column = 0; column < columns; ++column) {
+            QString text;
+            if (column < source.size()) {
+                const QJsonValue value = source.at(column);
+                if (value.isObject()) {
+                    text = value.toObject().value(QStringLiteral("text")).toString();
+                } else if (value.isString()) {
+                    text = value.toString();
+                }
+            }
+            TableCell cell;
+            cell.text = text;
+            cell.confidence = 0.0;
+            cell.needsReview = true;      // 降级发布：全部标黄待核对
+            cell.confidenceSentinel = false;
+            cells.append(cell);
+        }
+        data.m_rows.append(cells);
+    }
+    if (noticeMessage) {
+        *noticeMessage = QStringLiteral(
+            "识别组件返回的结果未通过完整性校验，已按可见内容降级展示（%1 行 × %2 列，"
+            "全部标为待核对）。请逐格核对后再使用。")
+            .arg(data.rowCount())
+            .arg(data.columnCount());
+    }
+    return data;
+}
+
 TableData TableData::fromBackendJson(const QJsonObject &object, QString *errorMessage)
 {
     // Python 响应属于不可信协议输入。任何结构校验失败都返回空表；
@@ -75,10 +148,20 @@ TableData TableData::fromBackendJson(const QJsonObject &object, QString *errorMe
             const QJsonValue confidenceValue = cell.value(QStringLiteral("confidence"));
             const QJsonValue reviewValue = cell.value(QStringLiteral("needs_review"));
             const double confidence = confidenceValue.toDouble(-1.0);
+            // 2026-11-05（lead 复查，数据全部丢失 P0）：后端把"这一格不可信"编码成
+            // **负的 confidence**（-1.0 锚点格 / -2.0 判定为空），并同时置
+            // needs_review=true。而这里原来一刀 `confidence < 0.0` 就整表拒收
+            // ⇒ 客户看到的是一片空白，界面既不显示表也不允许导出。
+            // 实测 FC-00024：38 格 confidence=-1.0，整表被丢弃。
+            // 现在把负值当作"复核哨兵"接受：存进表格时夹到 0.0，并强制标黄；
+            // 真正畸形的读数（NaN/Inf/超界/类型错）仍然照原样拒收。
+            const bool negativeReviewSentinel = qIsFinite(confidence)
+                && confidence < 0.0
+                && confidence >= -2.0;
             if (!textValue.isString()
                 || !confidenceValue.isDouble()
                 || !qIsFinite(confidence)
-                || confidence < 0.0
+                || (confidence < 0.0 && !negativeReviewSentinel)
                 || confidence > 1.0
                 || !reviewValue.isBool()) {
                 return fail(QStringLiteral("识别结果包含无效的单元格字段。"));
@@ -107,8 +190,10 @@ TableData TableData::fromBackendJson(const QJsonObject &object, QString *errorMe
             table.setCell(row,
                           column,
                           textValue.toString(),
-                          confidence,
-                          reviewValue.toBool(),
+                          // 负值是"复核哨兵"，落表时夹到 0.0：既满足 [0,1] 的显示约定，
+                          // 又靠下面的 needsReview=true 让它保持黄色。
+                          negativeReviewSentinel ? 0.0 : confidence,
+                          negativeReviewSentinel ? true : reviewValue.toBool(),
                           confidenceSentinel);
         }
     }

@@ -193,21 +193,26 @@ class RecognitionGuardWiringTest(unittest.TestCase):
             return (lambda _candidate: ocr_result), None
 
         blank = np.full((60, 80, 3), 255, dtype=np.uint8)
-        with self.assertRaises(ValueError):
-            _run_recognize(
-                blank,
-                [
-                    patch.object(table_pipeline, "extract_screen_grid", return_value=None),
-                    patch.object(
-                        table_pipeline,
-                        "prepare_image",
-                        return_value=(blank.copy(), {"detected": False, "mode": "auto"}),
-                    ),
-                    patch.object(table_pipeline, "extract_ruled_grid", return_value=None),
-                    patch.object(ocr_backend, "_screen_grid_is_credible", return_value=False),
-                    patch.object(ocr_backend, "_engines", side_effect=engines_spy),
-                ],
-            )
+        # 2026-11-07（lead，客户要求"绝不报错"）：快路径全部落空时不再抛 ValueError，
+        # 而是返回一张退化的空表（status 仍 ok、全部单元格标黄）。本用例的正题是
+        # **表格模型的加载顺序**，所以这里改成断言"退化结果"，顺序断言保持原样。
+        degraded = _run_recognize(
+            blank,
+            [
+                patch.object(table_pipeline, "extract_screen_grid", return_value=None),
+                patch.object(
+                    table_pipeline,
+                    "prepare_image",
+                    return_value=(blank.copy(), {"detected": False, "mode": "auto"}),
+                ),
+                patch.object(table_pipeline, "extract_ruled_grid", return_value=None),
+                patch.object(ocr_backend, "_screen_grid_is_credible", return_value=False),
+                patch.object(ocr_backend, "_engines", side_effect=engines_spy),
+            ],
+        )
+        self.assertEqual(degraded["status"], "ok", "识别失败也必须交出 status=ok 的结果")
+        self.assertTrue(degraded.get("degraded"), "兜底结果必须标记 degraded=True")
+        self.assertTrue(degraded["publication_blocked"], "兜底结果必须阻断发布")
 
         self.assertIn(
             True,

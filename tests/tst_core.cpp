@@ -188,6 +188,11 @@ private slots:
     void refusesToWriteCsvForEmptyTable();
     void loadsVersionedBackendCells();
     void acceptsSentinelConfidenceCellsInsteadOfRejectingWholeTable();
+    void lenientParserKeepsDataWhenStrictParsingRejects();
+    void lenientParserMarksEveryCellForReview();
+    void lenientParserRejectsMissingCells();
+    void acceptsNegativeReviewSentinelInsteadOfRejectingWholeTable();
+    void stillRejectsBeyondSentinelNegatives();
     void keepsSentinelConfidenceOutOfTheAttentionRule();
     void ignoresWhitespaceOnlyCellsInTheAttentionRule();
     void stillRejectsMalformedCellFields();
@@ -380,6 +385,54 @@ void CoreTests::acceptsSentinelConfidenceCellsInsteadOfRejectingWholeTable()
     // 放行不等于当成已确认：needs_review 保持后端给的值，
     // 显示层再按 confidence<0.78 补黄格。
     QVERIFY(!table.needsReview(0, 1));
+}
+
+void CoreTests::acceptsNegativeReviewSentinelInsteadOfRejectingWholeTable()
+{
+    // 2026-11-05（lead 复查，数据全部丢失 P0）：后端把"这一格不可信"编码成
+    // 负的 confidence（-1.0 锚点格 / -2.0 判定为空），同时置 needs_review=true。
+    // 旧实现见负值就整表拒收，被测用例 FC-00024 的 38 个 -1.0 格导致整表空白。
+    // 现在负值按"复核哨兵"接受：落表夹到 0.0、强制 needsReview=true；
+    // 只有真正畸形的读数（NaN/Inf/超界/类型错）才拒收。
+    const QByteArray json = "{\"protocol\":1,\"status\":\"ok\",\"rows\":1,\"columns\":3,\"cells\":[["
+                            "{\"text\":\"OK-1\",\"confidence\":0.93,\"needs_review\":false},"
+                            "{\"text\":\"UNTRUSTED\",\"confidence\":-1.0,\"needs_review\":true},"
+                            "{\"text\":\"EMPTY-CANDIDATE\",\"confidence\":-2.0,\"needs_review\":true}]]}";
+    const QJsonObject object = QJsonDocument::fromJson(json).object();
+    QVERIFY2(!object.isEmpty(), "test JSON failed to parse");
+
+    QString error;
+    const TableData table = TableData::fromBackendJson(object, &error);
+
+    QVERIFY2(error.isEmpty(), qPrintable(error));
+    QCOMPARE(table.rowCount(), 1);
+    QCOMPARE(table.columnCount(), 3);
+    // 负值格必须留下来，且置信度夹到 0.0（显示层仍按低置信处理）
+    QCOMPARE(table.cell(0, 1), QStringLiteral("UNTRUSTED"));
+    QCOMPARE(table.confidence(0, 1), 0.0);
+    QVERIFY(table.needsReview(0, 1));
+    QVERIFY(table.requiresAttention(0, 1));
+    QCOMPARE(table.cell(0, 2), QStringLiteral("EMPTY-CANDIDATE"));
+    QCOMPARE(table.confidence(0, 2), 0.0);
+    QVERIFY(table.requiresAttention(0, 2));
+    // 正常格不受影响
+    QCOMPARE(table.confidence(0, 0), 0.93);
+    QVERIFY(!table.requiresAttention(0, 0));
+}
+
+void CoreTests::stillRejectsBeyondSentinelNegatives()
+{
+    // 夹取边界：-2.0 是后端定义的最深哨兵；再往下（-3.0）视为畸形读数照旧拒收，
+    // 避免"任何负值都放行"把真正的坏响应也当合法。
+    const QByteArray json = "{\"protocol\":1,\"status\":\"ok\",\"rows\":1,\"columns\":1,\"cells\":[["
+                            "{\"text\":\"BAD\",\"confidence\":-3.0,\"needs_review\":true}]]}";
+    const QJsonObject object = QJsonDocument::fromJson(json).object();
+    QVERIFY2(!object.isEmpty(), "test JSON failed to parse");
+
+    QString error;
+    const TableData table = TableData::fromBackendJson(object, &error);
+    QVERIFY(!error.isEmpty());
+    QCOMPARE(table.rowCount(), 0);
 }
 
 void CoreTests::keepsSentinelConfidenceOutOfTheAttentionRule()
@@ -765,6 +818,68 @@ void CoreTests::prefersProductVenvOverPathSubstringMatch()
     QVERIFY(!BackendLocator::providesProductDependencies(QString()));
 
     QCOMPARE(BackendLocator::findPython(backend, QStringList() << workspace), productPython);
+}
+
+void CoreTests::lenientParserKeepsDataWhenStrictParsingRejects()
+{
+    // 2026-11-10（用户实测反馈）：后端返回的响应未通过严格契约校验时
+    // （这里 status 不是 ok、rows/columns 与实际不符），旧行为是**丢弃整表**、
+    // 界面显示"识别组件返回的结果不完整，本次结果未被采用"。
+    // 用户要求"任何情况一定要先传出数据出来，不要出现识别失败的情况"，
+    // 所以宽松解析器必须把 cells 里的内容完整读出来。
+    const QByteArray json = "{\"protocol\":1,\"status\":\"error\","
+                            "\"rows\":99,\"columns\":99,\"cells\":["
+                            "[{\"text\":\"A1\"},{\"text\":\"55\"}],"
+                            "[{\"text\":\"B2\"},{\"text\":\"91\"}]]}";
+    const QJsonObject object = QJsonDocument::fromJson(json).object();
+    QVERIFY2(!object.isEmpty(), "test JSON failed to parse");
+
+    QString strictError;
+    const TableData strict = TableData::fromBackendJson(object, &strictError);
+    QVERIFY2(!strictError.isEmpty(), "strict parser should reject this payload");
+    QCOMPARE(strict.rowCount(), 0);
+
+    QString notice;
+    const TableData lenient = TableData::fromBackendJsonLenient(object, &notice);
+    QCOMPARE(lenient.rowCount(), 2);
+    QCOMPARE(lenient.columnCount(), 2);
+    QCOMPARE(lenient.cell(0, 0), QStringLiteral("A1"));
+    QCOMPARE(lenient.cell(0, 1), QStringLiteral("55"));
+    QCOMPARE(lenient.cell(1, 1), QStringLiteral("91"));
+    QVERIFY2(!notice.isEmpty(), "notice should explain the downgrade");
+}
+
+void CoreTests::lenientParserMarksEveryCellForReview()
+{
+    // 降级发布的数据必须全部标黄待核对 —— 它能显示、能导出，
+    // 但不允许被当成"已认证"结果。
+    const QByteArray json = "{\"cells\":["
+                            "[{\"text\":\"X\"},{\"text\":\"Y\"}],"
+                            "[{\"text\":\"Z\"},{\"text\":\"W\"}]]}";
+    const QJsonObject object = QJsonDocument::fromJson(json).object();
+    QVERIFY2(!object.isEmpty(), "test JSON failed to parse");
+
+    QString notice;
+    const TableData lenient = TableData::fromBackendJsonLenient(object, &notice);
+    QCOMPARE(lenient.rowCount(), 2);
+    QCOMPARE(lenient.columnCount(), 2);
+    for (int row = 0; row < lenient.rowCount(); ++row)
+        for (int column = 0; column < lenient.columnCount(); ++column)
+            QVERIFY2(lenient.needsReview(row, column),
+                     "lenient cells must all be marked for review");
+}
+
+void CoreTests::lenientParserRejectsMissingCells()
+{
+    // 真的没有表格数据时仍然返回空表（界面给失败提示）。
+    const QByteArray json = "{\"status\":\"error\",\"message\":\"boom\"}";
+    const QJsonObject object = QJsonDocument::fromJson(json).object();
+    QVERIFY2(!object.isEmpty(), "test JSON failed to parse");
+
+    QString notice;
+    const TableData lenient = TableData::fromBackendJsonLenient(object, &notice);
+    QCOMPARE(lenient.rowCount(), 0);
+    QVERIFY2(!notice.isEmpty(), "notice should explain the empty result");
 }
 
 QTEST_MAIN(CoreTests)

@@ -101,6 +101,42 @@ private slots:
         QVERIFY(!reasons.isEmpty());
     }
 
+    void negativeReviewSentinelIsAcceptedButNotPublishable()
+    {
+        // 2026-11-05（lead 复查）：后端把"这一格不可信"编码成 negative confidence
+        // （-1.0 锚点格 / -2.0 判定为空）+ needs_review=true。
+        // 旧实现把这判成"字段非法" ⇒ 整份响应不可用；实测 FC-00024 有 38 个 -1.0 格。
+        // 现在按"复核哨兵"接受（validate 通过），但仍不可自动发布（needs_review=true）。
+        QJsonObject response = validResponse();
+        QJsonArray rows = response.value(QStringLiteral("cells")).toArray();
+        QJsonArray columns = rows.at(0).toArray();
+        QJsonObject cell = columns.at(0).toObject();
+        cell.insert(QStringLiteral("confidence"), -1.0);
+        cell.insert(QStringLiteral("needs_review"), true);
+        columns.replace(0, cell);
+        rows.replace(0, columns);
+        response.insert(QStringLiteral("cells"), rows);
+
+        QStringList reasons;
+        QVERIFY2(OcrTableClient::validateRecognitionResponse(response, &reasons),
+                 qPrintable(reasons.join(QStringLiteral("; "))));
+        QVERIFY(!OcrTableClient::canAutoPublish(response, &reasons));
+
+        // 比 -2.0 更负的读数仍然判非法，避免"任何负值都放行"。
+        QJsonObject broken = validResponse();
+        QJsonArray brokenRows = broken.value(QStringLiteral("cells")).toArray();
+        QJsonArray brokenColumns = brokenRows.at(0).toArray();
+        QJsonObject brokenCell = brokenColumns.at(0).toObject();
+        brokenCell.insert(QStringLiteral("confidence"), -3.0);
+        brokenCell.insert(QStringLiteral("needs_review"), true);
+        brokenColumns.replace(0, brokenCell);
+        brokenRows.replace(0, brokenColumns);
+        broken.insert(QStringLiteral("cells"), brokenRows);
+
+        QStringList brokenReasons;
+        QVERIFY(!OcrTableClient::validateRecognitionResponse(broken, &brokenReasons));
+    }
+
     void unverifiedBlockedResultIsDisplayableButNotPublishable()
     {
         QJsonObject response = validResponse();

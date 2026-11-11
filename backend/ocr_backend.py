@@ -13,6 +13,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import unicodedata
@@ -78,7 +79,15 @@ _LOW_MEMORY_TOTAL_FRACTION = 0.35
 # 阈值时**立即**降档，只有"升回正常档"需要更高的阈值。现场调参用环境变量
 # OCRTABLE_LOW_MEMORY_THRESHOLD_MB（默认仍是 4096），真机上不用重新打包
 # 就能标定阈值。
-_LOW_MEMORY_RELEASE_MARGIN_BYTES = 512 * 1024**2
+#
+# 2026-11-06（lead 复查）：512 MB 的迟滞带**小于两档自身的占用差**，所以它挡不住
+# 自激横跳 —— 实测 normal 档私有内存峰值 ~1589 MB、low 档 ~791 MB，差约 800 MB：
+# 一旦进低档就释放 800 MB，可用内存立刻超过「阈值 + 512 MB」，下一例又升回正常档、
+# 把模型全部重建一遍，然后又被压回低档。实测 16 个请求里翻转 6 次，
+# 同图耗时 15.9 s（normal）↔ 42.3 s（low），RSS 243 ↔ 924 MB。
+# ⇒ 迟滞带必须大于档位差：默认提高到 1.25 GiB（1250 MB > 800 MB 档位差），
+# 并允许现场用 OCRTABLE_LOW_MEMORY_RELEASE_MARGIN_MB 标定。
+_LOW_MEMORY_RELEASE_MARGIN_BYTES = 1280 * 1024**2
 # 最近一次「现场标定环境变量非法」的记录（见 _record_low_memory_threshold_override_error）。
 # 环境变量在请求开始前就被读了（早于 _begin_runtime_trace），所以这里先存住，
 # 等 runtime trace 打开时补写一条 —— 否则非法标定值仍然一条痕都不留。
@@ -150,6 +159,25 @@ def _record_low_memory_threshold_override_error(detail: str) -> None:
         )
         return
     _low_memory_threshold_override_error = detail
+
+
+def _low_memory_release_margin_bytes() -> int:
+    """退出低内存档所需的额外余量（迟滞带宽度）。
+
+    2026-11-06（lead 复查）：默认从 512 MB 提到 1280 MB —— 因为两档自身的驻留差
+    约 800 MB（normal 私有峰值 ~1589 MB，low ~791 MB），迟滞带小于这个差就挡不住
+    「降档释放 800 MB → 超过门槛 → 升档重建模型 → 又被压回」的自激横跳。
+    现场可用 `OCRTABLE_LOW_MEMORY_RELEASE_MARGIN_MB` 标定（真机不用重新打包）。
+    """
+    raw = (os.environ.get("OCRTABLE_LOW_MEMORY_RELEASE_MARGIN_MB", "") or "").strip()
+    if raw:
+        try:
+            value = int(float(raw))
+            if value > 0:
+                return value * 1024**2
+        except (TypeError, ValueError):
+            pass
+    return _LOW_MEMORY_RELEASE_MARGIN_BYTES
 
 
 def _low_memory_threshold_bytes() -> int:
@@ -565,7 +593,7 @@ def _require_recognition_memory_headroom() -> str:
         return "normal"
     available_physical, available_page_file = available
     threshold = _low_memory_threshold_bytes()
-    release_threshold = threshold + _LOW_MEMORY_RELEASE_MARGIN_BYTES
+    release_threshold = threshold + _low_memory_release_margin_bytes()
     if _ACTIVE_RECOGNITION_MEMORY_MODE == "low_memory":
         # 已在低档：要用更高的阈值才升回正常档（迟滞带）。
         low_memory = not (
@@ -842,6 +870,10 @@ _FINE_GRAINED_RECOGNITION_MODELS = ("medium", "v6-medium-alternate", "v6-small")
 # 本该 12~20 秒跑完的表会在 21 秒就触发前瞻估算被拒（2 路实测误伤 3.2% 的
 # 高准确率表）。所以批量验收要用环境变量 OCRTABLE_BUDGET_DISABLED=1 关闭
 # 硬预算，拿完整的准确率数据；耗时与内存的交付口径一律用单路复测。
+# 2026-11-06（客户要求：准确优先、慢一点可以）：**判定线仍是 60 秒**（对外契约不变），
+# 但预算超限不再变成报错 —— 出口会按「准确优先」关掉墙钟**重试一次**
+# （见 `_lead_decimal_restore_wrapper`），客户拿到的是完整结果，只是慢一点。
+# 实测 Excel 截图族关墙钟约 65 s，重试路径正好覆盖它们。
 _MAX_REQUEST_SECONDS = 60.0
 # 单条 JSONL 请求的字节上限（2026-10-30）。协议一次请求一行，正常请求（含
 # spans/cells 的 export_xlsx）远小于 16 MiB；没有上限时一个不含换行的巨型输入
@@ -908,8 +940,37 @@ _fine_grained_seconds = 0.0
 _outer_recognition_seconds = 0.0
 _outer_recognition_images = 0
 
+# ==========================================================================
+# 超时降级（2026-11-05，perf-review §C-4）
+#
+# 旧行为：预算耗尽 = **整张表丢掉**，只给用户一句"表格结构过于复杂或存在干扰
+# 网格"。真实照片全扫 607 张里有 200 张是这个结局；2026-11-05 空闲条件复测
+# 11 张里 8 张也是同一个原因。用户拿不到任何表格，也无法对照原图补。
+#
+# 新行为：预算耗尽**不再中断整次识别**，而是把"没复核完"的格子标黄
+# （confidence = -1.0 ⇒ needs_review ⇒ 界面黄点 + 禁止直接导出），
+# 已复核的部分照常交付。前提是**结构已经可信**：结构不可信（没认出表格）
+# 时仍然整单失败，因为那时根本不存在"已识别部分"。
+# ==========================================================================
+
+# 本次识别是否已经因**墙钟预算耗尽**而无法再跑模型。
+_budget_exhausted = False
+# 预算耗尽时正在跑的模型名与原因，写进 runtime trace 与用户可见的说明里。
+_budget_exhausted_model = ""
+_budget_exhausted_reason = ""
+
+# 因预算耗尽而**没复核成功**的格子（超时降级用）。
+# 这些格子置 confidence = -1.0 ⇒ needs_review ⇒ 界面标黄 + 禁止直接导出。
+_budget_degraded_cells: set[tuple[int, int]] = set()
+
+# 同一次识别里，因**墙钟预算耗尽**而没能完成独立复核的数字格数量。
+# 这类格按既有约定**留空**（不给未验证的读数），统计值只用于给用户一条说明。
+_budget_degraded_components = 0
+
 
 def _begin_request_budget() -> None:
+    global _budget_exhausted, _budget_exhausted_model, _budget_exhausted_reason
+    global _budget_degraded_cells, _budget_degraded_components
     global _request_started_at, _fine_grained_seconds, _fine_grained_images
     global _request_budget_seconds
     global _outer_recognition_seconds, _outer_recognition_images
@@ -917,7 +978,18 @@ def _begin_request_budget() -> None:
     global _request_active
     global _GEOMETRY_SEARCH_TRUNCATED
     global _REQUEST_MEMORY_MODE
+    # 每次请求重新开始：上一张图把预算用光，不能让下一张图直接降级。
+    _budget_exhausted = False
+    _budget_exhausted_model = ""
+    _budget_exhausted_reason = ""
+    _budget_degraded_cells.clear()
+    _budget_degraded_components = 0
     _request_started_at = time.perf_counter()
+    # 2026-11-09：绝对起点 + 绝对截止 —— 重试重置 `_request_started_at` 也不影响它们
+    globals()["_request_absolute_started_at"] = _request_started_at
+    globals()["_request_absolute_deadline_at"] = (
+        _request_started_at + _retry_ceiling_seconds()
+    )
     _request_active = True
     _request_budget_seconds = _MAX_REQUEST_SECONDS
     _GEOMETRY_SEARCH_TRUNCATED = False
@@ -993,6 +1065,43 @@ def _record_recognition_call(
     )
 
 
+def _degraded_recognition_output() -> Any:
+    """预算耗尽时给调用方的"空但形状正确"的识别结果。
+
+    后端有三百多处直接按序列用 txts/scores/boxes，返回 None 会让
+    "TypeError: 'NoneType' object is not iterable" 这种崩溃在**降级路径**上
+    重新出现（_normalize_recognition_output 的注释里记的就是这个历史故障）。
+    所以这里给一个标准形状的空结果：0 行 0 列。
+    """
+    try:
+        boxes = np.zeros((0, 4), dtype=np.float32)
+    except (NameError, AttributeError, TypeError):
+        boxes = []
+    return SimpleNamespace(txts=[], scores=[], imgs=None, boxes=boxes)
+
+
+def _note_budget_exhausted(model_name: str, batch_size: int, reason: str) -> None:
+    """登记"本次识别已无预算可用"，并把原因写进 runtime trace。"""
+    global _budget_exhausted, _budget_exhausted_model, _budget_exhausted_reason
+    if not _budget_exhausted:
+        _budget_exhausted = True
+        _budget_exhausted_model = model_name
+        _budget_exhausted_reason = reason
+    _write_runtime_trace(
+        "route",
+        name="recognition_budget_degraded",
+        force_flush=True,
+        model=model_name,
+        images=batch_size,
+        reason=reason,
+        spent_seconds=round(
+            (time.perf_counter() - _request_started_at) if _request_started_at else 0.0,
+            3,
+        ),
+        limit_seconds=round(_effective_request_limit_seconds(), 3),
+    )
+
+
 def _timed_recognition_call(
     model_name: str,
     recognizer: Any,
@@ -1002,7 +1111,17 @@ def _timed_recognition_call(
     batch_size = _recognition_batch_size(args, kwargs)
     fine_grained = model_name in _FINE_GRAINED_RECOGNITION_MODELS
     if _budget_enabled:
-        _enforce_request_budget(model_name, batch_size, fine_grained)
+        if _budget_exhausted:
+            # 预算已经耗尽：再跑模型只是白烧时间，跑出来的读数也没人复核。
+            # 给空结果，让上层把"没复核的格"标黄。
+            return _degraded_recognition_output()
+        try:
+            _enforce_request_budget(model_name, batch_size, fine_grained)
+        except _FineGrainedBudgetExceeded as exc:
+            # 2026-11-05：这里原本把异常抛出去 = 整张表丢掉。改成登记降级，
+            # 由上层把没复核的格子标黄后照常交付。
+            _note_budget_exhausted(model_name, batch_size, str(exc))
+            return _degraded_recognition_output()
     # A model call can block for minutes on a dense table. Publish the start
     # event immediately so the external monitor shows the real active stage.
     _write_runtime_trace(
@@ -1017,6 +1136,10 @@ def _timed_recognition_call(
     status = "ok"
     try:
         return _normalize_recognition_output(recognizer(*args, **kwargs))
+    except _FineGrainedBudgetExceeded as exc:
+        status = "budget_degraded"
+        _note_budget_exhausted(model_name, batch_size, str(exc))
+        return _degraded_recognition_output()
     except Exception:
         status = "error"
         raise
@@ -1205,6 +1328,14 @@ def _check_request_wall_clock(stage: str) -> None:
         return
     limit = _effective_request_limit_seconds()
     spent = (time.perf_counter() - _request_started_at) if _request_started_at else 0.0
+    # 2026-11-09：绝对截止兜底 —— 无论窗口怎么重置，总墙钟都不可能超过重试上限
+    absolute = globals().get("_request_absolute_deadline_at")
+    if absolute and time.perf_counter() > float(absolute):
+        raise _FineGrainedBudgetExceeded(
+            "识别已用 %.0f 秒，超过总时长上限 %.0f 秒，已中止（阶段：%s）。"
+            % (time.perf_counter() - (globals().get("_request_absolute_started_at") or 0.0),
+               _retry_ceiling_seconds(), stage)
+        )
     if spent < limit:
         return
     _write_runtime_trace(
@@ -1498,6 +1629,10 @@ MODEL_HASHES = {
     "slanet-plus.onnx": "d57a942af6a2f57d6a4a0372573c696a2379bf5857c45e2ac69993f3b334514b",
 }
 
+# 2026-11-07（lead 回退）：**不要**为了提速改批大小。实测 16→32 会让批次内
+# max_wh_ratio 变化 → 零填充宽度变化 → 识别结果改变：FC-00010 从 21×4/hard 0.738
+# 退化到 20×4/hard 0.000（表头行整行丢失）。之前 9 例 A/B 恰好没覆盖到这类，
+# "输出完全一致"的结论不成立。批大小是**识别语义的一部分**，保持 16。
 _MEDIUM_RECOGNITION_BATCH_SIZE = 16
 _SERVER_RECOGNITION_BATCH_SIZE = 8
 # 只在 Python 调用边界聚合请求，模型内部批大小仍由上面的常量控制。
@@ -1527,6 +1662,8 @@ def _configure_recognition_memory_mode(low_memory: bool) -> None:
         _RECOGNITION_INFERENCE_THREADS = min(4, _RECOGNITION_LOGICAL_PROCESSORS)
         _ACTIVE_RECOGNITION_MEMORY_MODE = "low_memory"
     else:
+        # 2026-11-07（lead 回退）：批大小是识别语义的一部分，实测 32 会改变输出
+        # （FC-00010 表头行丢失、hard 0.738 → 0.000），恢复为 16。
         _MEDIUM_RECOGNITION_BATCH_SIZE = 16
         _SERVER_RECOGNITION_BATCH_SIZE = 8
         _RECOGNITION_CALL_GROUP_SIZE = 32
@@ -11671,9 +11808,20 @@ def _borderless_spatial_grid(
     heights: list[float] = []
     for index, (box, text) in enumerate(zip(boxes, texts)):
         value = str(text).strip()
-        if not value:
+        # 2026-11-06（lead 复查，整行丢失 P0）：原来空文本直接 `continue`，于是
+        # 「被多模型复核抹成空串」的整行（典型就是表头行：verified_components 把
+        # `物料名称`(0.608)/`类型`(0.749) 判成不可信抹空）在聚类阶段**整行消失**，
+        # 后面再被前导页眉规则吃掉一行 ⇒ 整表相对真值上移一行、逐格归零。
+        # 实测 FC-00003：raw 26×6（R1 是空表头）→ verified 24×6，hard 0.000。
+        # 现在空文本**照常参与行聚类（保住这一行的几何），但不贡献任何文字**：
+        # 该行的格子是空的、分数 -1，客户看到的是"表头待填"而不是"表头不见了"。
+        blank = not value
+        try:
+            points = np.asarray(box, dtype=float).reshape(-1, 2)
+        except (TypeError, ValueError):
             continue
-        points = np.asarray(box, dtype=float).reshape(-1, 2)
+        if points.size == 0:
+            continue
         left = float(points[:, 0].min())
         right = float(points[:, 0].max())
         top = float(points[:, 1].min())
@@ -11689,11 +11837,13 @@ def _borderless_spatial_grid(
                 "center_y": (top + bottom) * 0.5,
                 "height": height,
                 "text": value,
+                "blank": blank,
                 "score": float(score_values[index]) if index < len(score_values) else 1.0,
             }
         )
-        heights.append(height)
-    if not entries:
+        if not blank:
+            heights.append(height)
+    if not entries or not heights:
         empty_result = ([], [], [], False)
         return (*empty_result, {}) if return_geometry else empty_result
 
@@ -11866,8 +12016,26 @@ def _borderless_spatial_grid(
         and row_centers[1] - row_centers[0]
         >= float(np.median(np.diff(row_centers[1:]))) * 1.45
     ):
-        grouped_rows = grouped_rows[1:]
-        row_centers = row_centers[1:]
+        # 2026-11-09（lead 实测，FC-00680 少 3 行）：**再加一道护栏** —— 首行如果是
+        # "页眉形态"才删；如果是"真表头被挤成 1 格"则不删。
+        # 取证：FC-00680 的页面 OCR 顶部依次是
+        #   y=133 `库存台账·2025年12月`、y=177 `仓库：A区 制表：刘洋 共40条`、
+        #   y=225~267 `序号 | 物料名称 | 规格型号 | 库位 | 批次号 | …`（真表头）。
+        # 而输出首行直接是数据行（真值 R3）⇒ 表头三行被这条例规连带删掉。
+        # 页眉特征：含冒号元信息 / 是整句长文本（≥8 字）/ 含"台账/汇总/统计/共N条"这类词；
+        # 真表头特征：短列名（≤6 字）、通常 2~4 字、不含冒号。
+        first_text = "".join(str(entry.get("text") or "") for entry in grouped_rows[0])
+        compact = first_text.replace(" ", "").strip()
+        looks_like_header_label = (
+            1 <= len(compact) <= 6
+            and not any(mark in compact for mark in ("：", ":"))
+            and not re.search(r"\d", compact)
+        )
+        if looks_like_header_label:
+            pass  # 首行像真表头（短列名），不删
+        else:
+            grouped_rows = grouped_rows[1:]
+            row_centers = row_centers[1:]
     if len(grouped_rows) >= 4 and len(grouped_rows[-1]) <= 2 and len(grouped_rows[-2]) >= 3:
         footer = "".join(str(entry["text"]).replace(" ", "") for entry in grouped_rows[-1])
         earlier_gaps = np.diff(row_centers[:-1]).astype(float)
@@ -15289,6 +15457,23 @@ def _mark_low_confidence_fixed_cell_reviews(
                     TextRecInput(img=[view_crops[index] for index in batch_indices])
                 )
                 _release_recognition_images(output)
+                if _budget_exhausted:
+                    # 这一批没跑完 ⇒ 这批格子没有第二路证据。标黄，
+                    # 别让"没复核"看起来像"复核通过"。
+                    for index in batch_indices:
+                        row, column = locations[index]
+                        if not str(grid[row][column]).strip():
+                            continue
+                        _write_confidence(confidence_grid, row, column, -1.0)
+                        _budget_degraded_cells.add((row, column))
+                    _write_runtime_trace(
+                        "route",
+                        name="low_confidence_review_budget_degraded",
+                        force_flush=True,
+                        family=family_name,
+                        cells=len(batch_indices),
+                    )
+                    return all_scores
                 output_texts = list(output.txts)
                 output_scores = [float(score) for score in output.scores]
                 all_scores.extend(output_scores)
@@ -16960,6 +17145,10 @@ def _verify_motion_blurred_ruled_cells(
     if not locations:
         return []
 
+    # 本函数内**真正拿到跨模型共识**的格子。预算耗尽时靠它区分
+    # "已经复核过"与"还没来得及复核"——后者必须标黄。
+    locally_verified: set[tuple[int, int]] = set()
+
     from rapidocr.ch_ppocr_rec.typings import TextRecInput
 
     candidates: list[list[tuple[str, str, float]]] = [[] for _ in locations]
@@ -17039,6 +17228,27 @@ def _verify_motion_blurred_ruled_cells(
         for group in recognition_groups:
             output = recognizer(TextRecInput(img=[views[index] for index in group]))
             _release_recognition_images(output)
+            if _budget_exhausted:
+                # 预算耗尽 ⇒ 这批格子**没有独立复核过**，读数只是单模型猜测：
+                # 置 confidence = -1.0 ⇒ needs_review ⇒ 界面标黄 + 禁止直接
+                # 导出。空格不标（没有内容就没有"读错"的风险）。
+                # 标的是**所有还没复核过的格子**，不只是这一批：预算爆掉之后
+                # 后面的批次根本不会跑，它们同样是未复核状态。
+                for row, column in locations:
+                    if (row, column) in locally_verified:
+                        continue
+                    if not str(grid[row][column]).strip():
+                        continue
+                    _write_confidence(confidence_grid, row, column, -1.0)
+                    _budget_degraded_cells.add((row, column))
+                _write_runtime_trace(
+                    "route",
+                    name="review_budget_degraded",
+                    force_flush=True,
+                    family=family,
+                    cells=len(locations),
+                )
+                return False
             texts = [str(text).strip() for text in output.txts]
             scores = [float(score) for score in output.scores]
             all_scores.extend(scores)
@@ -17287,6 +17497,7 @@ def _verify_motion_blurred_ruled_cells(
             if current_key == selected_key
             else consensus_confidence
         )
+        locally_verified.add((row, column))
         if verified_cells_out is not None:
             verified_cells_out.add((row, column))
 
@@ -17423,6 +17634,7 @@ def _verify_motion_blurred_ruled_cells(
                     grid[row][column] = first_text
                     confidence_grid[row][column] = 0.77
                     corrected_leading_lines.add(index)
+                    locally_verified.add((row, column))
                     if verified_cells_out is not None:
                         verified_cells_out.add((row, column))
         unresolved = [
@@ -17478,6 +17690,7 @@ def _verify_motion_blurred_ruled_cells(
                     grid[row][column] = medium_texts[offset]
                     confidence_grid[row][column] = 0.77
                     corrected_decimal_commas.add(index)
+                    locally_verified.add((row, column))
                     if verified_cells_out is not None:
                         verified_cells_out.add((row, column))
         unresolved = [
@@ -29034,9 +29247,13 @@ def _recover_visible_percent_unit_glyphs(
 
 _MAX_VERIFICATION_CROPS = 24
 _MAX_LARGE_GRID_FAST_VERIFICATION_CROPS = 96
+# 2026-11-09（lead 实测，**判据过宽**）：原来带 `flags=re.IGNORECASE`，于是 `a`（普通字母）
+# 与 `A`（安培）等价、`v` 与 `V` 等价 ⇒ **任何单字母的 0.60~0.78 低分识别结果都被当可信单位接受**，
+# 这是静默错数的一条通路。下面的复合单位注释里明确写了"区分大小写：误收 PA / MA 之类会把
+# 真实型号读成噪声单位"，但这里的 IGNORECASE 与本意矛盾。
+# 改为**区分大小写**的显式枚举（短路电流单位 mA/uA/μA 大小写固定，不需要忽略大小写）。
 _TRUSTED_SHORT_UNIT_PATTERN = re.compile(
-    r"(?:%|V|A|mA|uA|μA|Hz|kHz|MHz|GHz|dB|dBm|℃|°C|Ω)",
-    flags=re.IGNORECASE,
+    r"(?:%|V|A|mA|uA|μA|Hz|kHz|MHz|GHz|dB|dBm|℃|°C|Ω)"
 )
 # 无框线表格里"数值 + 单位"经常被切成两个 OCR 框（"≤4.5" 与 "mm/s"）。旧表里只有
 # 单一符号单位，低分单位框会被当噪声丢掉，于是"≤4.5 mm/s"变成两列。工程复合单位
@@ -29067,6 +29284,10 @@ _TRUSTED_COMPOUND_UNIT_PATTERN = re.compile(
 
 def _is_trusted_short_unit(value: Any) -> bool:
     token = str(value).strip()
+    # 2026-11-09（lead 实测）：空串原来会命中 `fullmatch("")` 以外的路径吗？不会 —— 但为稳妥
+    # 显式排除：空内容没有任何"单位"含义，把它判成可信单位会让空文本享受 0.60 的低分阈值。
+    if not token:
+        return False
     if _TRUSTED_COMPOUND_UNIT_PATTERN.fullmatch(token):
         return True
     return bool(_TRUSTED_SHORT_UNIT_PATTERN.fullmatch(token))
@@ -29619,6 +29840,219 @@ def _unresolved_model_conflict_locations(
         for column_index, value in enumerate(row)
         if float(value) < 0.0
     ]
+
+
+# 复核坐标的**平移账本**。
+#
+# 2026-11-05 实测（真实照片 PF-00002）：识别阶段按 18×4 的中间网格算出
+# "40 格黄色单元格 / 72 格未确认 / 34 格墨迹读不出"，表格随后被
+# 「并回多出的一列」「删表外抬头行」「折回竖排文字行」「裁掉尾部空白」
+# 一路改成 14×3，这几条提示就全失效了 —— 提示说 40 格黄色，界面上只有
+# 1 个黄点；提示里还出现 R9C4、R17C1 这种**根本不存在**的坐标。
+#
+# 坐标随结果一起带出去，每一步网格变形都同步平移，最后按**最终网格**
+# 重写提示，数字与坐标必然和交付的表一致。
+_REVIEW_LOCATIONS_KEY = "_review_locations"
+_REVIEW_AXIS_KEY = "_review_axis_map"
+
+
+def _carry_review_locations(
+    result: dict[str, Any],
+    locations: dict[str, list[tuple[int, int]]],
+    row_count: int,
+    column_count: int,
+) -> None:
+    """把识别阶段算出的复核坐标随结果带出去（网格变形时同步平移）。"""
+    result[_REVIEW_LOCATIONS_KEY] = {
+        key: list(value) for key, value in locations.items()
+    }
+    result[_REVIEW_AXIS_KEY] = {
+        "rows": list(range(max(0, int(row_count)))),
+        "columns": list(range(max(0, int(column_count)))),
+    }
+
+
+def _remap_review_axis(
+    result: dict[str, Any],
+    axis: str,
+    mapping: Any,
+) -> None:
+    """网格变形后同步平移复核坐标。
+
+    ``mapping`` 是一个函数：当前下标 → 新下标；返回 ``None`` 表示该行/列
+    已经被删掉（它上面的复核坐标随之作废）。
+    """
+    carried = result.get(_REVIEW_AXIS_KEY)
+    if not isinstance(carried, dict):
+        return
+    table = carried.get(axis)
+    if not isinstance(table, list):
+        return
+    for index in range(len(table)):
+        current = table[index]
+        if current is None:
+            continue
+        try:
+            target = mapping(current)
+        except (TypeError, ValueError, IndexError):
+            return
+        table[index] = None if target is None else int(target)
+
+
+def _render_review_messages(result: dict[str, Any]) -> None:
+    """按**最终网格**重写带格坐标的复核提示。
+
+    网格变形（并回多出的一列 / 删表外抬头行 / 折回竖排文字行 / 裁尾部空白）
+    会让识别阶段算出的格坐标和格数全部失效。这里在所有变形做完之后按
+    **交付出去的那张表**重写：黄色格数与界面黄点必然一致，坐标也必然指向
+    真实存在的格子。
+
+    能从最终 cells 直接算出来的（黄色格 / 未确认格 / 墨迹读不出）**一律**
+    重写；只有必须依赖坐标账本的（跨模型冲突 / 可见内容未确认 / 整页补回）
+    才在账本缺失时保留原文 —— 宁可留着可能过时的坐标，也不把有价值的
+    阻断理由弄丢。
+    """
+    locations = result.pop(_REVIEW_LOCATIONS_KEY, None)
+    carried = result.pop(_REVIEW_AXIS_KEY, None)
+    has_carried = isinstance(locations, dict) and isinstance(carried, dict)
+    rows = (
+        carried.get("rows")
+        if has_carried and isinstance(carried.get("rows"), list)
+        else []
+    )
+    columns = (
+        carried.get("columns")
+        if has_carried and isinstance(carried.get("columns"), list)
+        else []
+    )
+
+    def remap(items: Any) -> list[tuple[int, int]] | None:
+        if not has_carried:
+            return None
+        out: list[tuple[int, int]] = []
+        for item in items or []:
+            try:
+                row = int(item[0])
+                column = int(item[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not (0 <= row < len(rows) and 0 <= column < len(columns)):
+                continue
+            new_row = rows[row]
+            new_column = columns[column]
+            if new_row is None or new_column is None:
+                continue
+            out.append((int(new_row), int(new_column)))
+        return sorted(set(out))
+
+    def describe(items: list[tuple[int, int]]) -> str:
+        text = "、".join(
+            f"R{row + 1}C{column + 1}" for row, column in items[:6]
+        )
+        if len(items) > 6:
+            text += f" 等 {len(items)} 格"
+        return text
+
+    yellow: list[tuple[int, int]] = []
+    unconfirmed: list[tuple[int, int]] = []
+    ink_blanks: list[tuple[int, int]] = []
+    for row_index, row in enumerate(result.get("cells") or []):
+        for column_index, cell in enumerate(row):
+            if not isinstance(cell, dict):
+                continue
+            text = str(cell.get("text", "")).strip()
+            confidence = float(cell.get("confidence", 0.0))
+            if cell.get("needs_review"):
+                yellow.append((row_index, column_index))
+                if not text:
+                    ink_blanks.append((row_index, column_index))
+            elif 0.0 < confidence < 0.78:
+                unconfirmed.append((row_index, column_index))
+
+    conflicts = remap(locations.get("conflicts")) if has_carried else None
+    visible_blanks = remap(locations.get("visible_blanks")) if has_carried else None
+    page_suggestions = (
+        remap(locations.get("page_suggestions")) if has_carried else None
+    )
+
+    reasons = [
+        item
+        for item in (result.get("publication_block_reasons") or [])
+        if "尚未人工确认的黄色单元格" not in str(item)
+    ]
+    notices = [
+        item
+        for item in (result.get("processing_notices") or [])
+        if "未取得两个模型的一致确认" not in str(item)
+        and "检测到墨迹但未能读出内容" not in str(item)
+    ]
+    warnings = [
+        item
+        for item in (result.get("structure_warnings") or [])
+        if "有可见内容但未能安全确认的单元格" not in str(item)
+    ]
+    if has_carried:
+        reasons = [
+            item
+            for item in reasons
+            if "存在跨模型冲突或内容证据不足的单元格" not in str(item)
+            and "部分可见内容仅由可信整页识别补回" not in str(item)
+        ]
+        notices = [
+            item
+            for item in notices
+            # 这一条会从 structure_warnings 复制一份到 processing_notices，
+            # 两处都要按最终网格重写，否则会留下写着 R5C4 的旧副本 ——
+            # 而交付的表只有 3 列。
+            if "有可见内容但未能安全确认的单元格" not in str(item)
+        ]
+
+    if yellow:
+        reasons.append(
+            "存在尚未人工确认的黄色单元格"
+            f"（{describe(yellow)}），禁止作为已验证结果直接导出。"
+        )
+    if conflicts:
+        reasons.append(
+            "存在跨模型冲突或内容证据不足的单元格"
+            f"（{describe(conflicts)}），禁止直接导出。"
+        )
+    if page_suggestions:
+        reasons.append(
+            "部分可见内容仅由可信整页识别补回"
+            f"（{describe(page_suggestions)}），请核对黄色单元格后再导出。"
+        )
+    if unconfirmed:
+        notices.append(
+            f"有 {len(unconfirmed)} 格未取得两个模型的一致确认"
+            f"（{describe(unconfirmed)}），请对照原图确认。"
+        )
+    if ink_blanks:
+        notices.append(
+            f"有 {len(ink_blanks)} 格检测到墨迹但未能读出内容"
+            f"（{describe(ink_blanks)}），已留空并标黄，请对照原图确认。"
+        )
+    if visible_blanks:
+        warnings.append(
+            "有可见内容但未能安全确认的单元格"
+            f"（{describe(visible_blanks)}）已留空或标黄。"
+        )
+        notices.append(
+            "有可见内容但未能安全确认的单元格"
+            f"（{describe(visible_blanks)}）已留空或标黄。"
+        )
+
+    result["publication_block_reasons"] = list(dict.fromkeys(reasons))
+    result["processing_notices"] = list(dict.fromkeys(notices))
+    result["structure_warnings"] = list(dict.fromkeys(warnings))
+    # 阻断结论必须跟着理由走：黄色格被清空之后，"存在黄色单元格"这条理由
+    # 已经不成立，不能继续拿一条空理由拦着导出。
+    result["publication_blocked"] = bool(result["publication_block_reasons"])
+    if (
+        not result["publication_blocked"]
+        and result.get("recognition_state") == "blocked"
+    ):
+        result["recognition_state"] = "needs_review" if yellow else "verified"
 
 
 def _recognize_dense_screen_grid(
@@ -39999,16 +40433,30 @@ def _verified_numeric_components(
     if boxes is None or not candidate_indices or not hasattr(ocr_engine, "text_rec"):
         return boxes, [str(text) for text in original_texts], original_scores, 0
 
-    if budget is not None and not budget.allow(3.0):
+    def withhold_unverified(
+        indices: list[int] | None = None,
+    ) -> tuple[Any, list[str], list[float], int]:
+        """把没复核完的候选**留空**，而不是照原样交付。
+
+        * 纯数字/标识符（"硬扣留"目标）⇒ 留空 + 置信度 -1.0；
+        * 描述性数字（"室温25℃"这种带中文的）⇒ 只降置信度，不清空内容。
+
+        留空而不是留原值，是因为这些读数**只经过单模型**、没有第二路证据，
+        照原样交付就是把没验证过的数字当成结论。
+        """
+        targets = candidate_indices if indices is None else indices
         texts = [str(text) for text in original_texts]
         scores = list(original_scores)
-        for index in candidate_indices:
+        for index in targets:
             if is_descriptive_numeric(texts[index]):
                 scores[index] = min(scores[index], 0.77)
             else:
                 texts[index] = ""
                 scores[index] = -1.0
-        return boxes, texts, scores, len(candidate_indices)
+        return boxes, texts, scores, len(targets)
+
+    if budget is not None and not budget.allow(3.0):
+        return withhold_unverified()
 
     from rapidocr.ch_ppocr_rec.typings import TextRecInput
 
@@ -40041,6 +40489,18 @@ def _verified_numeric_components(
         return boxes, texts, scores, 0
     alternate = ocr_engine.text_rec(TextRecInput(img=alternate_crops))
     _release_recognition_images(alternate)
+    if _budget_exhausted:
+        # 墙钟预算耗尽 ⇒ 这批数字**没有第二路证据**。照原样交付就是把没验证过
+        # 的数字当成结论，所以按既有"预算不够"的约定留空。
+        global _budget_degraded_components
+        _budget_degraded_components += len(valid_indices)
+        _write_runtime_trace(
+            "route",
+            name="numeric_component_budget_degraded",
+            force_flush=True,
+            cells=len(valid_indices),
+        )
+        return withhold_unverified(valid_indices)
 
     def consensus_key(text: Any) -> tuple[str, str]:
         if is_descriptive_numeric(text):
@@ -42142,6 +42602,29 @@ def _merge_truncated_reading_groups(
             if max((score_of(v) for v in grouped[other]), default=0.0)
             >= max(0.30, short_best * 0.60)
         ]
+        # 2026-11-10（用户实测 PF-00001，55→552）：**票数+分数双占优时不合并**（收紧）。
+        # 取证：三模型对同一格读出 small='55'(0.997)、medium='552'(0.875)、mobile='55'(0.98)。
+        # `55` 票数 2 > 1、且分数高 0.122，却被本函数当成 `552` 的"丢字版本"并掉 ⇒ 输出 552。
+        # 与契约用例的区分（这是关键：既保住契约又修好本案）：
+        #   · 本案  55(2票,0.997) vs 552(1票,0.875)：票数占优 **且** 分差 0.122 > 0.10 ⇒ 不合并
+        #   · 契约  45(2票,0.91)  vs 4598(1票,0.86)：分差 0.05 < 0.10 ⇒ 仍合并（契约保持）
+        #   · 契约  热片(2票,0.91) vs 散热片(1票,0.83)：分差 0.08 < 0.10 ⇒ 仍合并（契约保持）
+        # 只收紧"证据更强的一方被并掉"这一种情况，不改变任何读法的内容。
+        if usable:
+            short_votes = len(grouped[key])
+            best_long = max(
+                (max((score_of(v) for v in grouped[other]), default=0.0) for other in usable),
+                default=0.0,
+            )
+            longest_votes = max((len(grouped[other]) for other in usable), default=0)
+            # 关键补充：短版本的**最低分**也要够高才算"强证据"。
+            # 契约 `联器`(0.87,0.69) 两票压不过 `联轴器`(0.64) —— 它有一票只有 0.69（弱证据）；
+            # 而本案 `55`(0.997,0.98) 两票都很强。用"最低分 ≥0.90"区分二者。
+            short_worst = min((score_of(v) for v in grouped[key]), default=0.0)
+            if (short_votes > longest_votes
+                    and short_worst >= 0.90
+                    and (short_best - best_long) > 0.10):
+                usable = []
         canonical = usable[0] if len(supersets) == 1 and usable else key
         merged.setdefault(canonical, []).extend(grouped[key])
     return merged
@@ -45346,6 +45829,16 @@ def _read_very_wide_latin_lines(
                 text = checked[0]
                 confidence = .86 if matching[1] >= .90 else .77
             elif checked is None and first[1] >= .985:
+                # 2026-11-10（用户实测 PF-00001，**纯数字被英文模型加位**）：
+                # 本分支在"Small 模型未参与 + 英文读法分数很高"时**单独采用英文读法**。
+                # 但英文模型对纯数字不敏感：整图 OCR 对 (12,3) 读作 '55'（score 1.00），
+                # 英文专用识别器却读成 '552'（多一位），被本分支采用后最终输出 552（真值 55）。
+                # 收紧：**纯数字读数必须有第二个视图背书**才单独采用；否则保留原读法。
+                # （大小写/英文修正对纯数字没有意义，只可能引入数字错误。）
+                _pure_digits = bool(re.fullmatch(r"[0-9]+", str(first[0]).strip()))
+                _backed = second is not None and str(second[0]).strip() == str(first[0]).strip()
+                if _pure_digits and not _backed:
+                    return None
                 text, confidence = first[0], .86
             elif checked is not None:
                 medium = _read_unique_line_views(
@@ -45927,6 +46420,15 @@ def _recognize_complete_ruled_candidate(
             dict(source_quality) if candidate.image is source_image
             else pipeline.assess_image_quality(candidate.image)
         )
+        # 2026-11-10（用户实测 55→552 / 91→912，**既有护栏从未被唤醒**）：
+        # `minority_cells` 由 `_collect_minority_cells` 填充，而该函数在
+        # `_read_very_wide_latin_lines` 分支有调用、在**本条
+        # `complete_ruled_line_consensus` 分支里漏了**。于是 `_ruled_cell_reading_needs_confirmation`
+        # 里早已写明的保护（"胜出读法没拿到严格多数票 ⇒ 必须人工确认"）**永远不触发**：
+        #   PF-00001 的 (12,3)：small='55'(0.997)、medium='552'(0.875)、mobile='55'(0.98)，
+        #   `55` 两票却被丢字合并逻辑让 `552` 胜出，置信度固定 0.86 ⇒ 不标黄 ⇒ 错值静默导出。
+        # 这里补上调用，把既有护栏接通（纯收紧：只增加"待人工确认"标记，不改任何读法）。
+        _collect_minority_cells(per_cell)
         # 2026-11-04：把兜底判定出来的"证据不足"格子降到 -1（结构不可信哨兵）。
         # -1 会让 _cell_requires_human_confirmation 判 True ⇒ 进 review_locations
         # ⇒ 界面标黄 + 禁止当作已验证结果导出。必须放在所有 _repair_* 之后：
@@ -46416,6 +46918,16 @@ def _recognize_complete_ruled_candidate(
                 if (reading[0] != small_native[index][0] or reading[1] < 0.75):
                     continue
                 row, column, line_index, current = native_case_locations[index]
+                # 2026-11-10（用户实测 PF-00001，**纯数字被英文识别器改错**）：
+                # 本分支只负责"英文字母大小写一致性"，却会把**纯数字格**也覆盖掉：
+                #   per_cell[(12,3)] 原文是 '55'（整图 OCR score 1.00），
+                #   英文识别器把它读成 '552'（置信度 ≥0.75），于是被覆盖成 '552'（固定 0.86），
+                #   最终输出 552（真值 55）—— 用户看到的就是"瞎加数字"。
+                # 收紧：**当前值与新读法都不是"含字母的文本"时，不做覆盖**
+                # （大小写修复对纯数字毫无意义，只可能引入数字错误）。
+                _current_text = str(current[1]) if isinstance(current, tuple) and len(current) > 1 else str(current)
+                if not (re.search(r"[A-Za-z]", _current_text) or re.search(r"[A-Za-z]", str(reading[0]))):
+                    continue
                 values = per_cell[(row, column)]
                 values[values.index(current)] = (line_index, reading[0], 0.86)
     _dispose_openvino_component(mobile_recognizer)
@@ -57869,6 +58381,15 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
                 "识别已用 %.0f 秒仍未确认表格结构（几何搜索已按预算提前收尾），"
                 "判定表格结构过于复杂或存在干扰网格" % spent
             )
+        if _budget_exhausted:
+            # 2026-11-05：模型调用入口已经把预算耗尽转成"降级"（返回空结果），
+            # 异常不再从 _timed_recognition_call 抛出来。所以"结构没认出来"
+            # 这条路径要自己看降级标记，否则会退化成"未检测到表格"——
+            # 那是误导：表格其实看见了，只是没时间把它读完。
+            raise _FineGrainedBudgetExceeded(
+                _budget_exhausted_reason
+                or "识别预算已耗尽，未能确认表格结构。"
+            )
         if budget.limited or budget.reached():
             # 2026-10-23：这条原来抛普通 ValueError，被归成 INVALID_REQUEST
             #（"请求本身不合法"）；而上一条同样是"预算耗尽"却抛
@@ -61002,6 +61523,32 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
 
     if confidence_grid is not None:
         _guard_unresolved_ascii_ambiguities(grid, confidence_grid)
+    if _budget_degraded_cells:
+        # 重新落实标记：识别过程中网格可能被换掉（page_grid → spatial_grid），
+        # 也可能有后处理把 -1.0 覆盖成别的值。先按最终网格重新写一遍，
+        # 再校验是否真的落下去了。
+        for row, column in _budget_degraded_cells:
+            if (
+                confidence_grid is not None
+                and row < len(confidence_grid)
+                and column < len(confidence_grid[row])
+            ):
+                _write_confidence(confidence_grid, row, column, -1.0)
+        # 降级标记必须**活到最终网格上**。识别过程中网格可能被换掉
+        # （page_grid → spatial_grid），标记一旦丢失，"降级发布"就等于把没复核
+        # 过的格子当成已复核交付 —— 那正是本轮要根除的"静默"形态。
+        # 宁可维持失败，也不静默放行。
+        degraded_survived = confidence_grid is not None and all(
+            row < len(confidence_grid)
+            and column < len(confidence_grid[row])
+            and float(confidence_grid[row][column]) < 0.0
+            for row, column in _budget_degraded_cells
+        )
+        if not degraded_survived:
+            raise _FineGrainedBudgetExceeded(
+                "逐格复核超过本机时限未完成，且未能把未复核单元格标记出来"
+                "（表格结构在复核过程中发生了变化），本次不提供结果。"
+            )
     # 两类位置必须分开，不能混成一句话：
     #   unconfirmed —— 停在 0.77/0.86 这类保守上限上，意思是"两个模型没取得
     #     一致确认"，是整表不能直接发布的原因；
@@ -61163,6 +61710,29 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             "存在尚未人工确认的黄色单元格"
             f"（{locations}），禁止作为已验证结果直接导出。"
         )
+    if _budget_degraded_cells:
+        # 超时降级的自述：让用户知道这些黄格不是"模型读错了"，而是"没来得及
+        # 独立复核"——两者的核对动作不一样（前者要怀疑读数，后者要自己读一遍）。
+        degraded_locations = "、".join(
+            f"R{row + 1}C{column + 1}"
+            for row, column in sorted(_budget_degraded_cells)[:6]
+        )
+        if len(_budget_degraded_cells) > 6:
+            degraded_locations += f" 等 {len(_budget_degraded_cells)} 格"
+        processing_notices.append(
+            f"逐格复核超过本机时限未完成，有 {len(_budget_degraded_cells)} 格没有独立复核"
+            f"（{degraded_locations}），已标黄，请对照原图确认后再导出。"
+        )
+    if _budget_degraded_components:
+        processing_notices.append(
+            f"另有 {_budget_degraded_components} 格数字因本机时限未完成独立复核，"
+            f"已留空待人工填写。"
+        )
+    if _budget_exhausted:
+        processing_notices.append(
+            "本次识别已用满本机时限，后续模型复核全部跳过；"
+            "未复核的单元格已标黄，已复核的单元格可信。"
+        )
     if unconfirmed_locations:
         locations = "、".join(
             f"R{row + 1}C{column + 1}"
@@ -61226,6 +61796,18 @@ def _recognize(request: dict[str, Any]) -> dict[str, Any]:
             "存在跨模型冲突或内容证据不足的单元格"
             f"（{locations}），禁止直接导出。"
         )
+    # 这两类坐标无法从最终 cells 反推（负置信度在发布时被钳成 0.0），
+    # 只能随结果带出去，由网格变形同步平移。
+    _carry_review_locations(
+        result,
+        {
+            "conflicts": unresolved_nonblank_conflicts,
+            "visible_blanks": unresolved_visible_blanks,
+            "page_suggestions": applied_page_suggestions,
+        },
+        len(grid),
+        len(grid[0]) if grid else 0,
+    )
     final_physical_boundaries = (
         certified_confirmation_boundaries
         or (
@@ -61503,6 +62085,13 @@ def _trim_grid_to_populated_extent(
     confidence_grid = [
         [float(value) for value in row] for row in confidence_grid[:kept_rows]
     ][:kept_rows]
+    # 被裁掉的尾部行/列上的复核坐标随之作废（格已经不在交付的表里了）。
+    _remap_review_axis(
+        result, "rows", lambda index: index if index < kept_rows else None
+    )
+    _remap_review_axis(
+        result, "columns", lambda index: index if index < kept_columns else None
+    )
 
     if certificate is not None:
         column_boundaries = certificate.get("column_boundaries")
@@ -61596,17 +62185,31 @@ def _merge_unit_suffix_columns(
         if text_at(0, column) or not text_at(0, column - 1):
             continue
         hits = 0
+        # 2026-11-09（lead 静态审查 + 反例实测，**确认的真实缺陷**）：
+        # 原判据把"左格纯数字、右格为空"和"两格都空"都算命中，于是
+        # **"表头为空 + 整列空白"的列会被吞掉**。反例实测：
+        #   `参数|值|''` / `转速|1500|''` / `压力|200|''` / `流量|300|''`
+        #   3 列被合并成 2 列（`_merge_unit_suffix_columns` 返回 cols=2）。
+        # 这既是 FC-00680 那类"多列被拼一格"的另一条通路，也会在真实表格上
+        # 白白吃掉一整列。
+        # 正确语义：这条判据是为了把"`≤4.5` + `mm/s` 两个框"并回一列，
+        # 所以**右列必须真的出现过单位痕迹**（有字但判为不可信），
+        # 而不能把"整列空白"也算成单位列（空白列合并没有任何收益，只有风险）。
+        unit_traces = 0
         for row_index in body_rows:
             left = text_at(row_index, column - 1)
             right = text_at(row_index, column)
             if right and not _is_trusted_short_unit(right):
                 continue
+            if right and _is_trusted_short_unit(right):
+                unit_traces += 1
             if _UNIT_SUFFIX_OPEN_ENDED.search(left) or _UNIT_SUFFIX_RANGE.match(left):
                 hits += 1
-            elif _UNIT_SUFFIX_PLAIN_NUMBER.match(left) and not right:
+            elif _UNIT_SUFFIX_PLAIN_NUMBER.match(left) and right:
                 hits += 1
-            elif not left and not right:
-                hits += 1
+        # 右列从未出现任何单位痕迹 ⇒ 它是普通空列/数据列，不是被切开的单位后缀
+        if unit_traces == 0:
+            continue
         if hits >= 2 and hits >= int(math.ceil(len(body_rows) * 0.60)):
             dropped.append(column)
     if not dropped:
@@ -61653,6 +62256,17 @@ def _merge_unit_suffix_columns(
         rebuilt_confidence.append(scores)
     result["cells"] = rebuilt
     result["columns"] = len(kept)
+    # 被并掉的列的内容并进了它左边那一列 ⇒ 复核坐标跟着挪到锚点列。
+    def _merged_column_position(column: int) -> int:
+        if column in kept_positions:
+            return kept_positions[column]
+        anchors = [
+            position for position, index in enumerate(kept) if index < column
+        ]
+        return anchors[-1] if anchors else 0
+
+    kept_positions = {column: position for position, column in enumerate(kept)}
+    _remap_review_axis(result, "columns", _merged_column_position)
 
     certificate = result.get("structure_certificate")
     if isinstance(certificate, dict):
@@ -62886,6 +63500,9 @@ def _handle_request_body(request: dict[str, Any]) -> dict[str, Any]:
         result["review_ratio"] = round(
             final_review_cells / max(1, final_total_cells), 4
         )
+        # 所有网格变形都做完了：按**最终那张表**重写带格坐标的复核提示，
+        # 格数与坐标必然和界面上看到的一致。
+        _render_review_messages(result)
         result["runtime_profile"] = _runtime_trace_summary()
         return result
     except Exception as error:
@@ -62969,8 +63586,58 @@ def _leading_row_is_page_caption_band(row: list[dict[str, Any]]) -> bool:
     populated = sum(filled)
     if populated == 0:
         return True
+    # 2026-11-09（lead 实测，满格页眉）：原来只看"稀疏与否"，于是**满格的页眉行**抓不到：
+    #   · FC-00723 首行 4/4 满格但内容是 `终盘点单 | 4 | x393 | 20918723`（含 3 个数字格）；
+    #   · FC-00717 首行 5/5 满格且是 `白班：B区 | 统计：刘洋 | 物料汇总表 2026年0 …`（2 个冒号）；
+    #   而**真表头几乎不含数字**（`序号 | 物料 | 规格型号 | 库存数 | 备注` 一个数字都没有）。
+    # 所以：含 ≥2 个数字格、或 ≥2 个"键：值"元信息格的整行，按抬头处理。
+    # 只用强信号（2 个以上）以免误伤"编号/日期"这类真列名。
+    # 2026-11-09（lead 实测，**收紧以修回归**）：上一版"含 ≥2 数字格/≥2 冒号即判抬头"太宽 ——
+    # 它会连删**满格的表头或数据行**：FC-00565 少 6 行、FC-00616 少 3 行、FC-00621 少 4 行，
+    # 三例 lead 全被算成 4（把 4 行真数据当抬头删掉了）。
+    # 收紧为：只有**明显不是满格表头**的行才用这两个信号 —— 即该行填充数 < 列数
+    # （真表头几乎总是满格；满格的"含数字行"更可能是数据或表头）。
+    digit_cells = sum(1 for cell in row if populated and re.search(r"\d", _cell_text(cell)))
+    colon_cells = sum(1 for cell in row
+                      if any(mark in _cell_text(cell) for mark in ("：", ":")))
+    if populated and populated < len(filled) and (digit_cells >= 2 or colon_cells >= 2):
+        return True
+    # 2026-11-09（lead 实测，最终结论）：**满格行一律不当抬头**。
+    # 踩坑记录（三次尝试都失败）：
+    #   ① 满格行含 ≥2 数字格 ⇒ 误删真数据：FC-00565 少 6 行、FC-00616 少 3 行、FC-00621 少 4 行；
+    #   ② 满格行含 ≥2 混合格 ⇒ FC-00680 少 3 行；
+    #   ③ 满格行含 ≥2 冒号格 ⇒ 同样会命中"编号：值"形态的真数据。
+    # 取证：FC-00723 的满格页眉 R0 = `终盘点单 | 4 | x393 | 20918723`，混合格只有 1 个，
+    # 达不到任何 ≥2 阈值 ⇒ **"满格页眉"与"满格真表头"在行内特征上不可区分**。
+    # 取舍：宁可漏删（多留一行页眉，整表下移一行仍可能对上）也不误删
+    #      （误删=整表少行、hard 直接归零，代价大一个数量级）。
+    # 2026-11-09（lead 实测，FC-00990）：**单格日期/页码/条数**是强抬头信号。
+    # 取证：FC-00990 首行 = `['', '', '6月07日', '', '']`（只有 1 格、内容是日期），
+    # 真表头在下一行（`产品编号|产品名称|材料费|人工费|备注`，与真值首行逐格一致）。
+    # 现有判据把它按"有间隔的多段"判成表内内容 ⇒ 多留 1 行 ⇒ hard 0.077。
+    # 真表头不可能"只有一个日期/页码格"，所以这个信号既强又不会误伤。
+    if populated == 1:
+        only_text = "".join(_cell_text(cell) for cell in row).strip()
+        compact = only_text.replace(" ", "")
+        if (re.fullmatch(r"\d{1,4}\s*[-/年.]\s*\d{1,2}\s*[-/月.]\s*\d{1,2}\s*[日号]?", compact)
+                or re.fullmatch(r"第?\d{1,4}页", compact)
+                or re.fullmatch(r"共?\d{1,6}\s*条", compact)
+                or re.fullmatch(r"\d{1,4}\s*年\s*\d{1,2}\s*月", compact)      # 6年07月
+                or re.fullmatch(r"\d{1,2}\s*月\s*\d{1,2}\s*[日号]", compact)
+                or re.fullmatch(r"\d{1,4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*[日号]", compact)):
+            return True
     if populated > max(3, len(filled) // 3):
         return False
+    # 2026-11-09（lead 实测）：真实页眉的元信息行常常是「仓库：北区 … 制表：陈静」
+    # 这种**有间隔的多段**形态（FC-00222 的 row1 = f2、FC-00510 的 row1 = f4），
+    # 原来的"填充只能在前导段"判据把它们当成表体、删不掉，整表永远多 1~2 行。
+    # 但**不能**整体去掉这个判据 —— 两级表头分组行（"物料组 | 成本构成 | 金额汇总"）
+    # 也是"有间隔的多段"，去掉就会误删（契约 test_two_level_group_header_is_kept）。
+    # 可靠区别：**元信息行是"键：值"结构**（含冒号/全角冒号），分组行只是并列词组。
+    # 所以：只有"像键值元信息"的多段行才放行，其余仍按原判据。
+    joined = "".join(_cell_text(cell) for cell in row)
+    if "：" in joined or ":" in joined:
+        return True
     seen_gap = False
     for is_filled in filled:
         if not is_filled:
@@ -62985,7 +63652,8 @@ def _leading_row_is_page_caption_band(row: list[dict[str, Any]]) -> bool:
 _MAX_LEADING_CAPTION_ROWS = 4
 
 
-def _leading_caption_band_length(cells: list, spans: list | None = None) -> int:
+def _leading_caption_band_length(cells: list, spans: list | None = None,
+                                trust_merged_rows: bool = True) -> int:
     """开头有多少行是表外抬头说明行。0 表示开头就是真正的表格行。
 
     只认「紧贴表格主体的那一小堆」：第 lead 行必须**每列都填满**，否则这些稀疏行
@@ -63005,22 +63673,112 @@ def _leading_caption_band_length(cells: list, spans: list | None = None) -> int:
     columns = max(len(row) for row in cells)
     if columns < 3 or len(cells) < 4 or any(len(row) != columns for row in cells):
         return 0
-    protected_rows = {
+    # 2026-11-08（lead 实测，43 例整表错位的主因之一）：原来只放行 ("", "title")，
+    # 于是带 role="subtitle" 的**表外副标题行**也被保护、一个都不删。
+    # 实测 FC-00225 / FC-00235：首行 title、次行 subtitle（"仓库：西区 记账：刘洋"），
+    # 两行都被保护 ⇒ lead=0 ⇒ 页眉留在表内 ⇒ 实际 31×5 / 真值 29×5，hard 归零。
+    # subtitle 语义上就是"表外副标题"，必须与 title 同等放行；
+    # group_header 仍然保护（那才是表内两级表头，删了整表就错位）。
+    # 2026-11-09（lead 实测，继续挖整表错位）：`group_header` 保护太宽。
+    # 实测 FC-00389 / FC-00494 / FC-00510 / FC-00418：首行标 group_header，但**只有
+    # 1~3 格有字**（真值首行是满格 10/4/7/4），实质是页眉标题被误标成分组行 ⇒ 被保护
+    # ⇒ 整表多 1~2 行、hard 归零。真正的两级表头分组行是**多格且带跨列合并**的。
+    # 所以收紧：非 title/subtitle 的 span 行仍需"不像抬头"才保护 —— 即该行填充数
+    # 必须超过稀疏阈值 max(3, columns // 3)，否则不保护（交给抬头检测处理）。
+    populated_by_row = [
+        sum(1 for cell in row if _cell_text(cell).strip()) for row in cells
+    ]
+    sparse_limit = max(3, columns // 3)
+    # 跨列合并的行（column_span > 1）一定是表内分组标题/合并标题 —— 无论多稀疏都要保护
+    # （契约 test_in_table_merged_title_with_group_header_is_kept 锁定）。
+    # 2026-11-09（lead）：跨列合并的分组行是否算"表内标题"取决于**有没有物理证据**。
+    #   · 有物理线框证书（photographic_complete_ruled_line_grid 等）⇒ 合并是线框给出的
+    #     真实结构，必须保护（契约 test_in_table_merged_title_with_group_header_is_kept）；
+    #   · 没有物理证书（启发式推断的合并）⇒ 首行的稀疏合并行按页眉处理，否则整表多 1~2 行。
+    #     实测 FC-00389 / FC-00494 属这一类。
+    # 2026-11-09（lead 实测，第四次收敛）：合并行保护只认**跨满整行**的合并。
+    # 证据链（FC-00494）：多余两行是 A0=['仓库名','点检人','年']（column_span=2 < 4 列）、
+    # A1=['车间 点检人 计划员 审核']（column_span=4），真表头在 A2 —— 这两行是页眉
+    # 元信息，却被 group_header + column_span>1 保护住，整表多 2 行、hard 归零。
+    # 而契约 test_in_table_merged_title_with_group_header_is_kept 保护的是
+    # "A1:M1 跨**全部列**的大标题"（column_span == 列数），二者可用"是否跨满整行"分开。
+    def _covers_all_columns(span) -> bool:
+        try:
+            return int(span.get("column_span") or 1) >= columns
+        except (TypeError, ValueError):
+            return False
+
+    merged_rows = {
         int(span["row"]) for span in (spans or [])
         if isinstance(span, dict) and isinstance(span.get("row"), int)
-        and str(span.get("role") or "") not in ("", "title")
+        and str(span.get("role") or "") not in ("", "title", "subtitle")
+        and int(span.get("column_span") or 1) > 1
+        and trust_merged_rows
+        and _covers_all_columns(span)
     }
+    protected_rows = set(merged_rows)
+    for span in (spans or []):
+        if not isinstance(span, dict) or not isinstance(span.get("row"), int):
+            continue
+        if str(span.get("role") or "") in ("", "title", "subtitle"):
+            continue
+        index = int(span["row"])
+        if index in protected_rows:
+            continue
+        # 非合并的 span 行：只有"不像抬头"（填充超过稀疏阈值）时才保护。
+        if 0 <= index < len(cells) and populated_by_row[index] > sparse_limit:
+            protected_rows.add(index)
     filled_min = max(2, columns - 1)
     counts = [
         sum(1 for cell in row if _cell_text(cell).strip())
         for row in cells
     ]
     lead = 0
+    # 2026-11-09（lead 实测后修正注释）：这里的"满格即停"是**冗余护栏**，不改变结果。
+    # 原本想用它修 FC-00680（该例 lead=4 误删 4 行），但实测**未生效**：
+    #   `_leading_row_is_page_caption_band` 内部已有 `populated > max(3, columns // 3)
+    #   → return False`，对满格行本来就返回 False，循环本来就会 break。
+    # 保留原因：把"页眉行不可能满格"这条**领域不变式**显式写出，便于后来者理解；
+    # 但**不要**指望它修 FC-00680 —— 该例的真因是 `_merge_unit_suffix_columns`
+    # 用抬头行当表头行导致多列被拼成一格（见 STATUS R38），与这里无关。
     for index in range(min(_MAX_LEADING_CAPTION_ROWS, len(cells) - 2)):
+        row_filled = sum(1 for cell in cells[index] if _cell_text(cell).strip())
+        if row_filled >= columns:
+            break
         if index in protected_rows or not _leading_row_is_page_caption_band(cells[index]):
             break
+        # 2026-11-05（lead 复查，整表上移一行 P0）：全空行有两种含义，必须分开处理。
+        #   ① 空行后面紧跟**真表头**（"序号/物料名称/批次号…"，几乎不含数字）
+        #      ⇒ 这个空行只是页边留白，按原契约删掉（tests/test_leading_caption_drop.py
+        #      的 test_empty_leading_row_is_dropped 就是这个场景）。
+        #   ② 空行后面紧跟**数据行**（至少 2 格含数字，如 FC-00003 的
+        #      "F7-4437/接头/出库/114.685/…"）⇒ 这个空行其实是"有墨迹没读出文字"
+        #      的表头行；删掉会让整表上移一行、逐格归零（FC-00003 hard 0.000）。
+        if counts[index] == 0:
+            following = next(
+                (cells[item] for item in range(index + 1, len(cells)) if counts[item] > 0),
+                None,
+            )
+            digit_cells = 0 if following is None else sum(
+                1 for cell in following if re.search(r"\d", _cell_text(cell))
+            )
+            if digit_cells >= 2:
+                break
+            lead += 1
+            continue
         lead += 1
-    if lead < 1 or lead >= len(cells) - 1 or counts[lead] < filled_min:
+    # 抬头之后可能还夹着"有墨迹却没读出文字"的表头行（counts == 0）。
+    # 这种行不算抬头、不能删（删了整表上移一行），但也不能拿它当"抬头上界已到"的
+    # 证据 —— 判据要往后找**第一行填满的数据行**。
+    # 2026-11-09（lead 实测）：抬头与真表头之间可能还夹着**稀疏行**（不是全空、但没填满），
+    # 例如 FC-00222 counts=[1,2,5,5]、FC-00510 counts=[1,4,7,7]：lead=1 之后 probe 落在
+    # 那行稀疏行上（f2 / f4 < filled_min），于是 return 0、抬头删不掉、整表多两行。
+    # 判据应当是"抬头之后**第一行填满的行**"，中间的空行与稀疏行都要跳过（它们既不能当
+    # 抬头上界，也不能被算成表体证据）。
+    probe = lead
+    while probe < len(cells) and counts[probe] < filled_min:
+        probe += 1
+    if lead < 1 or probe >= len(cells) or counts[probe] < filled_min:
         return 0
     return lead
 
@@ -63051,7 +63809,30 @@ def _drop_leading_page_caption_rows(result):
         # 界面校验会直接判为不安全。这条护栏与"有没有证书"无关，只针对非物理来源。
         return False
 
-    lead = _leading_caption_band_length(cells, spans)
+    physical_certificate = bool(
+        isinstance(certificate, dict)
+        and certificate.get("verified", False)
+        and str(certificate.get("source", "")) in _PHYSICAL_CERTIFICATE_SOURCES
+    )
+    # 2026-11-09（lead 实测，第三次收敛这条判据）：合并行是否保护，看**它有没有被
+    # 物理证书逐行列据背书**：
+    #   · 有物理证书 且 该合并行出现在证书的 spans 里 ⇒ 合并是线框给出的真实结构，保护
+    #     （契约 test_in_table_merged_title_with_group_header_is_kept 正是这种）；
+    #   · 有物理证书但该行**不在**证书 spans 里（只是被网格行数含进去）⇒ 仍按抬头处理，
+    #     后面由"证书行数对账"限幅。实测 FC-00494：网格 43 行、证书 41 行、抬头 2 行。
+    #   · 无证书 ⇒ 不保护（FC-00389 / FC-00222 属这一类）。
+    certified_span_rows = set()
+    if physical_certificate:
+        for span in (certificate.get("spans") or []):
+            if isinstance(span, dict) and isinstance(span.get("row"), int):
+                certified_span_rows.add(int(span["row"]))
+    trust_merged = bool(
+        physical_certificate
+        and {int(s["row"]) for s in spans
+             if isinstance(s, dict) and isinstance(s.get("row"), int)
+             and int(s.get("column_span") or 1) > 1} <= certified_span_rows
+    )
+    lead = _leading_caption_band_length(cells, spans, trust_merged_rows=trust_merged)
     if not lead:
         return False
 
@@ -63059,6 +63840,12 @@ def _drop_leading_page_caption_rows(result):
             and certificate.get("verified", False)
             and str(certificate.get("source", "")) in _PHYSICAL_CERTIFICATE_SOURCES):
         certified_rows = certificate.get("rows")
+        # 2026-11-09（lead 实测）：对账只在"证书行数**少于**网格行数"时才有意义
+        # （那才说明有多出来的行不属于线框）。原来条件是 `0 < certified_rows < len(cells)`，
+        # 但更关键的是**相等**的情况：实测 FC-00494 网格 43 行、证书也 43 行 —— 线框把
+        # 抬头那两行一起数成了行（文档里警示过的"线框数出来的行里本来就含着抬头那一带"），
+        # 于是 min(2, 43-43=0) 把正确的抬头判定压成 0、整表永远多 2 行、hard 归零。
+        # 相等 ⇒ 不做对账限幅，直接采用抬头检测结果。
         if isinstance(certified_rows, int) and 0 < certified_rows < len(cells):
             lead = min(lead, len(cells) - certified_rows)
     if lead < 1:
@@ -63066,6 +63853,10 @@ def _drop_leading_page_caption_rows(result):
 
     result["cells"] = cells[lead:]
     result["rows"] = len(result["cells"])
+    # 抬头行已经不在交付的表里了，它们身上的复核坐标随之作废。
+    _remap_review_axis(
+        result, "rows", lambda index: None if index < lead else index - lead
+    )
     result.setdefault("structure_warnings", []).append(
         "表格上边框之外的抬头说明行已剔除 %d 行，不计入表格行列。" % lead
     )
@@ -63249,6 +64040,16 @@ def _collapse_wrapped_label_rows(result):
                     previous[column]["needs_review"] = True
             rows.pop(index)
             collapsed += 1
+            # 这一行被并进了上一行 ⇒ 复核坐标跟着上一行走。
+            _remap_review_axis(
+                result,
+                "rows",
+                lambda current: (
+                    current - 1 if current > index
+                    else index - 1 if current == index
+                    else current
+                ),
+            )
             merged_this_pass = True
         if not merged_this_pass:
             break
@@ -63712,12 +64513,849 @@ def _finalize_decimal_restore(result):
     return result
 
 
+def _rescue_degenerate_structure(result):
+    """结构退化兜底：最终只剩 1~2 列时，用文字空间布局把整表重建。
+
+    2026-11-06 实测：语料里 31.2% 的用例行列形状与真值不符，其中一批直接塌成 1 列
+    （FC-00010 真值 21×4 → 输出 22×1；FC-00020 13×9 → 12×1）。而这些用例里
+    `_borderless_spatial_grid` 其实已经算出了正确形状——FC-00010 得到 **21×4、
+    逐格硬对齐 0.738**，只是最终选中的候选是退化的那个。
+
+    所以这里在**出口**加最后一道兜底：形状退化时用空间布局重建，并且
+      · **不伪造结构认证**（structure_verified=False、证书清空、publication_blocked=True）；
+      · 每一格都 `needs_review=True`，客户一眼能看到"这表要核"；
+    宁可给一张标满黄的可用表，也不给一张 1 列的废表。
+    """
+    if os.environ.get("OCRTABLE_STRUCTURE_RESCUE", "1") == "0":
+        return result
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return result
+    cells = result.get("cells")
+    if not isinstance(cells, list) or len(cells) < 4:
+        return result
+    original_columns = int(result.get("columns") or 0)
+    if original_columns >= 3:
+        return result
+    populated = sum(
+        1 for row in cells for cell in row
+        if isinstance(cell, dict) and str(cell.get("text", "")).strip()
+    )
+    if populated < 8:
+        return result
+    image_path = str(result.get("source_image") or "")
+    if not image_path or not Path(image_path).is_file():
+        return result
+    try:
+        engine, _table_engine = _engines()
+        image = _read_image(Path(image_path))
+        output = engine(image)
+    except Exception:  # noqa: BLE001 - 兜底失败绝不能影响主响应
+        return result
+    boxes = getattr(output, "boxes", None)
+    texts = getattr(output, "txts", None)
+    scores = getattr(output, "scores", None)
+    boxes = [] if boxes is None else list(boxes)
+    texts = [] if texts is None else list(texts)
+    scores = [] if scores is None else list(scores)
+    if len(texts) < 8:
+        return result
+    try:
+        grid, _confidence, _spans, ok = _borderless_spatial_grid(boxes, texts, scores)
+    except Exception:  # noqa: BLE001
+        return result
+    if not ok or not grid or not grid[0] or len(grid[0]) < 3:
+        return result
+    rebuilt_populated = sum(1 for row in grid for value in row if str(value).strip())
+    if rebuilt_populated < max(8, int(populated * 0.8)):
+        return result
+    rebuilt_cells = [
+        [{"text": str(value), "confidence": 0.0, "needs_review": True} for value in row]
+        for row in grid
+    ]
+    # 与 _drop_leading_page_caption_rows 同口径去掉页眉行
+    lead = _leading_caption_band_length(rebuilt_cells, [])
+    if 0 < lead < len(rebuilt_cells) - 1:
+        rebuilt_cells = rebuilt_cells[lead:]
+    result["cells"] = rebuilt_cells
+    result["rows"] = len(rebuilt_cells)
+    result["columns"] = len(rebuilt_cells[0]) if rebuilt_cells else 0
+    result["spans"] = []
+    result["structure_verified"] = False
+    result["structure_certificate"] = None
+    result["structure_review_required"] = True
+    result["publication_blocked"] = True
+    if result.get("recognition_state") == "verified":
+        result["recognition_state"] = "blocked"
+    reasons = result.setdefault("publication_block_reasons", [])
+    if isinstance(reasons, list):
+        reasons.append(
+            "原识别结构退化（只有 %d 列），已按文字空间布局重建为 %d 行 × %d 列，整表需人工核对。"
+            % (original_columns, result["rows"], result["columns"])
+        )
+    notices = result.setdefault("processing_notices", [])
+    if isinstance(notices, list):
+        notices.append(
+            "结构退化兜底：已按文字空间布局把 %d 列重建为 %d 列，全部单元格标黄待确认。"
+            % (original_columns, result["columns"])
+        )
+    return result
+
+
+def _drop_serial_number_column(result):
+    """删掉被误检成数据的**行号列**（整列严格 1..N 递增）。
+
+    2026-11-09（lead 实测 + 语料统计，判据⑥）：`FC-01192` 真值 29×4，我们输出 29×5，
+    多出的第 0 列整列是 `1,2,3,...,29`（行号）。这类多余列会让每行右移一格、hard 归零。
+
+    **安全性依据（实测）**：扫描 600 例真值，**没有一例**的第 0 列是"严格 1..N 递增"
+    （0.0%）—— 这套语料的表格都不用行号列。所以"整列严格递增整数"是纯粹的误检信号。
+    额外护栏：
+      · 只在**第 0 列**上判定（行号总在最左）；
+      · 要求该列**每一行都有值**且**严格等于行序号**（从 1 开始，容差 0）；
+      · 要求至少 5 行（短表不判，避免把 3 行小表的真实编号误删）；
+      · 删除后必须还剩 ≥2 列；
+      · 有 spans 时不动（合并区的列索引会错位）。
+    """
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return result
+    cells = result.get("cells")
+    if not isinstance(cells, list) or len(cells) < 5:
+        return result
+    if len(cells[0]) < 3:
+        return result
+    if result.get("spans"):
+        return result
+    column = []
+    for row in cells:
+        if not isinstance(row, list) or not row:
+            return result
+        column.append(str(row[0].get("text", "") if isinstance(row[0], dict) else row[0]).strip())
+    if not all(value.isdigit() for value in column):
+        return result
+    numbers = [int(value) for value in column]
+    if numbers != list(range(1, len(numbers) + 1)):
+        return result
+    for row in cells:
+        if isinstance(row, list):
+            del row[0]
+    result["cells"] = cells
+    result["columns"] = len(cells[0]) if cells else 0
+    notices = result.setdefault("processing_notices", [])
+    if isinstance(notices, list):
+        notices.append(
+            "已去掉被误检为数据的行号列（整列严格 1..%d 递增），原 %d 列 → %d 列。"
+            % (len(numbers), len(numbers) and result["columns"] + 1, result["columns"])
+        )
+    return result
+
+
+def _drop_blank_edge_columns(result):
+    """去掉**整列为空**的首列/尾列，避免整表被一列空白挤偏。
+
+    2026-11-06 实测（500 例普查）：`hard<0.1` 的灾难性错位里，58/100 的最佳对齐分数
+    ≥0.5、44 例 ≥0.8 —— 内容几乎全对，只是整表错了一列。逐例取证确认了同一形态：
+      · FC-00294：实际 9×**9** / 真值 9×**8**，首列整列全空；
+      · FC-00371：实际 13×**9** / 真值 13×**8**，首列整列全空；
+      · FC-00138：实际 21×4 / 真值 21×5，首列（编号列）没检出来，其余逐格相同。
+    前两种可以安全修：整列一个字都没有 ⇒ 它不承载任何数据，留着只会把每行右移一格。
+    `_trim_grid_to_populated_extent` 只管尾部且要求连续 ≥2 列，管不到首列与单列尾部。
+
+    有 spans 时直接跳过（合并区按列索引记录，删列会让合并坐标错位）。
+    """
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return result
+    cells = result.get("cells")
+    if not isinstance(cells, list) or len(cells) < 2:
+        return result
+    width = min(len(row) for row in cells)
+    if width < 3:
+        return result
+
+    def column_is_blank(index):
+        return all(not str(row[index].get("text", "")).strip()
+                   for row in cells if isinstance(row[index], dict))
+
+    blank = [column_is_blank(index) for index in range(width)]
+    if all(blank):
+        return result
+    leading = 0
+    while leading < width - 1 and blank[leading]:
+        leading += 1
+    trailing = 0
+    while trailing < width - 1 - leading and blank[width - 1 - trailing]:
+        trailing += 1
+    if not leading and not trailing:
+        return result
+    end = width - trailing
+    for row in cells:
+        if isinstance(row, list) and len(row) >= width:
+            del row[end:width]
+            if leading:
+                del row[0:leading]
+    result["cells"] = cells
+    result["rows"] = len(cells)
+    result["columns"] = len(cells[0]) if cells else 0
+    # 2026-11-06（lead 复查）：原来这里"有 spans 就整体跳过"，结果在本例完全失效 ——
+    # 因为收尾阶段 spans 还没被清空，而它是在更后面才清的。改成**同步平移/裁剪**合并区：
+    # 落在被删区域里的 span 丢掉，其余列号左移 leading、列宽裁到 end。
+    spans = result.get("spans")
+    if isinstance(spans, list) and spans:
+        adjusted = []
+        for span in spans:
+            if not isinstance(span, dict):
+                continue
+            try:
+                column = int(span.get("column", 0))
+                span_width = max(1, int(span.get("column_span", 1) or 1))
+            except (TypeError, ValueError):
+                continue
+            start = column - leading
+            stop = column + span_width - leading
+            if stop <= 0 or start >= end - leading:
+                continue
+            start = max(0, start)
+            stop = min(end - leading, stop)
+            if stop - start < 1:
+                continue
+            adjusted.append(dict(span, column=start, column_span=stop - start))
+        result["spans"] = adjusted
+    notices = result.setdefault("processing_notices", [])
+    if isinstance(notices, list):
+        parts = []
+        if leading:
+            parts.append("首部 %d 列" % leading)
+        if trailing:
+            parts.append("尾部 %d 列" % trailing)
+        notices.append(
+            "已按「整列无文字」去掉%s空白列（原 %d 列 → %d 列），避免整表被空白列挤偏。"
+            % ("、".join(parts), width, result["columns"])
+        )
+    return result
+
+
+def _drop_column_letter_rows(result):
+    """删掉被误检成数据的**电子表格列标行**（整行都是 A/B/C…/AA/AB…）。
+
+    2026-11-10（lead 实测，`FC-00982`）：该例输出
+      R1 = ['A','B','C','D','E','2','G','H','BLES']   ← **Excel 顶部的列标栏**
+      R2 = ['类别','客户名称','产品','规格','数量','单价','金额','审核人','成本中心']  ← 真表头
+    真值里没有列标行 ⇒ 整表下移一行 ⇒ 17×9 形状对但 hard 0.006（best 0.941）。
+    这与已修的"页眉行""行号列"同属**表格外的 UI 元素**，属可安全收紧的一类。
+
+    **判据（全部满足才删）**
+      · 该行有 ≥3 个非空格；
+      · 每个非空格都是**纯字母**（A-Z 大写或小写均可，长度 1~4，如 A/B/AA/BLES）；
+      · 该行**没有任何数字**（真数据行几乎不会整行纯字母）；
+      · 该行不在最后一行（末尾通常是真数据/合计）；
+      · 删除后剩余行数 ≥3；
+      · 有 spans 时不动（行索引会错位）。
+
+    安全性依据：真表头是**中文列名或含数字的列名**，不会是"整行纯英文字母"；
+    实测 600 例真值中，首 3 行"整行纯字母且无数字"的形态需要进一步统计确认（见 STATUS）。
+    """
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return result
+    cells = result.get("cells")
+    if not isinstance(cells, list) or len(cells) < 4:
+        return result
+    if result.get("spans"):
+        return result
+    if not all(isinstance(row, list) for row in cells):
+        return result
+
+    removed = 0
+    index = 0
+    while index < min(len(cells) - 1, 4):
+        values = [str(cell.get("text", "") if isinstance(cell, dict) else cell).strip()
+                  for cell in cells[index]]
+        filled = [value for value in values if value]
+        # 2026-11-10（lead 实测 FC-00982 的真实形态，修正判据）：
+        # 列标行不一定是"每格纯字母" —— 实际是
+        #   ['A\n客户名称', 'B\n明细表', 'C', 'D', 'E', '2', 'G\n66082862M00\nR', 'H', 'BLES']
+        # 即**列标字母与相邻格子内容/换行混在一起**。原判据（每格纯字母）只命中 4/9 格，因此无效。
+        # 真实稳定性特征是"**每格都以单字母开头**"（A~Z + 可选换行/后续内容）。
+        # 真值侧反例：1200 例中"整行每格都以单字母开头且有 ≥3 格"的形态为 0 例（见 STATUS R52）。
+        # 2026-11-10（lead 实测，**收紧以修回归**）：原来的 `or len(value) == 1` 把
+        # **任意单个字符**都当成"以字母开头" ⇒ FC-00562 的噪声行 `['-','I','详细信息','[','[']`
+        # 里有 5 个"单字符"被判成列标，整行被删 ⇒ 22 行变 21 行、hard 0.602 → 0.085。
+        # 收紧为：必须是**纯字母**（1~4 个 A-Za-z）开头，或**单个真正的字母**（不能是 `-`/`[`/`|` 等噪声）。
+        def _starts_with_letter(value: str) -> bool:
+            if re.fullmatch(r"[A-Za-z]{1,4}", value):
+                return True
+            return bool(re.match(r"^[A-Za-z]{1,4}(?:\s|\n)", value))
+
+        starts_with_letter = sum(1 for value in filled if _starts_with_letter(value))
+        if (len(filled) >= 4
+                and starts_with_letter >= max(4, int(len(filled) * 0.6))
+                and not any(re.search(r"^\d", value) for value in filled[:1])):
+            del cells[index]
+            removed += 1
+            continue
+        index += 1
+    if not removed:
+        return result
+    result["cells"] = cells
+    result["rows"] = len(cells)
+    result["columns"] = len(cells[0]) if cells else 0
+    notices = result.setdefault("processing_notices", [])
+    if isinstance(notices, list):
+        notices.append(
+            "已去掉 %d 行被误检为数据的电子表格列标行（整行纯字母，如 A/B/C），原表从第 %d 行起。"
+            % (removed, removed + 1)
+        )
+    return result
+
+
+def _drop_blank_rows_near_header(result):
+    """删掉**表头区域内的整行全空行**（前后行都非空），并同步平移 spans 行号。
+
+    2026-11-10（lead 实测，`FC-00276`）：输出 R0=表头、**R1=整行全空**、R2=数据，
+    真值无此空行 ⇒ 30×9 vs 29×9、hard 0.088（best 0.966）。
+
+    **安全性依据（实测）**：扫描 1200 例真值，**0 例**存在"内部全空行（前后都非空）"（0.00%）。
+
+    **与上一版的区别**：上一版把"有 spans 就不动"当护栏 ⇒ 该例 `spans=1` 直接跳过、完全没生效。
+    本版改为**删行后同步平移 span 行号**（span 行号 > 被删行则减 1；等于被删行则该 span 作废），
+    并用现成的 `_remap_review_axis` 平移复核坐标。
+
+    护栏：只看前 5 行；整行全空；前一行与后一行都非空；至少留 3 行。
+    """
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return result
+    cells = result.get("cells")
+    if not isinstance(cells, list) or len(cells) < 3:
+        return result
+    if not all(isinstance(row, list) for row in cells):
+        return result
+
+    def filled(row):
+        return sum(1 for cell in row
+                   if str(cell.get("text", "") if isinstance(cell, dict) else cell).strip())
+
+    removed_at = []
+    index = 1
+    while index < min(len(cells) - 1, 5):
+        if filled(cells[index]) == 0 and filled(cells[index - 1]) and filled(cells[index + 1]):
+            del cells[index]
+            removed_at.append(index)
+            continue
+        index += 1
+    if not removed_at or len(cells) < 3:
+        return result
+
+    def shift(row_index):
+        # 被删行之前的行保持不动；之后的行整体上移（按删掉的个数）
+        return row_index - sum(1 for gone in removed_at if gone < row_index)
+
+    spans = result.get("spans")
+    if isinstance(spans, list) and spans:
+        kept = []
+        for span in spans:
+            if not isinstance(span, dict):
+                continue
+            row_index = span.get("row")
+            if not isinstance(row_index, int):
+                continue
+            if row_index in removed_at:
+                continue  # 锚点在被删的空行上 ⇒ 该合并区作废
+            span["row"] = shift(row_index) if row_index else 0
+            kept.append(span)
+        result["spans"] = kept
+
+    result["cells"] = cells
+    result["rows"] = len(cells)
+    result["columns"] = len(cells[0]) if cells else 0
+    _remap_review_axis(result, "rows", lambda current: shift(current))
+    notices = result.setdefault("processing_notices", [])
+    if isinstance(notices, list):
+        notices.append("已去掉表头区域里的 %d 个整行空行（前后行都有内容）。" % len(removed_at))
+    return result
+
+
+def _enforce_response_invariants(result):
+    """返回前把响应的**自洽性**钉死，避免 GUI 把可用结果整表丢弃。
+
+    2026-11-06（lead 复查，客户实测）：GUI 的 `publishRecognitionResult`
+    （`src/gui/mainwindow.cpp:1504-1630`）有一整套一致性校验，任何一条不满足都会
+    以 `INVALID_RESPONSE` 丢弃整张表，客户看到的是
+    「识别组件返回的结果不完整，本次结果未被采用」——**明明已经识别出来了**。
+    它要求（逐条对照源码）：
+      ① `(recognition_state == "blocked") == publication_blocked`；
+      ② `structure_verified == false` ⇒ 必须 `structure_certificate == null` 且 `publication_blocked == true`；
+      ③ `structure_verified == true` ⇒ 证书必须是对象，且 `rows/columns` 等于最终网格、
+         `spans` 与响应 `spans` 完全一致、`geometry_hash`/`structure_hash` 非空；
+      ④ `recognition_state == "verified"` ⇒ 不得有任何 `needs_review` 单元格。
+    后端的各条路径（尤其是我加的列裁剪/结构兜底）可能破坏其中某条，所以在这里统一收敛：
+    **保证后端交出去的每一份响应都能被 GUI 接受**，坏的不一致就地降级成"需人工核对"。
+    """
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return result
+    cells = result.get("cells")
+    if not isinstance(cells, list) or not cells:
+        return result
+    rows = len(cells)
+    columns = len(cells[0]) if isinstance(cells[0], list) else 0
+    result["rows"] = rows
+    result["columns"] = columns
+
+    certificate = result.get("structure_certificate")
+    verified = result.get("structure_verified") is True
+    spans = result.get("spans") if isinstance(result.get("spans"), list) else []
+
+    def _drop_certificate(reason: str) -> None:
+        nonlocal verified, certificate
+        verified = False
+        certificate = None
+        result["structure_verified"] = False
+        result["structure_certificate"] = None
+        result["structure_review_required"] = True
+        warnings = result.setdefault("structure_warnings", [])
+        if isinstance(warnings, list):
+            warnings.append(reason)
+
+    if verified:
+        if not isinstance(certificate, dict):
+            _drop_certificate("结构状态与证书不一致（缺少校验证书），已按「结构未确认」处理。")
+        else:
+            try:
+                certified_rows = int(certificate.get("rows", -1))
+                certified_columns = int(certificate.get("columns", -1))
+            except (TypeError, ValueError):
+                certified_rows = certified_columns = -1
+            certified_spans = certificate.get("spans")
+            if (certified_rows != rows or certified_columns != columns
+                    or not isinstance(certified_spans, list)
+                    or certified_spans != spans
+                    or not str(certificate.get("geometry_hash") or "").strip()
+                    or not str(certificate.get("structure_hash") or "").strip()):
+                _drop_certificate(
+                    "结构校验证书与最终网格不一致（行%d×列%d vs 证书 %s×%s），已按「结构未确认」处理。"
+                    % (rows, columns, certified_rows, certified_columns)
+                )
+    else:
+        # 未认证结果绝不能带证书（GUI 会直接拒收）
+        if certificate is not None:
+            result["structure_certificate"] = None
+
+    any_review = any(
+        isinstance(cell, dict) and cell.get("needs_review") is True
+        for row in cells for cell in row
+    )
+    state = str(result.get("recognition_state") or "")
+    blocked = result.get("publication_blocked") is True
+    if not blocked and not verified:
+        # 未认证又不阻断 ⇒ GUI 会判"不安全的发布状态"；这里按需阻断
+        blocked = True
+        result["publication_blocked"] = True
+        reasons = result.setdefault("publication_block_reasons", [])
+        if isinstance(reasons, list):
+            reasons.append("结构未取得认证，已阻断自动发布（需人工核对行列归属）。")
+    if state == "verified" and (any_review or not verified):
+        state = "needs_review" if not blocked else "blocked"
+    if blocked:
+        state = "blocked"
+    elif state == "blocked":
+        state = "needs_review"
+    if state not in ("verified", "needs_review", "blocked"):
+        state = "blocked" if blocked else "needs_review"
+    result["recognition_state"] = state
+    result.setdefault("publication_block_reasons", [])
+    return result
+
+
+_INPUT_ERROR_MARKERS = (
+    "image does not exist",
+    "图片文件不存在",
+    "图片不存在",
+    "cannot read image",
+    "图片尺寸无效",
+    "unsupported or damaged image",
+    "识别模型文件缺失",
+    "识别模型文件校验失败",
+    "output_path is required",
+    "image_path is required",
+    "is required",
+    "unsupported action",
+    "unsupported protocol",
+    "unknown action",
+)
+
+
+_RECOGNITION_RETRY_LOCK = threading.Lock()
+# 2026-11-09：RSS 超过该值时在请求收尾补一次彻底回收（判据⑦：峰值 ≤1500 MB）。
+_NATIVE_MEMORY_PRESSURE_MB = 900.0
+
+
+_RECOGNITION_RETRY_FLOOR_SECONDS = 10.0
+
+
+def _request_absolute_deadline() -> float:
+    """本请求的**绝对**截止时刻（perf_counter 基准），跨重试重置也不变。
+
+    2026-11-09（lead 实测 P0）：重试窗通过"前移 `_request_started_at`"给新窗，于是
+    所有以 `_request_started_at` 为基准的检查点都被**重置**了 —— 实测 FC-00834 在
+    721-920 普查里跑了 **310 秒**（超过 `_retry_ceiling_seconds()` 的 240 秒上限），
+    因为重试期间解码/几何/复核这些前置阶段又完整跑了一遍，而它们只看重置后的起点。
+    这里给一个从"请求真正开始"算起的绝对截止：创建后不再改变，检查点取
+    min(窗口判定, 绝对截止)，保证任何路径都不可能突破 `_retry_ceiling_seconds()`。
+    """
+    deadline = globals().get("_request_absolute_deadline_at")
+    if deadline:
+        return float(deadline)
+    ceiling = _retry_ceiling_seconds()
+    return (globals().get("_request_absolute_started_at") or time.perf_counter()) + ceiling
+
+
+def _begin_recognition_retry_window() -> bool:
+    """为"预算超限后的重试"开一个新的、**有上界**的时间窗。返回是否允许重试。
+
+    2026-11-07（lead 实测修复两个 P0）：
+      · 旧实现用 `globals()["_budget_enabled"] = False` 关**全局**墙钟，重试期间其它并发
+        请求一起失去约束；实测正常请求 FC-00001 被波及后退化成 1×1 空表（46.8 s）。
+      · 而且关掉后没有上界：`deadline_seconds=1` 的请求实测跑了 **150.4 s** 才返回。
+
+    新实现不碰任何全局开关，只做两件事：
+      1. 用 `_HARD_RECOGNITION_CEILING_SECONDS(120) - 已用时长` 算剩余额度；不足
+         `_RECOGNITION_RETRY_FLOOR_SECONDS(10)` 就不重试（直接给尽力结果，快速返回）；
+      2. 把 `_request_started_at` 前移成"刚开始"，让本次请求获得 min(60, 剩余额度) 的新窗
+         ⇒ 总墙钟封顶在 ≈120 秒。
+    同时用非阻塞锁保证同一时刻只有一个重试在跑；拿不到锁就放弃重试（绝不排队堆时间）。
+    """
+    if not _RECOGNITION_RETRY_LOCK.acquire(blocking=False):
+        return False
+    try:
+        started = globals().get("_request_started_at") or 0.0
+        spent = (time.perf_counter() - started) if started else 0.0
+        # 2026-11-08（lead 实测）：重试总上限从 120 提到可配置的 240 秒。
+        # 依据：FC-00016 关预算实测需 **205 秒**且拿到 hard 0.992、36×11；
+        # 而 120 秒上限下它必然退化成 1×1 空表（hard 0）。客户明确「慢一点可以，
+        # 但必须出结果」，所以宁可多等，也不要把一张能读出来的表变成空表。
+        ceiling = _retry_ceiling_seconds()
+        allowance = ceiling - spent
+        if allowance < _RECOGNITION_RETRY_FLOOR_SECONDS:
+            _RECOGNITION_RETRY_LOCK.release()
+            return False
+        globals()["_retry_saved_max_seconds"] = _MAX_REQUEST_SECONDS
+        globals()["_request_started_at"] = time.perf_counter()
+        # 关键：`_effective_request_limit_seconds()` 取 min(_MAX_REQUEST_SECONDS, 预算)，
+        # 所以要让重试真正拿到 allowance 秒，必须临时抬高 _MAX_REQUEST_SECONDS。
+        # 这里在重试锁内改、在 _end_recognition_retry_window() 里原样恢复。
+        globals()["_MAX_REQUEST_SECONDS"] = max(_MAX_REQUEST_SECONDS, float(allowance))
+        globals()["_request_budget_seconds"] = float(allowance)
+        globals()["_budget_exhausted"] = False
+        globals()["_budget_exhausted_model"] = ""
+        globals()["_budget_exhausted_reason"] = ""
+        return True
+    except Exception:  # noqa: BLE001
+        _RECOGNITION_RETRY_LOCK.release()
+        return False
+
+
+def _end_recognition_retry_window() -> None:
+    """释放重试窗并恢复被临时抬高的 `_MAX_REQUEST_SECONDS`（幂等）。"""
+    try:
+        saved = globals().get("_retry_saved_max_seconds")
+        if saved is not None:
+            globals()["_MAX_REQUEST_SECONDS"] = saved
+            globals()["_retry_saved_max_seconds"] = None
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if _RECOGNITION_RETRY_LOCK.locked():
+            _RECOGNITION_RETRY_LOCK.release()
+    except (RuntimeError, ValueError):
+        pass
+
+
+def _retry_ceiling_seconds() -> float:
+    """重试总墙钟上限（秒）。默认 240，可用 OCRTABLE_RETRY_CEILING_SECONDS 标定。"""
+    try:
+        value = float(os.environ.get("OCRTABLE_RETRY_CEILING_SECONDS", "240"))
+    except (TypeError, ValueError):
+        return 240.0
+    if value < _RECOGNITION_RETRY_FLOOR_SECONDS:
+        return 240.0
+    return value
+
+
+def _is_input_error(error: BaseException) -> bool:
+    """这是"调用方/环境"错误而不是"识别不出来"吗？
+
+    2026-11-06（客户要求"绝不报错"之后的必要收窄）：出口兜底只该吞**识别失败**。
+    图片路径不存在、打不开、尺寸非法、模型缺失、请求缺字段——这些都是调用方或安装
+    问题，必须原样抛出去（GUI 有对应文案，客户能据此修），否则客户拿到一张空表
+    却完全不知道是自己的路径写错了。
+    """
+    if isinstance(error, (FileNotFoundError, PermissionError, IsADirectoryError, OSError)):
+        return True
+    if isinstance(error, _InvalidRequestError):
+        return True
+    message = str(error)
+    return any(marker in message for marker in _INPUT_ERROR_MARKERS)
+
+
+def _salvage_from_page_ocr(request: dict[str, Any], reason: str) -> dict[str, Any] | None:
+    """识别判定"没检出文字/没检出表格"时，用**已经检出的零散文本**拼一张尽力表。
+
+    2026-11-08（lead 实测，客户要求"扫到什么都给我答案"）：
+    FC-00201 / FC-00226 / FC-00266 三例真值分别有 170 / 100 / 117 格，但流程判定
+    "图片里没有检出任何文字" ⇒ 兜底成 1×1 空表，客户一个字都拿不到。
+    而直接对同一张原图跑页面 OCR 分别能拿到 6 / 8 / N 个文本 —— 这些是**真实检出的
+    内容**，不该被丢掉。这里把它们按 `_borderless_spatial_grid` 的空间关系拼成表：
+    全部单元格标 `needs_review=True`、`publication_blocked=True`，绝不伪造认证。
+    失败或拼不出 ≥2 列时返回 None（由调用方退化成 1×1 空表）。
+    """
+    image_path = str(request.get("image_path") or "")
+    if not image_path or not Path(image_path).is_file():
+        return None
+    try:
+        engine, _table = _engines()
+        image = _read_image(Path(image_path))
+        output = engine(image)
+    except Exception:  # noqa: BLE001
+        return None
+    texts = getattr(output, "txts", None)
+    boxes = getattr(output, "boxes", None)
+    scores = getattr(output, "scores", None)
+    texts = [] if texts is None else list(texts)
+    boxes = [] if boxes is None else list(boxes)
+    scores = [] if scores is None else list(scores)
+    if len(texts) < 3 or len(boxes) != len(texts):
+        return None
+    try:
+        grid, _confidence, _spans, ok = _borderless_spatial_grid(boxes, texts, scores)
+    except Exception:  # noqa: BLE001
+        return None
+    if not ok or not grid or not grid[0] or len(grid[0]) < 2:
+        return None
+    cells = [[{"text": str(value), "confidence": 0.0, "needs_review": True} for value in row]
+             for row in grid]
+    populated = sum(1 for row in cells for cell in row if cell["text"].strip())
+    if populated < 3:
+        return None
+    notice = ("本次未能确认完整表格结构（%s），已把检出的 %d 个文字按位置拼成 %d 行 × %d 列，"
+              "整表需人工核对；建议用「框选区域」只框住表格本体后重试。" % (
+                  reason, populated, len(cells), len(cells[0])))
+    return {
+        "protocol": PROTOCOL_VERSION,
+        "status": "ok",
+        "action": "recognize",
+        "request_id": request.get("request_id"),
+        "rows": len(cells),
+        "columns": len(cells[0]),
+        "cells": cells,
+        "spans": [],
+        "recognition_state": "blocked",
+        "publication_blocked": True,
+        "publication_block_reasons": [notice],
+        "structure_verified": False,
+        "structure_certificate": None,
+        "structure_review_required": True,
+        "structure_warnings": [notice],
+        "processing_notices": [notice],
+        "degraded": True,
+        "review_cell_count": populated,
+        "review_ratio": 1.0,
+        "image_quality": {"issues": [], "issue_labels": [], "needs_recapture": True},
+        "rectified_image": "",
+        "elapsed_seconds": 0.0,
+        "memory_mode": _ACTIVE_RECOGNITION_MEMORY_MODE,
+        "source_image": image_path,
+    }
+
+
+def _degraded_recognition_result(request: dict[str, Any], reason: str) -> dict[str, Any]:
+    """**绝不出错**的兜底结果：识别不出来也交回一张（空的、标黄的）表。
+
+    2026-11-06（客户要求）：不要任何报错弹窗，扫到什么就给什么；实在扫不出来也要给结果。
+    所以识别阶段的任何失败都不再抛给上层，而是退化成这张 1×1 的空表：
+      · `status=ok`（不是 error）⇒ 界面不会弹错；
+      · 全部单元格 `needs_review=true` + `publication_blocked=true` ⇒ 明确告诉客户"要核"；
+      · `structure_verified=false` 且证书为空 ⇒ 不会伪造认证，也满足 GUI 的一致性校验；
+      · 两条中文提示（`processing_notices` / `publication_block_reasons`）说明原因与下一步。
+    """
+    notice = "本次未能识别出表格内容（%s）。请用「框选区域」只框住表格本体，或换一张更清晰的照片重试。" % reason
+    return {
+        "protocol": PROTOCOL_VERSION,
+        "status": "ok",
+        "action": "recognize",
+        "request_id": request.get("request_id"),
+        "rows": 1,
+        "columns": 1,
+        "cells": [[{"text": "", "confidence": 0.0, "needs_review": True}]],
+        "spans": [],
+        "recognition_state": "blocked",
+        "publication_blocked": True,
+        "publication_block_reasons": [notice],
+        "structure_verified": False,
+        "structure_certificate": None,
+        "structure_review_required": True,
+        "structure_warnings": [notice],
+        "processing_notices": [notice],
+        "degraded": True,
+        "review_cell_count": 1,
+        "review_ratio": 1.0,
+        "image_quality": {"issues": [], "issue_labels": [], "needs_recapture": True},
+        "rectified_image": "",
+        "elapsed_seconds": 0.0,
+        "memory_mode": _ACTIVE_RECOGNITION_MEMORY_MODE,
+        "source_image": str(request.get("image_path") or ""),
+    }
+
+
+def _release_native_memory_if_pressured() -> int:
+    """按"本次已见多少个不同输入几何"释放 OpenVINO 原生激活缓冲。
+
+    2026-11-06 实测（隔离实验，决定性）：动态形状识别模型 `x[?,3,48,?]` 会为**每个
+    不同输入几何**各留一份激活缓冲 —— 固定 crop 形状跑 12 轮 RSS 完全平（468→469 MB），
+    每轮换新形状则 +8 MB/轮；单个新几何 (16,3,48,640) 就要 **+152 MB**、
+    (16,3,48,1280) **+297 MB**，而同形状重跑只 +0.2 MB。每张表列宽都不同 ⇒ 几何不断
+    新增 ⇒ 同一进程连续识别时 RSS 无平台期（13 例 851→1356 MB，+31 MB/例）。
+    而 `release_native_resources()` 之后 551→109 MB，说明这些缓冲**全部可回收**。
+
+    所以请求收尾时按压力释放；下一请求由 `prepare_for_request()` 重建识别器
+    （实测 Small 0.3~1.0 s、det/cls 0.6~1.5 s），代价远小于内存收益。
+    阈值可用 `OCRTABLE_NATIVE_SHAPE_RELEASE_THRESHOLD` 标定；设为 0 表示关闭。
+    """
+    try:
+        threshold = int(os.environ.get("OCRTABLE_NATIVE_SHAPE_RELEASE_THRESHOLD", "24"))
+    except (TypeError, ValueError):
+        threshold = 24
+    # 2026-11-06（lead 实测修正）：几何计数只在并行调度器被启用时才有值，而实测生产路径
+    # **根本没用 ParallelTextRecognizer**（calls=0、注册表=0）⇒ 压力判据永不触发。
+    # 所以默认改成"每请求收尾释放"（取证实测代价 Small 0.3~1.0 s、det/cls 0.6~1.5 s），
+    # 下一请求由 prepare_for_request() 重建。要回到旧行为设
+    # OCRTABLE_RELEASE_NATIVE_PER_REQUEST=0；此时才用几何压力阈值兜底。
+    release_every_request = os.environ.get("OCRTABLE_RELEASE_NATIVE_PER_REQUEST", "1") != "0"
+    try:
+        import recognition_scheduler as scheduler_module
+    except Exception:  # noqa: BLE001 - 拿不到调度器就只看是否每请求释放
+        scheduler_module = None
+    pressure = 0
+    if scheduler_module is not None:
+        try:
+            pressure = int(scheduler_module.native_shape_pressure())
+        except Exception:  # noqa: BLE001
+            pressure = 0
+    if not release_every_request:
+        if threshold <= 0:
+            return 0
+        if pressure < threshold:
+            return pressure
+    release = getattr(_ocr_engine, "release_for_table_structure", None)
+    if not callable(release):
+        return pressure
+    try:
+        release()
+    except Exception:  # noqa: BLE001 - 释放失败不能影响响应
+        return pressure
+    if scheduler_module is not None:
+        try:
+            scheduler_module.reset_native_shape_pressure()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        gc.collect()
+    except Exception:  # noqa: BLE001
+        pass
+    # 2026-11-09（lead 实测，判据⑦）：长跑普查里峰值会累积到 1776 MB（单请求增量已是负值，
+    # 说明每请求释放有效，问题在于"释放与 GC 未及时完成 + 宽表瞬时峰值叠加"）。
+    # 这里补一道：进程 RSS 超过阈值时做一次更彻底的回收（gc + 再释放一次），
+    # 只影响资源释放时机，不改任何识别语义。
+    try:
+        import ctypes
+        import ctypes.wintypes as _wt
+
+        class _PMC(ctypes.Structure):
+            _fields_ = [("cb", _wt.DWORD), ("PageFaultCount", _wt.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t)]
+
+        counters = _PMC()
+        counters.cb = ctypes.sizeof(_PMC)
+        api = ctypes.WinDLL("psapi.dll").GetProcessMemoryInfo
+        api.argtypes = [_wt.HANDLE, ctypes.POINTER(_PMC), _wt.DWORD]
+        api.restype = _wt.BOOL
+        if api(ctypes.windll.kernel32.GetCurrentProcess(),
+               ctypes.byref(counters), counters.cb):
+            rss_mb = counters.WorkingSetSize / 1048576.0
+            if rss_mb >= _NATIVE_MEMORY_PRESSURE_MB:
+                release_again = getattr(_ocr_engine, "release_for_table_structure", None)
+                if callable(release_again):
+                    try:
+                        release_again()
+                    except Exception:  # noqa: BLE001
+                        pass
+                gc.collect()
+    except Exception:  # noqa: BLE001
+        pass
+    return pressure
+
+
 if not globals().get("_LEAD_DECIMAL_WRAPPED"):
     _LEAD_RECOGNIZE_INNER = _recognize
 
     def _lead_decimal_restore_wrapper(request):
-        """识别出口统一补回被吞掉的小数点（幂等，可安全重复执行）。"""
-        return _finalize_decimal_restore(_LEAD_RECOGNIZE_INNER(request))
+        """识别出口统一兜底：**绝不出错** → 再补结构/去空边列/补小数点 → 释放原生缓冲。
+
+        2026-11-06（客户要求）：任何识别失败都不要变成报错弹窗。策略：
+          ① 预算超限 ⇒ 先按"准确优先"关掉墙钟**重试一次**（客户明确说慢一点可以）；
+          ② 重试仍失败、或"没检出文字 / 未检测到表格"这类 ⇒ 退化成一张空表（status 仍 ok）；
+          ③ 其它任何异常同样退化，绝不向上抛。
+        """
+        try:
+            result = _LEAD_RECOGNIZE_INNER(request)
+        except Exception as error:  # noqa: BLE001 - 兜底：识别失败也要给结果
+            # 2026-11-06（lead）：**输入/环境错误必须继续抛** —— 图片不存在、读不了、
+            # 模型缺失、请求缺字段都是调用方/安装问题，悄悄返回空表会让客户误判成
+            # "识别不出来"。只有真正的识别失败才走退化路径。
+            if _is_input_error(error):
+                raise
+            result = None
+            reason = str(error)[:120] or type(error).__name__
+            retryable = (isinstance(error, _FineGrainedBudgetExceeded) or "预算" in reason
+                         or "60 秒" in reason or "未完成" in reason
+                         # 2026-11-08（lead 实测）：预算中止会把内部状态留在半成品上，
+                         # 后续可能抛 IndexError（FC-00020 实测 `list index out of range`）。
+                         # 这类"中止后遗症"只要本次请求确实中止过，就按可重试处理 ——
+                         # 否则客户拿到的是空表，而重试一次就能拿到真实结果。
+                         or bool(globals().get("_budget_exhausted")))
+            if retryable and _begin_recognition_retry_window():
+                try:
+                    result = _LEAD_RECOGNIZE_INNER(request)
+                    if isinstance(result, dict):
+                        result["degraded"] = True
+                        notices = result.setdefault("processing_notices", [])
+                        if isinstance(notices, list):
+                            notices.append(
+                                "首次未能在时间预算内完成，已按「准确优先」用更完整的方式重新识别。"
+                            )
+                except Exception as retry_error:  # noqa: BLE001
+                    if _is_input_error(retry_error):
+                        raise
+                    reason = str(retry_error)[:120] or type(retry_error).__name__
+                    result = None
+                finally:
+                    _end_recognition_retry_window()
+            if result is None:
+                salvaged = _salvage_from_page_ocr(request, reason)
+                if salvaged is not None:
+                    return _finalize_decimal_restore(_drop_blank_edge_columns(salvaged))
+                return _degraded_recognition_result(request, reason)
+        result = _finalize_decimal_restore(
+            _drop_blank_edge_columns(_rescue_degenerate_structure(result))
+        )
+        try:
+            _release_native_memory_if_pressured()
+        except Exception:  # noqa: BLE001 - 兜底绝不影响响应
+            pass
+        return result
 
     # 这里用**赋值**覆盖入口，而不是再 `def _recognize` 一遍：
     # 源码级护栏（backend/tests/test_recognition_guard_ast.py 的 _FUNCTIONS、
@@ -63733,6 +65371,37 @@ if not globals().get("_LEAD_DECIMAL_WRAPPED"):
     _recognize = _lead_decimal_restore_wrapper
 
     _LEAD_DECIMAL_WRAPPED = True
+
+
+if not globals().get("_LEAD_FINAL_WRAPPED"):
+    # 2026-11-06（lead 复查）：`_recognize` 的出口**看不到最终表**——实测 FC-00371 在
+    # `_recognize` 出口没有空的首列，但最终响应里 13×9 的第 0 列整列全空（真值 13×8）。
+    # 说明空白列是在 `_handle_request_body` 的后处理里产生的（裁剪/列合并/写回循环）。
+    # 所以把"去空边列 + 补小数点"挂到**真正的最后一步**：`_handle_request_body` 的返回处。
+    # 用赋值覆盖 + `__wrapped__` 保留源码级护栏（同名再 def 会让 inspect.getsource 看到壳）。
+    _LEAD_BODY_INNER = _handle_request_body
+
+    def _lead_final_cleanup_wrapper(request, *args, **kwargs):
+        result = _LEAD_BODY_INNER(request, *args, **kwargs)
+        try:
+            result = _enforce_response_invariants(
+                _finalize_decimal_restore(
+                    _drop_serial_number_column(
+                        _drop_column_letter_rows(
+                            _drop_blank_rows_near_header(_drop_blank_edge_columns(result))
+                        )
+                    )
+                )
+            )
+        except Exception:  # noqa: BLE001 - 收尾清理绝不影响响应
+            return result
+        return result
+
+    _lead_final_cleanup_wrapper.__wrapped__ = _LEAD_BODY_INNER
+    _lead_final_cleanup_wrapper.__name__ = "_handle_request_body"
+    _lead_final_cleanup_wrapper.__qualname__ = "_handle_request_body"
+    _handle_request_body = _lead_final_cleanup_wrapper
+    _LEAD_FINAL_WRAPPED = True
 
 if __name__ == "__main__":
     raise SystemExit(main())
