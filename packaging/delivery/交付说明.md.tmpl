@@ -141,6 +141,18 @@ $payload | .\ocr-runtime\OcrBackend\OcrBackend.exe
 `OCRTABLE_BUDGET_DISABLED` 是测准确率用的，不是"给客户延长时限"的旋钮 ——
 打开后单次识别不再有 60 秒上限。本产品**没有**受支持的"调大识别时限"开关。
 
+### 识别失败的兜底（2026-11-07 起）
+
+**识别不出来不会报错，一定会给结果。** 具体约定：
+
+| 情况 | 后端行为 |
+|---|---|
+| 60 秒预算内没跑完 | **自动关掉墙钟重试一次**（准确优先，可能慢一些），返回完整结果并置 `degraded=true` + 一条中文提示 |
+| 重试后仍失败 / 图里没文字 / 没检测到表格 | 返回 `status` **仍为 `ok`** 的一张空表（1×1，单元格空白），全部标 `needs_review=true`、`publication_blocked=true`，并在 `processing_notices` 里说明原因与下一步 |
+| 图片路径不存在 / 打不开 / 尺寸非法 / 模型文件缺失 | **仍然返回错误**（这些是调用方或安装问题，报错才有意义；错误码见 §错误码） |
+
+判断依据：兜底结果一律 `degraded=true` 且 `publication_blocked=true`，导出前请以 `needs_review` 与 `publication_blocked` 为准，不要把"空表"当成"这张表就是空的"。
+
 ### 识别结果里的 confidence_sentinel
 
 `recognize` 的返回里每一格都带 `confidence_sentinel` 布尔字段：
